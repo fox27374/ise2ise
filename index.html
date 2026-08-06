@@ -3,21 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ise2ise — network device CSV translation</title>
+<title>ise2ise</title>
 <style>
 :root {
   color-scheme: light dark;
   --bg: #f6f7f9; --panel: #fff; --fg: #1b1f24; --muted: #5b636d; --line: #d8dce1;
   --accent: #1462b3; --warn-bg: #fff4e5; --warn-line: #d98324; --warn-fg: #7a4a06;
   --danger-bg: #fdecec; --danger-line: #c0392b; --danger-fg: #8c241a;
-  --ok: #1f7a4d;
+  --ok: #1f7a4d; --ok-bg: #e8f5ee;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #14171a; --panel: #1c2024; --fg: #e6e8ea; --muted: #9aa3ad; --line: #2f353b;
     --accent: #5aa9f5; --warn-bg: #3a2c12; --warn-line: #d98324; --warn-fg: #f0c48a;
     --danger-bg: #3a1c19; --danger-line: #e05a4a; --danger-fg: #f2a79c;
-    --ok: #57c98a;
+    --ok: #57c98a; --ok-bg: #17301f;
   }
 }
 * { box-sizing: border-box; }
@@ -40,7 +40,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .field { margin-bottom: 1rem; }
 label { display: block; font-weight: 600; margin-bottom: .3rem; }
 label .hint { display: block; font-weight: 400; color: var(--muted); font-size: .87rem; }
-input[type=file], input[type=text] {
+input[type=file], input[type=text], input[type=password] {
   width: 100%; padding: .5rem; background: var(--bg); color: var(--fg);
   border: 1px solid var(--line); border-radius: 6px; font: inherit;
 }
@@ -50,91 +50,591 @@ button {
 }
 button:disabled { opacity: .5; cursor: default; }
 button.secondary { background: transparent; color: var(--accent); border-color: var(--accent); }
+button.link { background: none; border: none; color: var(--accent); padding: 0; font-weight: 600; }
 .banner {
   border-left: 4px solid var(--danger-line); background: var(--danger-bg); color: var(--danger-fg);
   padding: .7rem .9rem; border-radius: 4px; margin-bottom: 1.1rem;
 }
+.banner.warn { border-left-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-fg); }
 .counts { display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1rem; }
 .counts div { font-size: 1.6rem; font-weight: 700; }
 .counts span { display: block; font-size: .8rem; font-weight: 400; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .block { border-radius: 6px; padding: .7rem .9rem; margin-bottom: .8rem; border-left: 4px solid var(--line); background: var(--bg); }
 .block.warn { border-left-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-fg); }
 .block.danger { border-left-color: var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); }
+.block.good { border-left-color: var(--ok); background: var(--ok-bg); }
 .block ul { margin: .3rem 0 0; padding-left: 1.2rem; }
 .block li { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
 details summary { cursor: pointer; font-weight: 600; }
-.err { border-left: 4px solid var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); padding: .7rem .9rem; border-radius: 4px; white-space: pre-wrap; }
+.err { border-left: 4px solid var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); padding: .7rem .9rem; border-radius: 4px; white-space: pre-wrap; margin-bottom: 1.1rem; }
 .hidden { display: none; }
 .ok { color: var(--ok); font-weight: 600; }
+
+/* landing */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; }
+.card {
+  text-align: left; background: var(--panel); border: 1px solid var(--line); color: var(--fg);
+  border-radius: 8px; padding: 1.1rem 1.2rem; cursor: pointer; font: inherit;
+}
+.card:hover { border-color: var(--accent); }
+.card strong { display: block; font-size: 1.05rem; margin-bottom: .35rem; color: var(--accent); }
+.card span { color: var(--muted); font-size: .9rem; }
+nav.crumbs { margin-bottom: 1rem; }
+
+/* connect form */
+.row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: .8rem; }
+@media (max-width: 40rem) { .row { grid-template-columns: 1fr; } }
+.badge {
+  display: inline-block; padding: .1rem .5rem; border-radius: 99px; font-size: .8rem;
+  font-weight: 600; border: 1px solid var(--line); margin-right: .4rem;
+}
+.badge.on { color: var(--ok); border-color: var(--ok); }
+.badge.off { color: var(--danger-line); border-color: var(--danger-line); }
+.kv { margin: 0 0 .6rem; color: var(--muted); font-size: .9rem; }
+.kv b { color: var(--fg); }
+.picker { max-height: 16rem; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; background: var(--bg); }
+.picker label, .families label { display: flex; gap: .5rem; align-items: baseline; font-weight: 400; margin-bottom: .25rem; }
+.families label { font-weight: 600; }
+.families .hint { display: block; font-weight: 400; color: var(--muted); font-size: .87rem; }
+pre.log {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: .7rem .9rem;
+  max-height: 18rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; margin: 0 0 1rem;
+}
+table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: .75rem; letter-spacing: .04em; }
+td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 </style>
 </head>
 <body>
 <main>
   <h1>ise2ise</h1>
-  <p class="sub">Translate a Cisco ISE network device CSV export into the column layout of another ISE deployment.</p>
+  <p class="sub">Migrate Cisco ISE configuration between two independent deployments.</p>
 
-  <div class="banner">
-    <strong>These CSVs contain plaintext credentials.</strong>
-    ISE's network device export carries RADIUS and TACACS shared secrets, SNMP auth/privacy
-    passwords, TrustSec device passwords and EXEC/enable passwords in the clear. Keep the files
-    on trusted storage, never commit them, and delete both the exports and the translated result
-    once the import is done. Nothing is written to disk by this tool — upload, translation and
-    download all happen in memory.
+  <div id="tlsWarn" class="banner warn hidden">
+    <strong>TLS certificate verification is OFF.</strong>
+    Connections to ISE are encrypted but the certificate is not checked, so this cannot detect an
+    interposed server. That is the default because ISE ships a self-signed certificate. Restart with
+    <code>-verify-tls</code> once the deployment presents a certificate your machine trusts.
   </div>
 
-  <section>
-    <h2>Workflow</h2>
-    <ol class="steps">
-      <li>On the <strong>source</strong> ISE: <code>Administration → Network Resources → Network Devices → Export</code>. This CSV is the only route that carries the secrets; the REST API masks them.</li>
-      <li>On the <strong>target</strong> ISE: <code>Administration → Network Resources → Network Devices → Import</code>, click <strong>Generate a Template</strong> and download it. That template defines the target release's column layout.</li>
-      <li>Drop both files below.</li>
-      <li>Optionally give the target deployment's node hostname.</li>
-      <li>Translate, review the report, download the result.</li>
-      <li>Import the result on the target ISE via the same Import dialog.</li>
-    </ol>
-  </section>
-
-  <section>
-    <form id="form">
-      <div class="field">
-        <label for="source">Source export CSV
-          <span class="hint">Exported from the old deployment.</span>
-        </label>
-        <input type="file" id="source" name="source" accept=".csv,text/csv" required>
-      </div>
-      <div class="field">
-        <label for="template">Target template CSV
-          <span class="hint">"Generate a Template" from the new deployment's Import dialog.</span>
-        </label>
-        <input type="file" id="template" name="template" accept=".csv,text/csv" required>
-      </div>
-      <div class="field">
-        <label for="targetNode">Target node hostname (optional)
-          <span class="hint">Replaces the source deployment's node hostnames in
-            <code>SNMP:Originating Policy Services Node</code> and
-            <code>SGA:CoA Coa Source Host</code>. Cells that are empty in the source stay empty.</span>
-        </label>
-        <input type="text" id="targetNode" name="targetNode" placeholder="ise-new.example.net" autocomplete="off">
-      </div>
-      <button type="submit" id="go">Translate</button>
-    </form>
-  </section>
-
-  <div id="error" class="err hidden"></div>
-
-  <section id="result" class="hidden">
-    <h2>Report</h2>
-    <div class="counts">
-      <div id="cSource">0<span>source rows</span></div>
-      <div id="cWritten">0<span>rows written</span></div>
+  <!-- ------------------------------------------------------------------ home -->
+  <div id="viewHome">
+    <div class="cards">
+      <button class="card" data-go="Export">
+        <strong>Export from ISE →</strong>
+        <span>Read objects from the source deployment over the API and write an encrypted transfer bundle.</span>
+      </button>
+      <button class="card" data-go="Import">
+        <strong>Import into ISE →</strong>
+        <span>Decrypt a bundle, check every reference against the target, then create what is missing.</span>
+      </button>
+      <button class="card" data-go="Csv">
+        <strong>Network device CSV →</strong>
+        <span>Translate a network device export into another release's column layout. The only route that carries device secrets.</span>
+      </button>
     </div>
-    <div id="blocks"></div>
-    <button id="download" class="secondary">Download network-devices-translated.csv</button>
-  </section>
+  </div>
+
+  <!-- ---------------------------------------------------------------- export -->
+  <div id="viewExport" class="hidden">
+    <nav class="crumbs"><button class="link" data-go="Home">← All tools</button></nav>
+    <h2>Export from the source deployment</h2>
+
+    <section>
+      <h2>1. Connect to the source ISE</h2>
+      <p class="kv">Needs an account with the <b>ERS Admin</b> role and, ideally, <b>API Admin</b>. Both APIs
+        are switched on in <code>Administration → System → Settings → API Settings</code>. Credentials are
+        held in this page's memory and sent with each request; they are never stored and never enter the bundle.</p>
+      <form id="expConnForm">
+        <div class="row">
+          <div class="field"><label for="expHost">ISE hostname or IP</label>
+            <input type="text" id="expHost" autocomplete="off" placeholder="ise-old.example.net" required></div>
+          <div class="field"><label for="expUser">Username</label>
+            <input type="text" id="expUser" autocomplete="off" required></div>
+          <div class="field"><label for="expPass">Password</label>
+            <input type="password" id="expPass" autocomplete="off" required></div>
+        </div>
+        <button type="submit" id="expConnect">Connect</button>
+      </form>
+      <div id="expProbe" class="hidden" style="margin-top:1rem"></div>
+    </section>
+
+    <section id="expPick" class="hidden">
+      <h2>2. Choose what to export</h2>
+      <div class="families">
+        <label><input type="checkbox" id="famGroups" checked> Endpoint identity groups
+          <span class="hint">All groups travel, so an endpoint's group exists on the target.</span></label>
+        <label><input type="checkbox" id="famEndpoints" checked> Static endpoints
+          <span class="hint">Only endpoints with a static group or static profile assignment. Profiler-assigned
+            endpoints are left behind: the new deployment regenerates them.</span></label>
+      </div>
+      <div id="expGroupsWrap" style="margin-top:1rem">
+        <label>Export endpoints from these groups
+          <span class="hint">Endpoints outside the selected groups are not read.</span></label>
+        <div style="margin-bottom:.5rem">
+          <button type="button" class="link" id="expSelAll">select all</button> ·
+          <button type="button" class="link" id="expSelNone">select none</button>
+        </div>
+        <div class="picker" id="expGroups">Loading groups…</div>
+      </div>
+    </section>
+
+    <section id="expRun" class="hidden">
+      <h2>3. Encrypt and run</h2>
+      <div class="row">
+        <div class="field"><label for="expPhrase">Bundle passphrase
+            <span class="hint">At least 12 characters. Without it the bundle cannot be read — there is no recovery.</span></label>
+          <input type="password" id="expPhrase" autocomplete="new-password"></div>
+        <div class="field"><label for="expPhrase2">Repeat passphrase</label>
+          <input type="password" id="expPhrase2" autocomplete="new-password"></div>
+      </div>
+      <button id="expGo">Export</button>
+    </section>
+
+    <div id="expError" class="err hidden"></div>
+
+    <section id="expProgress" class="hidden">
+      <h2>Progress</h2>
+      <pre class="log" id="expLog"></pre>
+      <div id="expResult"></div>
+    </section>
+  </div>
+
+  <!-- ---------------------------------------------------------------- import -->
+  <div id="viewImport" class="hidden">
+    <nav class="crumbs"><button class="link" data-go="Home">← All tools</button></nav>
+    <h2>Import into the target deployment</h2>
+
+    <section>
+      <h2>1. Connect to the target ISE</h2>
+      <p class="kv">The target is expected to be a freshly installed standalone. Nothing is ever overwritten:
+        an object that already exists is skipped and counted.</p>
+      <form id="impConnForm">
+        <div class="row">
+          <div class="field"><label for="impHost">ISE hostname or IP</label>
+            <input type="text" id="impHost" autocomplete="off" placeholder="ise-new.example.net" required></div>
+          <div class="field"><label for="impUser">Username</label>
+            <input type="text" id="impUser" autocomplete="off" required></div>
+          <div class="field"><label for="impPass">Password</label>
+            <input type="password" id="impPass" autocomplete="off" required></div>
+        </div>
+        <button type="submit" id="impConnect">Connect</button>
+      </form>
+      <div id="impProbe" class="hidden" style="margin-top:1rem"></div>
+    </section>
+
+    <section id="impBundleSec" class="hidden">
+      <h2>2. Open the bundle</h2>
+      <div class="field"><label for="impFile">Encrypted bundle</label>
+        <input type="file" id="impFile" accept=".enc,application/octet-stream"></div>
+      <div class="field"><label for="impPhrase">Bundle passphrase</label>
+        <input type="password" id="impPhrase" autocomplete="off"></div>
+      <button id="impCheck">Check against the target</button>
+      <p class="kv" style="margin-top:.6rem">This reads the target and writes nothing.</p>
+    </section>
+
+    <div id="impError" class="err hidden"></div>
+
+    <section id="impPre" class="hidden">
+      <h2>3. Pre-flight</h2>
+      <div id="impPreBody"></div>
+      <button id="impGo">Confirm and import</button>
+      <button class="secondary" id="impCancel">Cancel</button>
+    </section>
+
+    <section id="impProgress" class="hidden">
+      <h2>Progress</h2>
+      <pre class="log" id="impLog"></pre>
+      <div id="impResult"></div>
+    </section>
+  </div>
+
+  <!-- -------------------------------------------------------------------- csv -->
+  <div id="viewCsv" class="hidden">
+    <nav class="crumbs"><button class="link" data-go="Home">← All tools</button></nav>
+    <h2>Network device CSV translation</h2>
+    <p class="sub">Translate a Cisco ISE network device CSV export into the column layout of another ISE deployment.</p>
+
+    <div class="banner">
+      <strong>These CSVs contain plaintext credentials.</strong>
+      ISE's network device export carries RADIUS and TACACS shared secrets, SNMP auth/privacy
+      passwords, TrustSec device passwords and EXEC/enable passwords in the clear. Keep the files
+      on trusted storage, never commit them, and delete both the exports and the translated result
+      once the import is done. Nothing is written to disk by this tool — upload, translation and
+      download all happen in memory.
+    </div>
+
+    <section>
+      <h2>Workflow</h2>
+      <ol class="steps">
+        <li>On the <strong>source</strong> ISE: <code>Administration → Network Resources → Network Devices → Export</code>. This CSV is the only route that carries the secrets; the REST API masks them.</li>
+        <li>On the <strong>target</strong> ISE: <code>Administration → Network Resources → Network Devices → Import</code>, click <strong>Generate a Template</strong> and download it. That template defines the target release's column layout.</li>
+        <li>Drop both files below.</li>
+        <li>Optionally give the target deployment's node hostname.</li>
+        <li>Translate, review the report, download the result.</li>
+        <li>Import the result on the target ISE via the same Import dialog.</li>
+      </ol>
+    </section>
+
+    <section>
+      <form id="form">
+        <div class="field">
+          <label for="source">Source export CSV
+            <span class="hint">Exported from the old deployment.</span>
+          </label>
+          <input type="file" id="source" name="source" accept=".csv,text/csv" required>
+        </div>
+        <div class="field">
+          <label for="template">Target template CSV
+            <span class="hint">"Generate a Template" from the new deployment's Import dialog.</span>
+          </label>
+          <input type="file" id="template" name="template" accept=".csv,text/csv" required>
+        </div>
+        <div class="field">
+          <label for="targetNode">Target node hostname (optional)
+            <span class="hint">Replaces the source deployment's node hostnames in
+              <code>SNMP:Originating Policy Services Node</code> and
+              <code>SGA:CoA Coa Source Host</code>. Cells that are empty in the source stay empty.</span>
+          </label>
+          <input type="text" id="targetNode" name="targetNode" placeholder="ise-new.example.net" autocomplete="off">
+        </div>
+        <button type="submit" id="go">Translate</button>
+      </form>
+    </section>
+
+    <div id="error" class="err hidden"></div>
+
+    <section id="result" class="hidden">
+      <h2>Report</h2>
+      <div class="counts">
+        <div id="cSource">0<span>source rows</span></div>
+        <div id="cWritten">0<span>rows written</span></div>
+      </div>
+      <div id="blocks"></div>
+      <button id="download" class="secondary">Download network-devices-translated.csv</button>
+    </section>
+  </div>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+/* ------------------------------------------------------------------ routing */
+const views = ["Home", "Export", "Import", "Csv"];
+function show(name) {
+  views.forEach(v => $("view" + v).classList.toggle("hidden", v !== name));
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => show(b.dataset.go)));
+
+fetch("/api/config").then(r => r.json()).then(cfg => {
+  if (!cfg.verifyTls) $("tlsWarn").classList.remove("hidden");
+}).catch(() => {});
+
+/* ------------------------------------------------------- shared API helpers */
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+// readStream consumes newline-delimited JSON as it arrives, so a long export or
+// import shows progress instead of looking hung.
+async function readStream(res, onMsg) {
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || ("HTTP " + res.status));
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) onMsg(JSON.parse(line));
+    }
+  }
+  if (buf.trim()) onMsg(JSON.parse(buf.trim()));
+}
+
+function probeHTML(p) {
+  const badge = (on, label) => '<span class="badge ' + (on ? "on" : "off") + '">' + label + (on ? " on" : " off") + "</span>";
+  let h = '<div class="block ' + (p.ers ? "good" : "danger") + '">';
+  h += badge(p.ers, "ERS") + badge(p.openapi, "OpenAPI");
+  h += '<p class="kv" style="margin-top:.6rem">Host <b>' + esc(p.host) + "</b>";
+  if (p.version) h += " · ISE <b>" + esc(p.version) + "</b>";
+  if (p.nodes && p.nodes.length) h += " · nodes <b>" + p.nodes.map(esc).join(", ") + "</b>";
+  h += "</p>";
+  if (p.notes && p.notes.length) h += "<ul>" + p.notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul>";
+  h += "</div>";
+  return h;
+}
+
+function showErr(el, msg) { el.textContent = msg; el.classList.remove("hidden"); }
+function hide(el) { el.classList.add("hidden"); }
+function logLine(pre, msg) { pre.textContent += msg + "\n"; pre.scrollTop = pre.scrollHeight; }
+
+/* ------------------------------------------------------------------- export */
+// Credentials live in this variable and nowhere else: no storage, no cookie.
+let expCreds = null, expBundle = null, expFilename = "ise2ise-bundle.enc";
+
+$("expConnForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  hide($("expError"));
+  $("expConnect").disabled = true;
+  $("expConnect").textContent = "Connecting…";
+  try {
+    expCreds = { host: $("expHost").value.trim(), user: $("expUser").value, pass: $("expPass").value };
+    const p = await postJSON("/api/probe", expCreds);
+    $("expProbe").innerHTML = probeHTML(p);
+    $("expProbe").classList.remove("hidden");
+    if (!p.ers) {
+      $("expPick").classList.add("hidden");
+      $("expRun").classList.add("hidden");
+      showErr($("expError"), "The ERS API is required to export. See the notes above.");
+      return;
+    }
+    $("expPick").classList.remove("hidden");
+    $("expRun").classList.remove("hidden");
+    loadGroups();
+  } catch (err) {
+    showErr($("expError"), err.message);
+  } finally {
+    $("expConnect").disabled = false;
+    $("expConnect").textContent = "Connect";
+  }
+});
+
+async function loadGroups() {
+  $("expGroups").textContent = "Loading groups…";
+  try {
+    const data = await postJSON("/api/endpoint-groups", expCreds);
+    const gs = data.groups || [];
+    if (!gs.length) { $("expGroups").textContent = "This deployment has no endpoint identity groups."; return; }
+    $("expGroups").innerHTML = gs.map(g =>
+      '<label><input type="checkbox" class="grp" value="' + esc(g.name) + '"> ' + esc(g.name) + "</label>").join("");
+  } catch (err) {
+    $("expGroups").textContent = "Could not list groups: " + err.message;
+  }
+}
+
+const eachGroup = fn => document.querySelectorAll("#expGroups .grp").forEach(fn);
+$("expSelAll").addEventListener("click", () => eachGroup(c => c.checked = true));
+$("expSelNone").addEventListener("click", () => eachGroup(c => c.checked = false));
+$("famEndpoints").addEventListener("change", () => {
+  $("expGroupsWrap").classList.toggle("hidden", !$("famEndpoints").checked);
+});
+
+$("expGo").addEventListener("click", async () => {
+  hide($("expError"));
+  $("expResult").innerHTML = "";
+  const families = [];
+  if ($("famGroups").checked) families.push("endpointGroups");
+  if ($("famEndpoints").checked) families.push("endpoints");
+  if (!families.length) return showErr($("expError"), "Select at least one object family.");
+  const phrase = $("expPhrase").value;
+  if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");
+  if (phrase !== $("expPhrase2").value) return showErr($("expError"), "The two passphrases do not match.");
+  const groups = [];
+  eachGroup(c => { if (c.checked) groups.push(c.value); });
+  if ($("famEndpoints").checked && !groups.length) {
+    return showErr($("expError"), "Select at least one endpoint identity group, or untick “Static endpoints”.");
+  }
+
+  $("expGo").disabled = true;
+  $("expGo").textContent = "Exporting…";
+  $("expLog").textContent = "";
+  $("expProgress").classList.remove("hidden");
+  try {
+    const res = await fetch("/api/export", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, passphrase: phrase })),
+    });
+    await readStream(res, m => {
+      if (m.type === "log") logLine($("expLog"), m.msg);
+      else if (m.type === "error") { logLine($("expLog"), "ERROR: " + m.msg); showErr($("expError"), m.msg); }
+      else if (m.type === "done") renderExportDone(m);
+    });
+  } catch (err) {
+    showErr($("expError"), err.message);
+  } finally {
+    $("expGo").disabled = false;
+    $("expGo").textContent = "Export";
+  }
+});
+
+function renderExportDone(m) {
+  expBundle = m.bundle;
+  expFilename = m.filename || expFilename;
+  const counts = m.counts || {};
+  let h = '<div class="counts">';
+  for (const k of Object.keys(counts)) h += "<div>" + counts[k] + "<span>" + esc(k) + "</span></div>";
+  h += "</div>";
+  if (m.notes && m.notes.length) {
+    h += '<div class="block warn"><h3>Notes from the export (' + m.notes.length + ")</h3><ul>" +
+      m.notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul></div>";
+  }
+  h += '<div class="block"><strong>The bundle is encrypted with your passphrase.</strong> Nothing was written to ' +
+    "disk by this tool; the download below comes from memory. Keep the passphrase separate from the file.</div>";
+  h += '<button id="expDownload">Download ' + esc(expFilename) + "</button>";
+  $("expResult").innerHTML = h;
+  $("expDownload").addEventListener("click", () => {
+    const bin = Uint8Array.from(atob(expBundle), c => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bin], { type: "application/octet-stream" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = expFilename; a.click();
+    URL.revokeObjectURL(url);
+  });
+}
+
+/* ------------------------------------------------------------------- import */
+let impCreds = null;
+
+function importForm(confirm) {
+  const fd = new FormData();
+  fd.append("host", impCreds.host);
+  fd.append("user", impCreds.user);
+  fd.append("pass", impCreds.pass);
+  fd.append("bundle", $("impFile").files[0]);
+  fd.append("passphrase", $("impPhrase").value);
+  if (confirm) fd.append("confirm", "yes");
+  return fd;
+}
+
+$("impConnForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  hide($("impError"));
+  $("impConnect").disabled = true;
+  $("impConnect").textContent = "Connecting…";
+  try {
+    impCreds = { host: $("impHost").value.trim(), user: $("impUser").value, pass: $("impPass").value };
+    const p = await postJSON("/api/probe", impCreds);
+    $("impProbe").innerHTML = probeHTML(p);
+    $("impProbe").classList.remove("hidden");
+    if (!p.ers) {
+      $("impBundleSec").classList.add("hidden");
+      showErr($("impError"), "The ERS API is required to import. See the notes above.");
+      return;
+    }
+    $("impBundleSec").classList.remove("hidden");
+  } catch (err) {
+    showErr($("impError"), err.message);
+  } finally {
+    $("impConnect").disabled = false;
+    $("impConnect").textContent = "Connect";
+  }
+});
+
+$("impCheck").addEventListener("click", async () => {
+  hide($("impError"));
+  hide($("impPre"));
+  hide($("impProgress"));
+  if (!$("impFile").files[0]) return showErr($("impError"), "Choose the encrypted bundle file.");
+  if (!$("impPhrase").value) return showErr($("impError"), "Give the bundle passphrase.");
+  $("impCheck").disabled = true;
+  $("impCheck").textContent = "Checking…";
+  try {
+    const res = await fetch("/api/import/preflight", { method: "POST", body: importForm(false) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
+    renderPreflight(data);
+    $("impPre").classList.remove("hidden");
+  } catch (err) {
+    showErr($("impError"), err.message);
+  } finally {
+    $("impCheck").disabled = false;
+    $("impCheck").textContent = "Check against the target";
+  }
+});
+
+function itemsTable(items, action) {
+  const rows = items.filter(i => i.action === action);
+  if (!rows.length) return "";
+  const title = { create: "Will be created", skip: "Already on the target — skipped", blocked: "Cannot be imported — skipped" }[action];
+  const cls = action === "blocked" ? " danger" : "";
+  let h = '<div class="block' + cls + '"><details' + (action === "create" || action === "blocked" ? " open" : "") + ">" +
+    "<summary>" + title + " (" + rows.length + ")</summary><table><tr><th>Family</th><th>Object</th><th>Reason</th></tr>";
+  for (const r of rows) {
+    h += "<tr><td>" + esc(r.family) + '</td><td class="mono">' + esc(r.name) + "</td><td>" + esc(r.reason || "") + "</td></tr>";
+  }
+  return h + "</table></details></div>";
+}
+
+function renderPreflight(data) {
+  const p = data.preflight;
+  let h = '<p class="kv">Bundle from <b>' + esc(p.source.host || "unknown") + "</b>";
+  if (p.source.iseVersion) h += " (ISE " + esc(p.source.iseVersion) + ")";
+  if (p.source.nodes && p.source.nodes.length) h += ", nodes <b>" + p.source.nodes.map(esc).join(", ") + "</b>";
+  if (data.exportedAt) h += ", exported " + esc(new Date(data.exportedAt).toLocaleString());
+  h += "</p>";
+  h += '<div class="counts"><div>' + p.create + "<span>to create</span></div><div>" + p.skip +
+    "<span>already there</span></div><div>" + p.blocked + "<span>blocked</span></div></div>";
+  h += '<div class="block"><strong>Nothing has been written yet.</strong> This is the pre-flight: every reference in ' +
+    "the bundle was resolved against the target. Blocked objects are never attempted.</div>";
+  h += itemsTable(p.items, "blocked") + itemsTable(p.items, "create") + itemsTable(p.items, "skip");
+  if (p.notes && p.notes.length) {
+    h += '<div class="block warn"><details><summary>Notes carried in the bundle (' + p.notes.length + ")</summary><ul>" +
+      p.notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul></details></div>";
+  }
+  $("impPreBody").innerHTML = h;
+  $("impGo").disabled = p.create === 0;
+  $("impGo").textContent = p.create === 0 ? "Nothing to create" : "Confirm and create " + p.create + " objects";
+}
+
+$("impCancel").addEventListener("click", () => { hide($("impPre")); });
+
+$("impGo").addEventListener("click", async () => {
+  hide($("impError"));
+  $("impResult").innerHTML = "";
+  $("impLog").textContent = "";
+  $("impProgress").classList.remove("hidden");
+  $("impGo").disabled = true;
+  $("impGo").textContent = "Importing…";
+  try {
+    const res = await fetch("/api/import/apply", { method: "POST", body: importForm(true) });
+    await readStream(res, m => {
+      if (m.type === "log") logLine($("impLog"), m.msg);
+      else if (m.type === "error") { logLine($("impLog"), "ERROR: " + m.msg); showErr($("impError"), m.msg); }
+      else if (m.type === "done") renderImportDone(m);
+    });
+  } catch (err) {
+    showErr($("impError"), err.message);
+  } finally {
+    $("impGo").disabled = false;
+    $("impGo").textContent = "Confirm and import";
+  }
+});
+
+function renderImportDone(m) {
+  const r = m.result || {};
+  let h = '<div class="counts"><div>' + (r.created || 0) + "<span>created</span></div><div>" + (r.skipped || 0) +
+    "<span>skipped</span></div><div>" + (r.blocked || 0) + "<span>blocked</span></div><div>" + (r.failed || 0) +
+    "<span>failed</span></div></div>";
+  if (r.errors && r.errors.length) {
+    h += '<div class="block danger"><h3>Failures (' + r.errors.length + ")</h3><ul>" +
+      r.errors.map(e => "<li>" + esc(e) + "</li>").join("") + "</ul></div>";
+  } else {
+    h += '<div class="block good"><span class="ok">No failures.</span></div>';
+  }
+  if (m.preflight) h += itemsTable(m.preflight.items, "blocked");
+  $("impResult").innerHTML = h;
+}
+
+/* ------------------------------------------------ network device CSV (slice 1) */
 let csvText = "";
 
 function block(cls, title, note, items) {
@@ -149,10 +649,6 @@ function collapsed(title, note, items) {
   const li = items.map(v => "<li>" + esc(v) + "</li>").join("");
   return '<div class="block"><details><summary>' + esc(title) + " (" + items.length + ")</summary>" +
          (note ? "<div>" + note + "</div>" : "") + "<ul>" + li + "</ul></details></div>";
-}
-
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
 function render(rep) {

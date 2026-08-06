@@ -2,11 +2,18 @@
 
 Migrates Cisco ISE configuration between two independent deployments.
 
-Today it does exactly one thing: it translates a **network device CSV export**
-from a source ISE into the column layout of a target ISE, so the export actually
-imports on the other side.
+Three tools, all in one local binary with a browser UI on `127.0.0.1`:
 
-## Why this exists
+- **Export** — read objects from the source deployment over the ISE APIs and
+  write an encrypted transfer bundle.
+- **Import** — decrypt a bundle on the other side, resolve every cross-reference
+  against the target, show a pre-flight report, and only then create what is
+  missing.
+- **Network device CSV** — translate a network device export into the target
+  release's column layout. The API masks device secrets, so the CSV is the only
+  route that carries them.
+
+## Why the CSV tool exists
 
 ISE's GUI export of network devices contains the RADIUS and TACACS shared
 secrets, the SNMP auth/privacy passwords, the TrustSec (SGA) device passwords
@@ -38,7 +45,7 @@ What it does beyond reordering columns:
   hostname in `SNMP:Originating Policy Services Node` and
   `SGA:CoA Coa Source Host` with the target node's.
 
-## Workflow
+## CSV workflow
 
 1. Source ISE: `Administration → Network Resources → Network Devices → Export`.
 2. Target ISE: `Administration → Network Resources → Network Devices → Import`,
@@ -50,6 +57,69 @@ What it does beyond reordering columns:
 
 Handle both CSVs as credential material and delete them when you are done.
 `.gitignore` excludes `*.csv` for that reason.
+
+## API migration
+
+### Enabling the APIs
+
+Both ISE APIs are off out of the box. On **each** deployment:
+`Administration → System → Settings → API Settings` → enable **ERS** (port
+9060) and **OpenAPI** (port 443), and use an account with the **ERS Admin**
+role (plus **API Admin** for OpenAPI). ise2ise probes both and tells you which
+one answered; when only ERS is available everything still works, just slower,
+because ERS needs one GET per object.
+
+Nothing decides behaviour from the ISE version — capability is probed, and
+whatever is missing is skipped and reported. Both ends are expected to be
+ISE 3.x. The source may be standalone or distributed; the target is expected to
+be a **freshly installed standalone**, so import is **create-only**: an object
+that already exists is skipped and counted, never overwritten.
+
+### Export
+
+Connect to the source, look at the probe result (version, nodes, which APIs are
+on), pick the object families and — for endpoints — the endpoint identity
+groups to export from, give a passphrase, run. Progress streams live. The
+result is a single encrypted file.
+
+Endpoints are filtered to the ones with a **static** group or profile
+assignment. Everything else is profiler output that the new deployment
+regenerates by itself, so carrying it is pointless churn. Endpoints are read
+from the OpenAPI when it is available (whole objects in one call) and from ERS
+otherwise.
+
+### The bundle
+
+AES-256-GCM, key from PBKDF2-HMAC-SHA256 with 600 000 iterations and a random
+16-byte salt; the file header (magic, format version, salt, nonce) is
+authenticated as GCM additional data. There is no unencrypted mode and no
+recovery: lose the passphrase and the bundle is gone.
+
+**Credentials are never in the bundle.** They are held in memory for the
+duration of a request and nowhere else — not on disk, not in a log, not in a
+session.
+
+### Import and the pre-flight gate
+
+Import writes nothing until you confirm. It decrypts the bundle, resolves every
+cross-reference against the target, and reports three lists: what will be
+created, what already exists and will be skipped, and what **cannot** be
+resolved. Unresolvable objects are never attempted — a dangling reference is
+worse than a missing object. Only after the confirm button does anything get
+written, and the pre-flight is re-run server-side at that moment in case the
+target moved.
+
+Cross-references travel **by name**, never by UUID: on export an endpoint's
+`groupId` and `profileId` are resolved to the group and profiler-profile names;
+on import those names are resolved against the target's own UUIDs. A profiler
+profile that does not exist on the target blocks that endpoint at pre-flight.
+
+### What travels today
+
+| Family | Notes |
+|---|---|
+| Endpoint identity groups | All groups, so an endpoint's group exists on the target. Group nesting is not carried and is reported. |
+| Static endpoints | Only in the groups you select, only static assignments, identified by MAC. |
 
 ## Running
 
@@ -74,11 +144,12 @@ Flags:
 |---|---|---|
 | `-port` | `8777` | Port to listen on. |
 | `-open` | `true` | Open the UI in the system browser on startup. |
+| `-verify-tls` | `false` | Verify the ISE TLS certificate. Off by default because ISE ships a self-signed one; the UI says so out loud while it is off. |
 
 The server binds `127.0.0.1` only — there is deliberately no way to bind a
 routable interface. The UI is unauthenticated and handles credential-bearing
 files. Uploads and results are never written to disk; the browser downloads the
-translated CSV from an in-memory blob.
+translated CSV and the encrypted bundle from in-memory blobs.
 
 ## Building
 
@@ -93,8 +164,6 @@ make dist    # all four cross-compiled binaries into dist/
 Everything below is a later slice. None of it exists in the binary today, not
 even as a stub:
 
-- API export/import of endpoints (static assignments in selected groups)
-- Endpoint identity groups
 - Network device groups
 - Condition library
 - dACLs
@@ -105,5 +174,9 @@ even as a stub:
 - AD join point configuration and `addGroups`
 - Trusted certificates
 - System certificates
-- Encrypted transfer bundle
 - Network device CSV → API import
+
+The API field names come from Cisco's documentation, not from a live box. When
+a response does not have the expected shape, the tool reports what it actually
+received instead of failing silently — please read those messages literally
+when you hit one in a lab.

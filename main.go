@@ -18,9 +18,15 @@ var indexHTML []byte
 
 const maxUpload = 64 << 20 // 64 MB; a network device export is a few hundred KB
 
+// verifyTLS is process-wide because it is an operator decision about the whole
+// run, not per request. Off by default: ISE ships a self-signed certificate and
+// a first migration happens before anyone has replaced it. The UI says so.
+var verifyTLS bool
+
 func main() {
 	port := flag.Int("port", 8777, "loopback port to listen on")
 	open := flag.Bool("open", true, "open the UI in the system browser")
+	flag.BoolVar(&verifyTLS, "verify-tls", false, "verify the ISE TLS certificate (off by default: ISE ships a self-signed cert)")
 	flag.Parse()
 
 	// Loopback only, always: this UI is unauthenticated and the files it
@@ -31,16 +37,28 @@ func main() {
 		log.Fatalf("listen on %s: %v", addr, err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", serveIndex)
-	mux.HandleFunc("/api/translate", handleTranslate)
-
 	url := "http://" + addr + "/"
 	fmt.Println("ise2ise listening on", url)
+	if !verifyTLS {
+		fmt.Println("TLS certificate verification is OFF for connections to ISE (-verify-tls turns it on)")
+	}
 	if *open {
 		go openBrowser(url)
 	}
-	log.Fatal(http.Serve(ln, mux))
+	log.Fatal(http.Serve(ln, newMux()))
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", serveIndex)
+	mux.HandleFunc("/api/config", handleConfig)
+	mux.HandleFunc("/api/translate", handleTranslate)
+	mux.HandleFunc("/api/probe", handleProbe)
+	mux.HandleFunc("/api/endpoint-groups", handleEndpointGroups)
+	mux.HandleFunc("/api/export", handleExport)
+	mux.HandleFunc("/api/import/preflight", handlePreflight)
+	mux.HandleFunc("/api/import/apply", handleApply)
+	return mux
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {

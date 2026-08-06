@@ -1,6 +1,9 @@
 # ISE network device exports are plaintext credential dumps. Never commit one.
 *.csv
 
+# Host build output; dist/ holds the binaries that ship.
+/ise2ise
+
 # OS cruft
 .DS_Store
 Thumbs.db
