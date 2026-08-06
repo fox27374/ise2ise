@@ -1,0 +1,7 @@
+# ISE network device exports are plaintext credential dumps. Never commit one.
+*.csv
+
+# OS cruft
+.DS_Store
+Thumbs.db
+._*

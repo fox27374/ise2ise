@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ise2ise — network device CSV translation</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #fff; --fg: #1b1f24; --muted: #5b636d; --line: #d8dce1;
+  --accent: #1462b3; --warn-bg: #fff4e5; --warn-line: #d98324; --warn-fg: #7a4a06;
+  --danger-bg: #fdecec; --danger-line: #c0392b; --danger-fg: #8c241a;
+  --ok: #1f7a4d;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a; --panel: #1c2024; --fg: #e6e8ea; --muted: #9aa3ad; --line: #2f353b;
+    --accent: #5aa9f5; --warn-bg: #3a2c12; --warn-line: #d98324; --warn-fg: #f0c48a;
+    --danger-bg: #3a1c19; --danger-line: #e05a4a; --danger-fg: #f2a79c;
+    --ok: #57c98a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+main { max-width: 60rem; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+h3 { font-size: .95rem; margin: 0 0 .35rem; }
+p.sub { color: var(--muted); margin: 0 0 1.5rem; }
+section {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 1.1rem 1.2rem; margin-bottom: 1.1rem;
+}
+ol.steps { margin: 0; padding-left: 1.3rem; }
+ol.steps li { margin-bottom: .3rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+.field { margin-bottom: 1rem; }
+label { display: block; font-weight: 600; margin-bottom: .3rem; }
+label .hint { display: block; font-weight: 400; color: var(--muted); font-size: .87rem; }
+input[type=file], input[type=text] {
+  width: 100%; padding: .5rem; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; font: inherit;
+}
+button {
+  font: inherit; font-weight: 600; padding: .55rem 1.1rem; border-radius: 6px;
+  border: 1px solid transparent; background: var(--accent); color: #fff; cursor: pointer;
+}
+button:disabled { opacity: .5; cursor: default; }
+button.secondary { background: transparent; color: var(--accent); border-color: var(--accent); }
+.banner {
+  border-left: 4px solid var(--danger-line); background: var(--danger-bg); color: var(--danger-fg);
+  padding: .7rem .9rem; border-radius: 4px; margin-bottom: 1.1rem;
+}
+.counts { display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.counts div { font-size: 1.6rem; font-weight: 700; }
+.counts span { display: block; font-size: .8rem; font-weight: 400; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.block { border-radius: 6px; padding: .7rem .9rem; margin-bottom: .8rem; border-left: 4px solid var(--line); background: var(--bg); }
+.block.warn { border-left-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-fg); }
+.block.danger { border-left-color: var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); }
+.block ul { margin: .3rem 0 0; padding-left: 1.2rem; }
+.block li { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+details summary { cursor: pointer; font-weight: 600; }
+.err { border-left: 4px solid var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); padding: .7rem .9rem; border-radius: 4px; white-space: pre-wrap; }
+.hidden { display: none; }
+.ok { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ise2ise</h1>
+  <p class="sub">Translate a Cisco ISE network device CSV export into the column layout of another ISE deployment.</p>
+
+  <div class="banner">
+    <strong>These CSVs contain plaintext credentials.</strong>
+    ISE's network device export carries RADIUS and TACACS shared secrets, SNMP auth/privacy
+    passwords, TrustSec device passwords and EXEC/enable passwords in the clear. Keep the files
+    on trusted storage, never commit them, and delete both the exports and the translated result
+    once the import is done. Nothing is written to disk by this tool — upload, translation and
+    download all happen in memory.
+  </div>
+
+  <section>
+    <h2>Workflow</h2>
+    <ol class="steps">
+      <li>On the <strong>source</strong> ISE: <code>Administration → Network Resources → Network Devices → Export</code>. This CSV is the only route that carries the secrets; the REST API masks them.</li>
+      <li>On the <strong>target</strong> ISE: <code>Administration → Network Resources → Network Devices → Import</code>, click <strong>Generate a Template</strong> and download it. That template defines the target release's column layout.</li>
+      <li>Drop both files below.</li>
+      <li>Optionally give the target deployment's node hostname.</li>
+      <li>Translate, review the report, download the result.</li>
+      <li>Import the result on the target ISE via the same Import dialog.</li>
+    </ol>
+  </section>
+
+  <section>
+    <form id="form">
+      <div class="field">
+        <label for="source">Source export CSV
+          <span class="hint">Exported from the old deployment.</span>
+        </label>
+        <input type="file" id="source" name="source" accept=".csv,text/csv" required>
+      </div>
+      <div class="field">
+        <label for="template">Target template CSV
+          <span class="hint">"Generate a Template" from the new deployment's Import dialog.</span>
+        </label>
+        <input type="file" id="template" name="template" accept=".csv,text/csv" required>
+      </div>
+      <div class="field">
+        <label for="targetNode">Target node hostname (optional)
+          <span class="hint">Replaces the source deployment's node hostnames in
+            <code>SNMP:Originating Policy Services Node</code> and
+            <code>SGA:CoA Coa Source Host</code>. Cells that are empty in the source stay empty.</span>
+        </label>
+        <input type="text" id="targetNode" name="targetNode" placeholder="ise-new.example.net" autocomplete="off">
+      </div>
+      <button type="submit" id="go">Translate</button>
+    </form>
+  </section>
+
+  <div id="error" class="err hidden"></div>
+
+  <section id="result" class="hidden">
+    <h2>Report</h2>
+    <div class="counts">
+      <div id="cSource">0<span>source rows</span></div>
+      <div id="cWritten">0<span>rows written</span></div>
+    </div>
+    <div id="blocks"></div>
+    <button id="download" class="secondary">Download network-devices-translated.csv</button>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let csvText = "";
+
+function block(cls, title, note, items) {
+  if (!items || !items.length) return "";
+  const li = items.map(v => "<li>" + esc(v) + "</li>").join("");
+  return '<div class="block ' + cls + '"><h3>' + esc(title) + " (" + items.length + ")</h3>" +
+         (note ? "<div>" + note + "</div>" : "") + "<ul>" + li + "</ul></div>";
+}
+
+function collapsed(title, note, items) {
+  if (!items || !items.length) return "";
+  const li = items.map(v => "<li>" + esc(v) + "</li>").join("");
+  return '<div class="block"><details><summary>' + esc(title) + " (" + items.length + ")</summary>" +
+         (note ? "<div>" + note + "</div>" : "") + "<ul>" + li + "</ul></details></div>";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function render(rep) {
+  $("cSource").childNodes[0].nodeValue = rep.sourceRows;
+  $("cWritten").childNodes[0].nodeValue = rep.writtenRows;
+  let html = "";
+  html += block("danger", "Rows refused — NOT written",
+    "These devices are missing from the output and must be handled by hand.", rep.refused);
+  html += block("warn", "Source columns with no home in the target — DATA LOSS",
+    "The target release has no column for these; their values are not carried over.", rep.unmappedSrc);
+  if (!rep.refused?.length && !rep.unmappedSrc?.length) {
+    html += '<div class="block"><span class="ok">No data loss: every source column mapped and every row was written.</span></div>';
+  }
+  html += collapsed("Target columns left blank", "Present in the target template, absent from the source export.", rep.emptyTarget);
+  html += collapsed("Read-only columns dropped", "PAC state is re-provisioned by ISE on first authentication.", rep.droppedRO);
+  html += collapsed("Node hostname rewritten", "", rep.nodeRewrites);
+  html += collapsed("Columns mapped", "", rep.mapped);
+  $("blocks").innerHTML = html;
+  $("result").classList.remove("hidden");
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("error").classList.add("hidden");
+  $("result").classList.add("hidden");
+  $("go").disabled = true;
+  $("go").textContent = "Translating…";
+  try {
+    const fd = new FormData();
+    fd.append("source", $("source").files[0]);
+    fd.append("template", $("template").files[0]);
+    fd.append("targetNode", $("targetNode").value.trim());
+    const res = await fetch("/api/translate", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
+    csvText = data.csv;
+    render(data.report);
+  } catch (err) {
+    $("error").textContent = err.message;
+    $("error").classList.remove("hidden");
+  } finally {
+    $("go").disabled = false;
+    $("go").textContent = "Translate";
+  }
+});
+
+$("download").addEventListener("click", () => {
+  const url = URL.createObjectURL(new Blob([csvText], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "network-devices-translated.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
