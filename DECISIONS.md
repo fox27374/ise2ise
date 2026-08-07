@@ -222,6 +222,22 @@ OpenAPI writes are **not** covered by the check, which is why the trusted
 certificate import worked throughout and this stayed hidden until an endpoint
 had to be created.
 
+**ERS refuses the OpenAPI's own endpoint fields.** Found on 2026-08-07 against
+the second lab box, where six of nine static endpoints failed the create with
+HTTP 400 `Resource Initialization Failed due to JSON invalidity` and the other
+three landed. The correlation was exact: every failure carried a non-null
+`ipAddress`, every success had none. `/api/v1/endpoint` returns `ipAddress`,
+`vendor`, `productId`, `serialNumber`, `deviceType`, the revision and protocol
+fields and the whole `asset*` set; `/ers/config/endpoint` knows none of them and
+rejects the entire object, naming every property in the payload rather than the
+offending one.
+
+The null strip below hid this completely — those fields are null on an endpoint
+ISE has never learned an address for, which is most of them in a quiet lab. A
+DHCP-learned address is not null. All of it is runtime state the target relearns,
+so the fields are dropped at endpoint create rather than on export, which covers
+bundles written before this was known.
+
 **ERS refuses JSON nulls on create**: "Resource Initialization Failed due to JSON
 invalidity: please if properties names are correct: ipAddress->...". An endpoint
 read from the OpenAPI arrives with a dozen null fields (`ipAddress`, `vendor`,
@@ -463,6 +479,35 @@ trusted certificate surface described above.
 The code reports what it actually received when a shape does not match, rather
 than panicking or returning empty. Read those messages literally.
 
+### The first real migration, source to target
+
+A second deployment answered on 2026-08-07, which made the first end-to-end run
+between two real boxes possible: 3.4.0.608 at `172.24.89.178`, **two nodes**
+(`ISE-178`, `ISE-179`), ERS and OpenAPI both on. `ntslab.loc`'s standalone was
+the source.
+
+It is neither fresh nor standalone, so it contradicts the assumption at the top
+of this file in both directions — and nothing broke, because create-only means
+the target's own state decides what happens: 52 of 72 objects were already there
+and were skipped by name. What the two-node target does *not* yet exercise is the
+node-collapse assumption, since neither endpoints nor trusted certificates carry
+a node reference. System certificates will be the first family that cares.
+
+The run: 44 endpoint identity groups, 9 statically assigned endpoints and 19
+trusted certificates exported into a 69 KB encrypted bundle, pre-flight reporting
+20 create / 52 skip / 0 blocked, and after the endpoint fix above a confirmed
+import creating all of them and two further re-runs creating nothing.
+
+One thing the operator caught that the code did not: a self-signed certificate
+for `ibk-sda-ise2.ntslab.loc` sat in the source's trust store and was offered for
+export. The per-node exclusion only drops a self-signed certificate whose CN
+matches a node of *this* deployment, and `ise2` is not a node of the standalone —
+so a dead node certificate from some other box passed the filter. Correct by the
+rule as written, wrong in effect. Widening the rule to "any self-signed
+certificate whose CN is an FQDN" would also drop legitimate self-signed roots, so
+the picker, not the filter, is the place this gets decided; it is worth flagging
+such a certificate in the UI rather than silently offering it.
+
 ### Lab checklist, when the lab is back
 
 Do this **before** building more slices — the policy, TrustSec and certificate
@@ -488,8 +533,10 @@ slice on unverified shapes.
    The group was recreated with a new UUID and the endpoint followed it.
 9. ~~Re-run the same import~~ — done. Nothing created, nothing duplicated,
    nothing failed.
-10. Try a bundle with the wrong passphrase; confirm the error is legible.
-    **Still open.**
+10. ~~Try a bundle with the wrong passphrase; confirm the error is legible~~ —
+    done. Both a wrong passphrase and a truncated bundle answer `wrong
+    passphrase, or the bundle is corrupt or was tampered with`, before any
+    connection to the target is made.
 
 Trusted certificates — items 11, 12, 14, 15 and 16 were done on 2026-08-07 and
 their answers are in "Verified against ISE 3.4.0.608" above. What is left:
@@ -499,8 +546,10 @@ their answers are in "Verified against ISE 3.4.0.608" above. What is left:
 12. Confirm an **expired** certificate is blocked and never attempted. The lab
     store has none, so this remains fake-verified only.
 13. Re-run an import of certificates the target already has and confirm every one
-    is skipped, none duplicated — including one **renamed on the target**, which
-    is what fingerprint matching exists for.
+    is skipped, none duplicated — **half done**: 17 of 19 source certificates
+    were recognised as already present on a target that had never seen this
+    bundle, and two full re-runs created nothing. The **renamed on the target**
+    case, which is what fingerprint matching exists for, is still open.
 14. With OpenAPI disabled on the target, confirm pre-flight blocks the family
     once with a legible reason rather than per certificate.
 15. Import a certificate whose description contains a comma and confirm the

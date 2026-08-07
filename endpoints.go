@@ -29,6 +29,24 @@ const (
 	pathEndpointsAPI   = "/api/v1/endpoint"
 )
 
+// openAPIOnlyEndpointFields are fields the OpenAPI endpoint resource returns and
+// the ERS endpoint resource does not know. ERS answers a create carrying any of
+// them with HTTP 400 "Resource Initialization Failed due to JSON invalidity",
+// naming every property in the payload rather than the offending one — so this
+// list is what a real 3.4 box actually rejected, not a guess at its schema.
+//
+// Nulls are already stripped at ersCreate, which hid this for every endpoint ISE
+// had never learned an IP or an asset attribute for. A DHCP-learned ipAddress is
+// a non-null value and failed the create outright. All of it is runtime state
+// the target relearns, so dropping it loses nothing.
+var openAPIOnlyEndpointFields = []string{
+	"ipAddress", "vendor", "productId", "serialNumber", "deviceType",
+	"softwareRevision", "hardwareRevision", "protocol",
+	"assetId", "assetName", "assetIpAddress", "assetVendor", "assetProductId",
+	"assetSerialNumber", "assetDeviceType", "assetSwRevision",
+	"assetHwRevision", "assetProtocol", "assetConnectedLinks",
+}
+
 // --- cross-reference remapping ----------------------------------------------
 //
 // Every reference between ISE objects is a UUID that only means something in
@@ -770,6 +788,11 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 		}
 		done++
 		obj := maps.Clone(it.obj)
+		// Stripped here rather than on export so a bundle written before this
+		// was known imports too.
+		for _, f := range openAPIOnlyEndpointFields {
+			delete(obj, f)
+		}
 		if ok, why := nameToRef(obj, "groupName", "groupId", "endpoint identity group", groupIDByName); !ok {
 			res.Failed++
 			res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))

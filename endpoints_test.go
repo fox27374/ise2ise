@@ -434,3 +434,48 @@ func TestImportStripsNullsFromERSCreate(t *testing.T) {
 		t.Error("the endpoint was not created on the target")
 	}
 }
+
+// A real 3.4 box refused every endpoint that carried a DHCP-learned ipAddress
+// with HTTP 400 "Resource Initialization Failed due to JSON invalidity": the
+// field exists on the OpenAPI resource and not on the ERS one. Null stripping
+// did not cover it, because a learned address is not null.
+func TestImportStripsOpenAPIOnlyEndpointFields(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "asset-test-group")
+	ep := src.addEndpoint("02:00:5E:00:53:04", "grp-1", true, "")
+	ep["ipAddress"] = "10.20.1.196"
+	ep["vendor"] = "Cisco Systems, Inc"
+	ep["assetId"] = "asset-42"
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"asset-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	c := tgt.client()
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	for _, e := range tgt.endpoints {
+		if endpointMAC(e) != "02:00:5E:00:53:04" {
+			continue
+		}
+		for _, f := range openAPIOnlyEndpointFields {
+			if v, ok := e[f]; ok {
+				t.Errorf("%s reached the ERS create as %v; ERS rejects the whole object", f, v)
+			}
+		}
+		return
+	}
+	t.Error("the endpoint was not created on the target")
+}
