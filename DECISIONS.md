@@ -39,7 +39,14 @@ runs. The trade is that "one file" becomes one file per OS.
 Rejected: a pure HTML/JS page with no server. The browser cannot reach ISE —
 CORS, the self-signed certificate, and Basic auth to port 9060 all block it.
 
-**Prebuilt binaries are committed** to `dist/` so a recipient needs no toolchain.
+**Prebuilt binaries ship as release assets**, so a recipient still needs no
+toolchain. They were originally committed to `dist/`, which was the right call
+while the repository was private and hand-carried and the wrong one the moment it
+had a remote: four ~10 MB blobs per rebuild, replaced on every slice, is a
+history that grows faster than the source it documents. A tag now triggers a
+workflow that re-runs the checks, cross-compiles and attaches the binaries plus
+`SHA256SUMS`. The blobs already in the history stay there — rewriting it is a
+bigger cost than the space it reclaims.
 
 **Stdlib only.** `go.mod` has no requirements and should stay that way.
 AES-GCM, PBKDF2, CSV, HTTP and `embed` are all in the standard library as of

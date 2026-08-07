@@ -1,0 +1,42 @@
+name: release
+
+# Binaries are release assets, not commits. Tag and push:
+#
+#   git tag v0.3.0 && git push origin v0.3.0
+#
+# gh and GITHUB_TOKEN are already on the runner, so this needs no third-party
+# actions and no secrets beyond the default one.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Verify
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+
+      - name: Build
+        run: make dist
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes

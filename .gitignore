@@ -1,8 +1,10 @@
 # ISE network device exports are plaintext credential dumps. Never commit one.
 *.csv
 
-# Host build output; dist/ holds the binaries that ship.
+# Build output. The binaries ship as release assets, not as commits: four
+# ~10 MB blobs per rebuild is a repository that grows faster than its source.
 /ise2ise
+/dist/
 
 # OS cruft
 .DS_Store

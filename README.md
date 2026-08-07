@@ -162,14 +162,18 @@ System certificates — the ones with a private key — are a later slice.
 
 ## Running
 
-Prebuilt binaries are in `dist/`:
+Prebuilt binaries are attached to each release —
+[github.com/fox27374/ise2ise/releases](https://github.com/fox27374/ise2ise/releases):
 
 ```
-dist/ise2ise-darwin-arm64
-dist/ise2ise-darwin-amd64
-dist/ise2ise-windows-amd64.exe
-dist/ise2ise-linux-amd64
+ise2ise-darwin-arm64
+ise2ise-darwin-amd64
+ise2ise-windows-amd64.exe
+ise2ise-linux-amd64
 ```
+
+`SHA256SUMS` is attached alongside them. On macOS and Linux, `chmod +x` the file
+you downloaded.
 
 Or from source (Go 1.24+, stdlib only, no third-party modules):
 
@@ -195,7 +199,14 @@ translated CSV and the encrypted bundle from in-memory blobs.
 ```
 make build   # ./ise2ise for the host platform
 make test    # gofmt -l . && go vet ./... && go test ./...
-make dist    # all four cross-compiled binaries into dist/
+make dist    # all four cross-compiled binaries into dist/ (git-ignored)
+```
+
+Releasing is a tag. The workflow in `.github/workflows/release.yml` re-runs the
+checks, cross-compiles, and attaches the four binaries and their checksums:
+
+```
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 ## Not yet implemented
