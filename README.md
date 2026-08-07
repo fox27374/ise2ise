@@ -65,7 +65,8 @@ Handle both CSVs as credential material and delete them when you are done.
 Both ISE APIs are off out of the box. On **each** deployment:
 `Administration → System → Settings → API Settings` → enable **ERS** (port
 9060) and **OpenAPI** (port 443), and use an account with the **ERS Admin**
-role (plus **API Admin** for OpenAPI). ise2ise probes both and tells you which
+role (plus **API Admin** for OpenAPI). Leave the **CSRF check** however you like
+— the tool performs ISE's nonce handshake, so it works either way. ise2ise probes both and tells you which
 one answered; when only ERS is available everything still works, just slower,
 because ERS needs one GET per object.
 
@@ -154,9 +155,18 @@ What to expect:
   step fails the certificate still stays — the report names the settings to enter
   by hand. An OCSP service selection is never carried, because OCSP service
   configurations are out of scope; the report names the service.
+- **A description containing a comma cannot be set.** ISE refuses the import
+  outright ("Security Check Failed"), so the certificate is imported without its
+  description and the report tells you what to paste back in.
 - **Importing needs OpenAPI on the target.** It is the only create path ISE
-  offers for this family; with OpenAPI off, the whole family is blocked with one
-  line in the report rather than one line per certificate.
+  offers for this family — the ERS resource does not exist. With OpenAPI off, the
+  whole family is blocked with one line in the report rather than one line per
+  certificate.
+
+This path has been run against a real ISE 3.4 deployment: 33 certificates listed,
+14 excluded, export and encrypted bundle, pre-flight recognising duplicates by
+fingerprint, and a confirmed import creating a certificate with its trust
+purposes intact.
 
 System certificates — the ones with a private key — are a later slice.
 
@@ -225,7 +235,8 @@ even as a stub:
 - System certificates (the ones with a private key)
 - Network device CSV → API import
 
-The API field names come from Cisco's documentation, not from a live box. When
-a response does not have the expected shape, the tool reports what it actually
-received instead of failing silently — please read those messages literally
-when you hit one in a lab.
+The probe, both endpoint families and the whole trusted certificate path have
+been exercised against a real ISE 3.4 standalone, import included. Everything
+still to be built comes from Cisco's documentation rather than a live box. When a response does not have the expected shape, the tool reports what it
+actually received instead of failing silently; please read those messages
+literally when you hit one in a lab.

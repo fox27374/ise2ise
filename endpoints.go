@@ -1,9 +1,10 @@
 package main
 
 import (
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
 	"sort"
 	"strings"
@@ -422,8 +423,8 @@ func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 	certs := b.Objects[familyTrustedCerts]
 	if len(certs) > 0 {
-		// Read target's trusted certificates.
-		targetStubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+		// Read target's trusted certificates from OpenAPI.
+		targetCerts, err := fetchTrustedCertsOpenAPI(c)
 		if err != nil {
 			// The only create path is OpenAPI, so one blocked item stands for the
 			// whole family rather than one per certificate.
@@ -436,18 +437,16 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 		targetByName := map[string]bool{}
 		fingerprints := 0
 
-		for _, stub := range targetStubs {
-			cert, err := c.ersGetByID(pathTrustedCerts, stub.ID, rootTrustedCert)
-			if err != nil {
-				continue
-			}
+		for _, cert := range targetCerts {
 			if fp := str(cert, "sha256Fingerprint"); fp != "" {
 				// Normalize: lowercase, strip whitespace and colons.
 				fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
 				targetByFingerprint[fp] = true
 				fingerprints++
 			}
-			targetByName[stub.Name] = true
+			if friendlyName := str(cert, "friendlyName"); friendlyName != "" {
+				targetByName[friendlyName] = true
+			}
 		}
 
 		// If no usable fingerprints, emit exactly one note.
@@ -566,6 +565,7 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 			name := str(obj, "name")
 			pemData := str(obj, "pem")
 			crlSettings := obj["crl"]
+			description := str(obj, "description")
 
 			// Remove fields not in the import payload.
 			delete(obj, "fingerprint")
@@ -574,37 +574,68 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 			delete(obj, "issuer")
 			delete(obj, "crl")
 			delete(obj, "pem")
+			delete(obj, "friendlyName")
 
-			// Build the import payload.
+			// Build the import payload with plain-text PEM data (not base64-encoded).
 			payload := map[string]any{
-				"name": name,
-				"data": base64.StdEncoding.EncodeToString([]byte(pemData)),
+				"name":                        name,
+				"data":                        pemData,
+				"allowOutOfDateCert":          false,
+				"allowSHA1Certificates":       false,
+				"allowBasicConstraintCAFalse": false,
 			}
-			if desc := str(obj, "description"); desc != "" {
-				payload["description"] = desc
-			}
+
+			// Add optional fields from the bundle.
 			for _, flag := range []string{"trustForIseAuth", "trustForClientAuth", "trustForCertificateBasedAdminAuth", "trustForCiscoServicesAuth", "allowBasicConstraintCAFalse", "allowOutOfDateCert", "allowSHA1Certificates", "validateCertificateExtensions"} {
 				if v, ok := obj[flag]; ok {
 					payload[flag] = v
 				}
 			}
 
-			// POST the import.
+			// POST the import. If description contains a comma, the import will fail with
+			// "Security Check Failed". Retry without the description on that specific error.
+			if description != "" {
+				payload["description"] = description
+			}
+
 			if err := c.openAPICreate(pathTrustedCertsAPI+"/import", payload); err != nil {
-				if isDuplicate(err) {
+				// Check if this is the "Security Check Failed" + comma-in-description case.
+				var ae *APIError
+				if errors.As(err, &ae) && ae.Status == http.StatusBadRequest && strings.Contains(strings.ToLower(ae.Body), "security check failed") && strings.Contains(description, ",") {
+					// Retry without the description.
+					log("Trusted certificate %q: description contains a comma and was rejected; retrying without description.", name)
+					delete(payload, "description")
+					if retryErr := c.openAPICreate(pathTrustedCertsAPI+"/import", payload); retryErr != nil {
+						if isDuplicate(retryErr) {
+							res.Skipped++
+							log("Trusted certificate %q already exists; skipped.", name)
+							continue
+						}
+						res.Failed++
+						res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, retryErr))
+						log("FAILED trusted certificate %q: %v", name, retryErr)
+						continue
+					}
+					// Created without description; record that the description was not set.
+					res.Created++
+					log("Created trusted certificate %q (description could not be set).", name)
+					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: description %q contains a comma and could not be set; please enter it manually in the GUI", name, description))
+				} else if isDuplicate(err) {
 					res.Skipped++
 					log("Trusted certificate %q already exists; skipped.", name)
 					continue
+				} else {
+					res.Failed++
+					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, err))
+					log("FAILED trusted certificate %q: %v", name, err)
+					continue
 				}
-				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, err))
-				log("FAILED trusted certificate %q: %v", name, err)
-				continue
+			} else {
+				res.Created++
+				log("Created trusted certificate %q.", name)
 			}
-			res.Created++
-			log("Created trusted certificate %q.", name)
 
-			// If there are CRL settings, look up the cert and update via ERS.
+			// If there are CRL settings, look up the cert and update via OpenAPI PUT.
 			if crlSettings != nil {
 				// The bundle is operator-supplied data: a shape that is not an
 				// object is reported, never asserted.
@@ -613,8 +644,9 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: the bundle's CRL settings are %T, not an object; they were not applied", name, crlSettings))
 					continue
 				}
-				// Re-read the target's certs to find the new one by name.
-				stubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+
+				// Re-read the target's certs to find the new one by friendlyName.
+				targetCerts, err := fetchTrustedCertsOpenAPI(c)
 				if err != nil {
 					// Can't look it up; record the error but don't fail the whole import.
 					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied (could not read target certs): %v", name, err)
@@ -624,9 +656,9 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 				}
 
 				var targetID string
-				for _, stub := range stubs {
-					if stub.Name == name {
-						targetID = stub.ID
+				for _, cert := range targetCerts {
+					if str(cert, "friendlyName") == name {
+						targetID = str(cert, "id")
 						break
 					}
 				}
@@ -637,15 +669,46 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 					continue
 				}
 
-				// PUT the CRL settings via ERS.
-				crlUpdate := maps.Clone(crlMap)
-				// Don't include selectedOCSPService in the PUT.
-				delete(crlUpdate, "selectedOCSPService")
+				// Build the CRL PUT payload. The bundle has booleans and integers;
+				// the API PUT expects the same types.
+				crlUpdate := map[string]any{"name": name}
+				for k, v := range crlMap {
+					if k != "selectedOCSPService" {
+						crlUpdate[k] = v
+					}
+				}
+				// ISE 3.4 rejects the whole PUT with "can only be set true if
+				// downloadCRL parameter is set to be true" when any of these is
+				// true while CRL download is off. They are inert in that state
+				// anyway, so they are forced false rather than losing the rest of
+				// the settings to a 400.
+				if dl, _ := crlUpdate["downloadCRL"].(bool); !dl {
+					for _, dependent := range crlDownloadDependentFields {
+						if b, _ := crlUpdate[dependent].(bool); b {
+							crlUpdate[dependent] = false
+						}
+					}
+				}
+				if description != "" && !strings.Contains(description, ",") {
+					crlUpdate["description"] = description
+				}
+				// The PUT replaces the object rather than patching it: a trust
+				// flag left out of the body comes back false, and the certificate
+				// ends up trusted for nothing ("trustedFor": "Unknown") despite
+				// the import having set it correctly. Carry them again. Verified
+				// on 3.4.
+				for _, flag := range trustFlagFields {
+					if v, ok := obj[flag]; ok {
+						crlUpdate[flag] = v
+					}
+				}
 
-				if err := c.ersPut(pathTrustedCerts+"/"+targetID, rootTrustedCert, crlUpdate); err != nil {
+				// PUT the CRL settings via OpenAPI.
+				if err := c.openAPIPut(pathTrustedCertsAPI+"/"+targetID, crlUpdate); err != nil {
 					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied: %v", name, err)
 					res.Errors = append(res.Errors, errMsg)
 					log("WARNING: %s; these settings must be entered manually.", errMsg)
+					// Don't fail the whole import; the cert was created successfully.
 				}
 			}
 		}

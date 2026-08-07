@@ -322,7 +322,11 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log("%d to create, %d already present, %d blocked.", rep.Create, rep.Skip, rep.Blocked)
 	if rep.Create == 0 {
-		s.send(map[string]any{"type": "done", "result": &ImportResult{Errors: []string{}}, "preflight": rep})
+		// Nothing to write, but the operator still needs the counts: a re-run of
+		// a completed import must report "45 already present", not four zeros.
+		s.send(map[string]any{"type": "done", "preflight": rep, "result": &ImportResult{
+			Skipped: rep.Skip, Blocked: rep.Blocked, Errors: []string{},
+		}})
 		return
 	}
 	res, err := ApplyImport(in.client, rep, s.log)

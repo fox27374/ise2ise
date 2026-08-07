@@ -355,3 +355,82 @@ func TestApplyReportsISEErrorText(t *testing.T) {
 		t.Errorf("a race with an existing object is a skip, not a failure: %+v", res)
 	}
 }
+
+// A deployment with the ERS CSRF check enabled refuses every write until the
+// client fetches a nonce and sends it back with the session cookie. Without
+// this the endpoint import fails on a stock 3.4 box with an HTML error body.
+func TestImportWithERSCSRFCheck(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "ise2ise-test-group")
+	src.addEndpoint("02:00:5E:00:53:01", "grp-1", true, "")
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"ise2ise-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	tgt.csrfRequired = true
+	c := tgt.client()
+
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	if res.Created == 0 {
+		t.Fatal("nothing was created against a target requiring a CSRF nonce")
+	}
+	if tgt.csrfIssued == 0 {
+		t.Error("the client never fetched a CSRF nonce")
+	}
+}
+
+// Endpoints read from the OpenAPI arrive with a dozen null fields (ipAddress,
+// vendor, mdmAttributes, the asset* set). ERS refuses a create whose body
+// carries any of them: "Resource Initialization Failed due to JSON invalidity".
+func TestImportStripsNullsFromERSCreate(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "null-test-group")
+	ep := src.addEndpoint("02:00:5E:00:53:03", "grp-1", true, "")
+	ep["ipAddress"] = nil
+	ep["vendor"] = nil
+	ep["mdmAttributes"] = nil
+	ep["description"] = nil
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"null-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	c := tgt.client()
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	created := false
+	for _, e := range tgt.endpoints {
+		if endpointMAC(e) == "02:00:5E:00:53:03" {
+			created = true
+		}
+	}
+	if !created {
+		t.Error("the endpoint was not created on the target")
+	}
+}

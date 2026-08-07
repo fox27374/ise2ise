@@ -149,6 +149,87 @@ key* is 3.3+. For a 3.2 source the operator exports the ZIP from the GUI and
 drops it in; the import path (3.1+) is identical either way. One "certificate
 password" field covers the API export, the GUI ZIPs and the import.
 
+### Verified against ISE 3.4.0.608 on 2026-08-07
+
+The lab came back and answered all of this. What the documentation said and what
+ISE does differ enough that the first implementation read **zero** of the 33
+certificates on the box and reported success.
+
+| Assumption | Reality on 3.4 |
+|---|---|
+| ERS `/ers/config/trustedcertificate` | **404.** The resource does not exist. OpenAPI is the only route. |
+| Objects have `name` | The field is **`friendlyName`**. |
+| List returns stubs, detail per object | The list returns **whole objects**; no second call needed. |
+| Export at `/{id}/export` | **`/export/{id}`**, id last. |
+| Export body shape unknown | **Bare PEM**, `application/octet-stream`, one certificate, filename from the friendly name. |
+| Four `trustFor*` booleans on read | A single comma-separated string, `trustedFor`: `Infrastructure` = ISE auth, `Endpoints` = client auth, `Cisco Services`, `AdminAuth`. Writes still take the four booleans. |
+| `data` is base64 | **Plain-text PEM.** |
+| Booleans and numbers | Reads give `"on"`/`"off"` and stringified integers; writes want real booleans and integers. |
+| Dates | Java `Date.toString()`: `Thu Jul 17 01:59:59 CEST 2036`. |
+| A `selfSigned` field exists | It does not. Use `issuedTo == issuedBy`. |
+| CRL settings via ERS PUT | OpenAPI `PUT /api/v1/certs/trusted-certificate/{id}`. |
+
+Three behaviours no documentation mentions, each found by hitting it:
+
+- **A comma in `description` is refused** with HTTP 400 `Security Check Failed`,
+  and the check runs before the duplicate check. `name` accepts commas. The
+  import retries once without the description rather than failing the
+  certificate, and reports what could not be set.
+- **`automaticCRLUpdate`, `enableServerIdentityCheck`,
+  `authenticateBeforeCRLReceived` and `ignoreCRLExpiration` may only be true
+  when `downloadCRL` is true** — otherwise the whole PUT is rejected. A factory
+  certificate commonly has exactly that combination, so the dependent flags are
+  forced false rather than losing every other setting to a 400.
+- **The PUT replaces rather than patches.** A trust flag left out of the body
+  comes back false and the certificate ends up `trustedFor: "Unknown"` — trusted
+  for nothing, on a certificate the import had just set correctly. The flags are
+  sent again with the CRL settings.
+
+A duplicate is **HTTP 409**, "Certificates are having same subject, same serial
+number and they are binary equal. Hence skipping the replace" — wording that
+matched none of the existing duplicate detection.
+
+Also confirmed: ISE names a node by its short hostname in `/ers/config/node`
+(`ibk-sda-ise1`) but issues its default server certificate to the FQDN
+(`ibk-sda-ise1.ntslab.loc`), so an exact comparison never matches and the
+per-node certificates were being offered for export.
+
+The whole chain now runs against the box: picker (33 listed, 12 internal CA and
+2 node certificates excluded, 19 offered), export, encrypted bundle, pre-flight
+(duplicates recognised by fingerprint), and a confirmed import that created a
+certificate with its trust flags intact.
+
+### Two things ERS demands that nothing documented
+
+Found on the same box while testing the endpoint import, and both are why that
+import had never once succeeded against real hardware.
+
+**ERS writes need a CSRF nonce.** With the CSRF check enabled — it is, by
+default, under Administration → System → Settings → API Settings — every ERS
+create is refused with an HTML body reading `CSRF nonce validation failed`. The
+handshake is a GET carrying `X-CSRF-TOKEN: fetch`, which answers **415** while
+returning `X-CSRF-Token` plus `JSESSIONIDSSO`/`APPSESSIONID` cookies; the token
+and the cookies must both travel with the write.
+
+The client does the handshake itself rather than asking the operator to turn the
+check off. Weakening a security setting on a production source deployment to run
+a migration tool is the wrong trade, and the fetch header is harmless on a
+deployment where the check is disabled. The nonce is held in memory for the life
+of one client, never persisted, and a stale one is refetched once before the
+write is retried.
+
+OpenAPI writes are **not** covered by the check, which is why the trusted
+certificate import worked throughout and this stayed hidden until an endpoint
+had to be created.
+
+**ERS refuses JSON nulls on create**: "Resource Initialization Failed due to JSON
+invalidity: please if properties names are correct: ipAddress->...". An endpoint
+read from the OpenAPI arrives with a dozen null fields (`ipAddress`, `vendor`,
+`mdmAttributes`, the whole `asset*` set), and the export carried them into the
+create. Nulls are stripped at `ersCreate`, so every family is covered and so is
+any bundle written before the fix. A null means "unset", so dropping it loses
+nothing.
+
 ### The trusted store is its own slice
 
 Interviewed 2026-08-07 and built as slice 3, ahead of system certificates. The
@@ -344,9 +425,13 @@ Small things settled provisionally, worth revisiting:
 
 ## Unverified against real hardware
 
-**No ISE has ever answered this code.** Every field name, path and payload shape
-came from Cisco's documentation. The lab (`ntslab.loc`) was offline when slices 1,
-2 and 3 were built.
+Every field name, path and payload shape originally came from Cisco's
+documentation, because the lab (`ntslab.loc`) was offline while slices 1, 2 and 3
+were built. It answered on 2026-08-07; the probe, the endpoint reads and the
+entire trusted certificate path have now been exercised against a real
+standalone (3.4.0.608, node `ibk-sda-ise1`), including the endpoint import: a
+group and a statically assigned endpoint were created on the box, the endpoint
+following the target's own group UUID, and a re-run created nothing.
 
 Slice 1 (CSV translation) *is* verified — against a real 37-device export from a
 production deployment, translated into a synthetic newer-release template.
@@ -365,21 +450,15 @@ ever lands in the repository.
 
 Known-uncertain shapes, in rough order of risk:
 
-1. `/api/v1/endpoint` — list shape, paging parameters, and which fields carry
-   `staticGroupAssignment` / `staticProfileAssignment` / `groupId` / `profileId`.
-2. `/ers/config/profilerprofile` — used for the profile-name remap.
-3. `/ers/config/node` — node list shape for the probe.
-4. `GET /api/v1/certs/trusted-certificate/{id}/export` — whether the body is PEM,
-   DER or ZIP. Sniffed rather than assumed, so all three work; what is unproven
-   is that it is one of the three at all.
-5. The target's trusted-certificate fingerprint field (`sha256Fingerprint`) and
-   its formatting. Absent means a silent fall back to name matching.
-6. Whether the trusted-certificate read-side field names match the import-side
-   ones (`trustForIseAuth` and friends), and whether the CRL PUT accepts the
-   field set the source object hands over.
-7. System certificate export body and the 3.3 export endpoint (not yet built).
-8. Egress matrix cell shape (not yet built).
-9. Condition library payloads (not yet built).
+1. `/ers/config/profilerprofile` — used for the profile-name remap.
+2. System certificate export body and the 3.3 export endpoint (not yet built).
+3. Egress matrix cell shape (not yet built).
+4. Condition library payloads (not yet built).
+
+Verified on 3.4 and no longer guesses: `/api/v1/endpoint` (bare JSON array, with
+`mac`, `groupId`, `profileId`, `staticGroupAssignment` and
+`staticProfileAssignment` all as assumed), `/ers/config/node`, and the whole
+trusted certificate surface described above.
 
 The code reports what it actually received when a shape does not match, rather
 than panicking or returning empty. Read those messages literally.
@@ -390,44 +469,43 @@ Do this **before** building more slices — the policy, TrustSec and certificate
 work all sits on top of this client, and an hour here is worth more than another
 slice on unverified shapes.
 
-1. Enable ERS and OpenAPI on the lab; confirm the probe reports version, nodes,
-   and both APIs on.
-2. Probe with a deliberately wrong password — confirm it says bad credentials,
-   not "API off".
+1. ~~Enable ERS and OpenAPI; confirm the probe reports version, nodes, both
+   APIs~~ — done. 3.4.0.608, node `ibk-sda-ise1`, both on.
+2. ~~Probe with a deliberately wrong password~~ — done. Both APIs report 401 with
+   the either/or wording, no false "API off".
 3. Probe with OpenAPI disabled — confirm it distinguishes that from a bad
-   password.
-4. Export endpoint identity groups; compare the count against the GUI.
-5. Export static endpoints from one group; confirm the static-only filter keeps
-   what the GUI shows as statically assigned and drops the profiled ones.
+   password. **Still open**; needs the setting turned off in the GUI.
+4. ~~Export endpoint identity groups~~ — done, 44 returned. Still worth comparing
+   the count against the GUI.
+5. ~~Export static endpoints from one group~~ — done. 171 endpoints read from the
+   OpenAPI, 1 static in the selected group, 170 outside it.
 6. Confirm an endpoint with a static *profile* assignment round-trips its profile
-   name.
-7. Import into a throwaway standalone; confirm the pre-flight blocks an endpoint
-   whose profiler profile is missing, and that nothing is written before confirm.
-8. Confirm a created endpoint points at the **target's** group UUID.
-9. Re-run the same import; confirm everything is skipped as already existing and
-   nothing is duplicated.
+   name. **Still open**: the lab's static endpoints are all group-assigned.
+7. Import; confirm the pre-flight blocks an endpoint whose profiler profile is
+   missing, and that nothing is written before confirm. **Half done**: nothing is
+   written before confirm (verified), the blocked case is fake-verified only.
+8. ~~Confirm a created endpoint points at the **target's** group UUID~~ — done.
+   The group was recreated with a new UUID and the endpoint followed it.
+9. ~~Re-run the same import~~ — done. Nothing created, nothing duplicated,
+   nothing failed.
 10. Try a bundle with the wrong passphrase; confirm the error is legible.
+    **Still open.**
 
-Trusted certificates, same session:
+Trusted certificates — items 11, 12, 14, 15 and 16 were done on 2026-08-07 and
+their answers are in "Verified against ISE 3.4.0.608" above. What is left:
 
-11. Export one trusted certificate and **say which shape came back** — PEM, DER
-    or ZIP, and whether the ZIP held a chain. This is the single most useful
-    thing the lab can answer for this slice.
-12. Confirm the picker excludes the internal CA certificates and each node's
-    self-signed default server certificate, and nothing else.
-13. Compare the picker's list against Administration → System → Certificates →
-    Trusted Certificates in the GUI.
-14. Confirm the target's certificate list exposes a fingerprint; if pre-flight
-    reports the name-matching fallback, send the note back verbatim.
-15. Import into the throwaway standalone; confirm the four trust flags arrive as
-    the source had them, and that an expired certificate was blocked and never
-    attempted.
-16. Confirm the CRL settings PUT is accepted, and what ISE says if it is not.
-17. Re-run the same import; confirm every certificate is skipped, none
-    duplicated, and that a certificate renamed on the target is still recognised
-    by fingerprint.
-18. With OpenAPI disabled on the target, confirm pre-flight blocks the family
+11. Compare the picker's 19 offered certificates against Administration → System
+    → Certificates → Trusted Certificates in the GUI.
+12. Confirm an **expired** certificate is blocked and never attempted. The lab
+    store has none, so this remains fake-verified only.
+13. Re-run an import of certificates the target already has and confirm every one
+    is skipped, none duplicated — including one **renamed on the target**, which
+    is what fingerprint matching exists for.
+14. With OpenAPI disabled on the target, confirm pre-flight blocks the family
     once with a legible reason rather than per certificate.
+15. Import a certificate whose description contains a comma and confirm the
+    retry lands it without the description and reports what was dropped. The lab
+    cannot hold such a description, so this too is fake-verified only.
 
 Send back whatever it gets wrong — the error text is designed to be quotable.
 
@@ -440,10 +518,13 @@ Ordered by dependency, not by size.
 1. ~~Network device CSV translation~~ — done, verified against real data.
 2. ~~API core: client, probe, encrypted bundle, endpoint groups + static
    endpoints~~ — done, fake-ISE verified only.
-3. ~~Trusted certificates~~ — built 2026-08-07, fake-ISE verified only. Taken out
-   of order because it is self-contained and needed no lab answers that policy
-   work also needs.
-4. **Lab verification of slices 2 and 3.** Blocking; see the checklist above.
+3. ~~Trusted certificates~~ — built and then corrected against real 3.4 on
+   2026-08-07. Export, pre-flight and a confirmed import all exercised against
+   the lab.
+4. **Finish lab verification**: the handful of checklist items the lab's own
+   contents cannot exercise — a static *profile* assignment, an expired
+   certificate, a comma in a description, OpenAPI switched off. Everything
+   structural is now proven on hardware.
 5. **System certificates** — operator-selected, the 3.3 export-with-private-key
    API and the 3.2 GUI-ZIP fallback, admin role off. Held back deliberately: four
    unverified shapes and a private key, none of it testable without the lab.
