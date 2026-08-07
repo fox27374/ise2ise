@@ -545,11 +545,18 @@ their answers are in "Verified against ISE 3.4.0.608" above. What is left:
     → Certificates → Trusted Certificates in the GUI.
 12. Confirm an **expired** certificate is blocked and never attempted. The lab
     store has none, so this remains fake-verified only.
-13. Re-run an import of certificates the target already has and confirm every one
-    is skipped, none duplicated — **half done**: 17 of 19 source certificates
-    were recognised as already present on a target that had never seen this
-    bundle, and two full re-runs created nothing. The **renamed on the target**
-    case, which is what fingerprint matching exists for, is still open.
+13. ~~Re-run an import of certificates the target already has and confirm every
+    one is skipped, none duplicated — including one **renamed on the target**~~ —
+    done. 17 of 19 source certificates were recognised as already present on a
+    target that had never seen this bundle, and two full re-runs created nothing.
+    The renamed case was then forced by hand: `ROOTCA NTSLAB`, imported by the
+    tool, was renamed to `ROOTCA NTSLAB 2` in the target's GUI, and pre-flight
+    still reported 0 create / 71 skip. Only the SHA-256 fingerprint could have
+    matched it, which is what the fingerprint path exists for.
+
+    The report says "already exists on the target" either way. It does not say
+    the match was by content under a different name, which is the one case where
+    an operator would want to know.
 14. With OpenAPI disabled on the target, confirm pre-flight blocks the family
     once with a legible reason rather than per certificate.
 15. Import a certificate whose description contains a comma and confirm the
