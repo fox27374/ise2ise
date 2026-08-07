@@ -169,6 +169,8 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         <label><input type="checkbox" id="famEndpoints" checked> Static endpoints
           <span class="hint">Only endpoints with a static group or static profile assignment. Profiler-assigned
             endpoints are left behind: the new deployment regenerates them.</span></label>
+        <label><input type="checkbox" id="famCerts"> Trusted certificates
+          <span class="hint">Portable certificate authority, root and intermediate certificates.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Export endpoints from these groups
@@ -178,6 +180,15 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <button type="button" class="link" id="expSelNone">select none</button>
         </div>
         <div class="picker" id="expGroups">Loading groups…</div>
+      </div>
+      <div id="expCertsWrap" style="margin-top:1rem" class="hidden">
+        <label>Export these trusted certificates
+          <span class="hint">Excluded certificates are shown unticked and disabled with the reason.</span></label>
+        <div style="margin-bottom:.5rem">
+          <button type="button" class="link" id="expSelAllCerts">select all</button> ·
+          <button type="button" class="link" id="expSelNoneCerts">select none</button>
+        </div>
+        <div class="picker" id="expCerts">Loading certificates…</div>
       </div>
     </section>
 
@@ -432,11 +443,36 @@ async function loadGroups() {
   }
 }
 
+async function loadCerts() {
+  $("expCerts").textContent = "Loading certificates…";
+  try {
+    const data = await postJSON("/api/trusted-certs", expCreds);
+    const cs = data.certs || [];
+    if (!cs.length) { $("expCerts").textContent = "This deployment has no trusted certificates."; return; }
+    $("expCerts").innerHTML = cs.map(c => {
+      let label = esc(c.name);
+      if (c.excluded) {
+        label += ' <span style="color: var(--warn-fg)">' + esc(c.excludeReason) + '</span>';
+      }
+      return '<label><input type="checkbox" class="cert" value="' + esc(c.name) + '"' + (c.excluded ? ' disabled' : ' checked') + '> ' + label + "</label>";
+    }).join("");
+  } catch (err) {
+    $("expCerts").textContent = "Could not list certificates: " + err.message;
+  }
+}
+
 const eachGroup = fn => document.querySelectorAll("#expGroups .grp").forEach(fn);
+const eachCert = fn => document.querySelectorAll("#expCerts .cert").forEach(fn);
 $("expSelAll").addEventListener("click", () => eachGroup(c => c.checked = true));
 $("expSelNone").addEventListener("click", () => eachGroup(c => c.checked = false));
+$("expSelAllCerts").addEventListener("click", () => eachCert(c => { if (!c.disabled) c.checked = true; }));
+$("expSelNoneCerts").addEventListener("click", () => eachCert(c => c.checked = false));
 $("famEndpoints").addEventListener("change", () => {
   $("expGroupsWrap").classList.toggle("hidden", !$("famEndpoints").checked);
+});
+$("famCerts").addEventListener("change", () => {
+  $("expCertsWrap").classList.toggle("hidden", !$("famCerts").checked);
+  if ($("famCerts").checked) loadCerts();
 });
 
 $("expGo").addEventListener("click", async () => {
@@ -445,6 +481,7 @@ $("expGo").addEventListener("click", async () => {
   const families = [];
   if ($("famGroups").checked) families.push("endpointGroups");
   if ($("famEndpoints").checked) families.push("endpoints");
+  if ($("famCerts").checked) families.push("trustedCertificates");
   if (!families.length) return showErr($("expError"), "Select at least one object family.");
   const phrase = $("expPhrase").value;
   if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");
@@ -454,6 +491,11 @@ $("expGo").addEventListener("click", async () => {
   if ($("famEndpoints").checked && !groups.length) {
     return showErr($("expError"), "Select at least one endpoint identity group, or untick “Static endpoints”.");
   }
+  const certs = [];
+  eachCert(c => { if (c.checked) certs.push(c.value); });
+  if ($("famCerts").checked && !certs.length) {
+    return showErr($("expError"), "Select at least one trusted certificate, or untick “Trusted certificates”.");
+  }
 
   $("expGo").disabled = true;
   $("expGo").textContent = "Exporting…";
@@ -462,7 +504,7 @@ $("expGo").addEventListener("click", async () => {
   try {
     const res = await fetch("/api/export", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, passphrase: phrase })),
+      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, certs, passphrase: phrase })),
     });
     await readStream(res, m => {
       if (m.type === "log") logLine($("expLog"), m.msg);

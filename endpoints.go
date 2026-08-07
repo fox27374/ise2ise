@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"maps"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Object families carried by a bundle. One string per family, used as the
@@ -13,6 +15,7 @@ import (
 const (
 	familyEndpointGroups = "endpointGroups"
 	familyEndpoints      = "endpoints"
+	familyTrustedCerts   = "trustedCertificates"
 )
 
 // ISE paths and their ERS root keys.
@@ -347,6 +350,8 @@ func (r *PreflightReport) add(it PreflightItem) {
 func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 	r := &PreflightReport{Source: b.Source, Items: []PreflightItem{}, Notes: append([]string{}, b.Notes...)}
 
+	preflightTrustedCerts(c, b, r)
+
 	groupIDByName, err := stubsByName(c, pathEndpointGroups)
 	if err != nil {
 		return nil, fmt.Errorf("reading the target's endpoint identity groups: %w", err)
@@ -406,7 +411,100 @@ func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 		}
 		r.add(it)
 	}
+
 	return r, nil
+}
+
+// preflightTrustedCerts resolves the trusted certificate family. It runs before
+// the endpoint families and in its own function because the endpoint section
+// returns early when the bundle carries no endpoints, and certificates travel
+// independently of them.
+func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
+	certs := b.Objects[familyTrustedCerts]
+	if len(certs) > 0 {
+		// Read target's trusted certificates.
+		targetStubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+		if err != nil {
+			// The only create path is OpenAPI, so one blocked item stands for the
+			// whole family rather than one per certificate.
+			it := PreflightItem{Family: familyTrustedCerts, Name: "trusted certificates", Action: actionBlocked, Reason: "the import path POST /api/v1/certs/trusted-certificate/import is OpenAPI-only and the target's OpenAPI is not answering: " + err.Error()}
+			r.add(it)
+			return
+		}
+
+		targetByFingerprint := map[string]bool{}
+		targetByName := map[string]bool{}
+		fingerprints := 0
+
+		for _, stub := range targetStubs {
+			cert, err := c.ersGetByID(pathTrustedCerts, stub.ID, rootTrustedCert)
+			if err != nil {
+				continue
+			}
+			if fp := str(cert, "sha256Fingerprint"); fp != "" {
+				// Normalize: lowercase, strip whitespace and colons.
+				fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+				targetByFingerprint[fp] = true
+				fingerprints++
+			}
+			targetByName[stub.Name] = true
+		}
+
+		// If no usable fingerprints, emit exactly one note.
+		if fingerprints == 0 && len(targetByName) > 0 {
+			r.Notes = append(r.Notes, "Trusted certificates: the target's objects do not expose a sha256Fingerprint field; using name-based deduplication instead")
+		}
+
+		for _, certObj := range certs {
+			name := str(certObj, "name")
+			pemData := str(certObj, "pem")
+			notAfter := str(certObj, "notAfter")
+			fp := str(certObj, "fingerprint")
+
+			it := PreflightItem{Family: familyTrustedCerts, Name: name, obj: certObj}
+
+			// Expired certificates are never attempted. The date is parsed, not
+			// string-compared: a fresh deployment does not need dead trust, and
+			// ISE would refuse it anyway without allowOutOfDateCert.
+			if notAfter != "" {
+				exp, err := time.Parse(time.RFC3339, notAfter)
+				switch {
+				case err != nil:
+					it.Action, it.Reason = actionBlocked, fmt.Sprintf("certificate expiry %q is not a date this build understands", notAfter)
+					r.add(it)
+					continue
+				case exp.Before(time.Now()):
+					it.Action, it.Reason = actionBlocked, fmt.Sprintf("certificate expired on %s", exp.Format(time.RFC3339))
+					r.add(it)
+					continue
+				}
+			}
+
+			// Check PEM.
+			if pemData == "" {
+				it.Action, it.Reason = actionBlocked, "certificate has no PEM data"
+				r.add(it)
+				continue
+			}
+
+			// Dedup by fingerprint if available, else by name.
+			if fingerprints > 0 && fp != "" {
+				fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+				if targetByFingerprint[fpNorm] {
+					it.Action, it.Reason = actionSkip, "already exists on the target"
+					r.add(it)
+					continue
+				}
+			} else if targetByName[name] {
+				it.Action, it.Reason = actionSkip, "already exists on the target"
+				r.add(it)
+				continue
+			}
+
+			it.Action = actionCreate
+			r.add(it)
+		}
+	}
 }
 
 func stubsByName(c *Client, path string) (map[string]string, error) {
@@ -445,10 +543,116 @@ type ImportResult struct {
 }
 
 // ApplyImport writes the objects the pre-flight report marked as creatable, in
-// dependency order: groups first, then the endpoints that reference them.
+// dependency order: trusted certificates first, then groups, then endpoints.
 // Nothing else is touched; existing objects are never overwritten.
 func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*ImportResult, error) {
 	res := &ImportResult{Errors: []string{}}
+
+	// Trusted certificates.
+	var certCount int
+	for _, it := range r.Items {
+		if it.Family == familyTrustedCerts && it.Action == actionCreate {
+			certCount++
+		}
+	}
+	if certCount > 0 {
+		log("Creating %d trusted certificates…", certCount)
+		for _, it := range r.Items {
+			if it.Family != familyTrustedCerts || it.Action != actionCreate {
+				continue
+			}
+
+			obj := maps.Clone(it.obj)
+			name := str(obj, "name")
+			pemData := str(obj, "pem")
+			crlSettings := obj["crl"]
+
+			// Remove fields not in the import payload.
+			delete(obj, "fingerprint")
+			delete(obj, "notAfter")
+			delete(obj, "subject")
+			delete(obj, "issuer")
+			delete(obj, "crl")
+			delete(obj, "pem")
+
+			// Build the import payload.
+			payload := map[string]any{
+				"name": name,
+				"data": base64.StdEncoding.EncodeToString([]byte(pemData)),
+			}
+			if desc := str(obj, "description"); desc != "" {
+				payload["description"] = desc
+			}
+			for _, flag := range []string{"trustForIseAuth", "trustForClientAuth", "trustForCertificateBasedAdminAuth", "trustForCiscoServicesAuth", "allowBasicConstraintCAFalse", "allowOutOfDateCert", "allowSHA1Certificates", "validateCertificateExtensions"} {
+				if v, ok := obj[flag]; ok {
+					payload[flag] = v
+				}
+			}
+
+			// POST the import.
+			if err := c.openAPICreate(pathTrustedCertsAPI+"/import", payload); err != nil {
+				if isDuplicate(err) {
+					res.Skipped++
+					log("Trusted certificate %q already exists; skipped.", name)
+					continue
+				}
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, err))
+				log("FAILED trusted certificate %q: %v", name, err)
+				continue
+			}
+			res.Created++
+			log("Created trusted certificate %q.", name)
+
+			// If there are CRL settings, look up the cert and update via ERS.
+			if crlSettings != nil {
+				// The bundle is operator-supplied data: a shape that is not an
+				// object is reported, never asserted.
+				crlMap, ok := crlSettings.(map[string]any)
+				if !ok {
+					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: the bundle's CRL settings are %T, not an object; they were not applied", name, crlSettings))
+					continue
+				}
+				// Re-read the target's certs to find the new one by name.
+				stubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+				if err != nil {
+					// Can't look it up; record the error but don't fail the whole import.
+					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied (could not read target certs): %v", name, err)
+					res.Errors = append(res.Errors, errMsg)
+					log("WARNING: %s; these settings must be entered manually.", errMsg)
+					continue
+				}
+
+				var targetID string
+				for _, stub := range stubs {
+					if stub.Name == name {
+						targetID = stub.ID
+						break
+					}
+				}
+				if targetID == "" {
+					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied (certificate not found on target after creation)", name)
+					res.Errors = append(res.Errors, errMsg)
+					log("WARNING: %s; these settings must be entered manually.", errMsg)
+					continue
+				}
+
+				// PUT the CRL settings via ERS.
+				crlUpdate := maps.Clone(crlMap)
+				// Don't include selectedOCSPService in the PUT.
+				delete(crlUpdate, "selectedOCSPService")
+
+				if err := c.ersPut(pathTrustedCerts+"/"+targetID, rootTrustedCert, crlUpdate); err != nil {
+					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied: %v", name, err)
+					res.Errors = append(res.Errors, errMsg)
+					log("WARNING: %s; these settings must be entered manually.", errMsg)
+				}
+			}
+		}
+		if certCount > 0 {
+			log("Completed %d trusted certificates.", certCount)
+		}
+	}
 
 	var createdGroups int
 	for _, it := range r.Items {

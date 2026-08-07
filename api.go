@@ -81,6 +81,29 @@ func handleEndpointGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
 }
 
+func handleTrustedCerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var in creds
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "could not read the request: "+err.Error())
+		return
+	}
+	c, err := in.client()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	certs, err := ListTrustedCerts(c)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"certs": certs})
+}
+
 // --- newline-delimited JSON progress ----------------------------------------
 
 // stream writes one JSON object per line and flushes each one, so the browser
@@ -125,6 +148,7 @@ type exportReq struct {
 	creds
 	Families   []string `json:"families"`
 	Groups     []string `json:"groups"`
+	Certs      []string `json:"certs"`
 	Passphrase string   `json:"passphrase"`
 }
 
@@ -164,6 +188,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 
 	b := NewBundle(probe)
 	if err := ExportEndpoints(c, b, in.Families, in.Groups, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
+	if err := ExportTrustedCerts(c, b, in.Families, in.Certs, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}

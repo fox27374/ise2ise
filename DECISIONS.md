@@ -142,6 +142,81 @@ key* is 3.3+. For a 3.2 source the operator exports the ZIP from the GUI and
 drops it in; the import path (3.1+) is identical either way. One "certificate
 password" field covers the API export, the GUI ZIPs and the import.
 
+### The trusted store is its own slice
+
+Interviewed 2026-08-07 and built as slice 3, ahead of system certificates. The
+two stores share a menu in the ISE GUI and nothing else: the trusted store has no
+private keys, no password, no node identity and no lockout risk, so it carries
+one unverified API shape instead of four. System certificates wait for the lab.
+
+**ERS cannot create a trusted certificate.** `/ers/config/trustedcertificate`
+answers GET, PUT and DELETE — there is no POST. The only create path is OpenAPI
+`POST /api/v1/certs/trusted-certificate/import`. A target whose OpenAPI is not
+answering therefore blocks the whole family, as **one** pre-flight item rather
+than one per certificate.
+
+**The detail read carries no certificate.** Both APIs return metadata — subject,
+issuer, serial, expiry, trust flags — and the bytes come from a separate
+`GET /api/v1/certs/trusted-certificate/{id}/export`. Cisco documents it as a file
+download without saying what the file is, and the GUI's answer changes with the
+selection (one certificate downloads `.pem`, several download `.zip`).
+
+So the body is **sniffed, not assumed**: `-----BEGIN` is PEM, `0x30` is DER,
+`PK\x03\x04` is a ZIP that gets walked with `archive/zip` and each entry sniffed
+again. Everything normalises to PEM in the bundle. `encoding/pem`, `crypto/x509`
+and `archive/zip` are all stdlib, so covering all three cost about twenty lines
+and removed the possibility of being wrong about which one ISE picked. Bytes that
+match none of the three are reported with their leading hex and Content-Type, and
+that certificate is skipped.
+
+**A chain is split into its members.** An export file holding several
+certificates yields several trusted certificates, because a missing issuer on the
+target is a silent validation failure later. Only the certificate matching the
+listing metadata keeps its source friendly name; the rest are named from their
+subject CN, suffixed with the first 8 hex of their fingerprint when the CN is
+empty or the name already exists. ISE requires the name unique. Fingerprint
+dedupe absorbs the duplicates this produces when the issuer also has its own
+entry in the source store.
+
+**Two exclusions, computed and never offered:** an `internalCA` certificate (the
+internal CA is out of scope, and its root on the target would be trust the target
+should not have) and a self-signed certificate whose CN is one of the source node
+hostnames (a per-node default server certificate, meaningless on the target).
+Everything else appears in a picker, ticked by default. Cisco's factory roots
+ride along and land as "already exists" — free, and cheaper than maintaining a
+list of what a given release ships.
+
+**Dedupe is by SHA-256 fingerprint, not by name.** The same root sits in two
+stores under two friendly names often enough to matter, and this is the first
+family whose identity is really its content. The source-side fingerprint is
+computed locally over the DER rather than read from ISE, so only the target side
+depends on ISE exposing one. When the target exposes no usable fingerprint the
+family falls back to name matching and says so once, rather than stopping: a
+metadata field name is a poor reason to halt a migration, and ISE's own rejection
+of a duplicate certificate still catches the content case at write time.
+
+**Trust flags travel verbatim, all four**, `trustForCertificateBasedAdminAuth`
+included. This deliberately differs from the system certificate rule above: that
+one changes how the box authenticates administrators *to itself*, while a trusted
+CA flag only widens what the box will accept. Discarding a decision the source
+operator made is the failure mode the tool exists to prevent.
+
+**Expired certificates are blocked in pre-flight**, with the expiry date in the
+reason, never attempted. `crypto/x509` answers this locally, so it costs nothing,
+and expired trust on a fresh deployment is dead weight.
+
+**CRL settings need a second write.** The OpenAPI import payload accepts only the
+name, description, data and the trust/allow flags; CRL download, distribution
+URL, update period and failure behaviour are set by a PUT afterwards. The PUT is
+made, and **a failed PUT still counts the certificate as created** — deleting a
+good certificate because a secondary setting would not stick is worse than a
+certificate with default revocation settings, and the tool issues no DELETE
+against a target under any circumstances. The failure and the settings to enter
+by hand go into the report.
+
+The OCSP service reference is dropped with a note naming the service. OCSP
+service objects are out of scope, so the name resolves to nothing on the target.
+
 ---
 
 ## Policy
@@ -234,7 +309,9 @@ is dead on arrival — different SIDs — and the tool can only report them.
 Confirmed manual: ISE internal CA · posture (conditions, requirements, policies)
 · profiler policies and custom profiles · guest/sponsor/BYOD portals and their
 customisation · admin users, RBAC and admin groups · logging targets, syslog,
-alarms, repositories · licensing, node roles, deployment build · PAC
+alarms, repositories · **OCSP service configurations** (a trusted certificate's
+reference to one is dropped with a note) · licensing, node roles, deployment
+build · PAC
 provisioning state (re-provisioned on first authentication) · **TACACS device
 admin policy** (a parallel policy tree under `/api/v1/policy/device-admin/*`;
 network access only for now).
@@ -261,8 +338,8 @@ Small things settled provisionally, worth revisiting:
 ## Unverified against real hardware
 
 **No ISE has ever answered this code.** Every field name, path and payload shape
-came from Cisco's documentation. The lab (`ntslab.loc`) was offline when slices 1
-and 2 were built.
+came from Cisco's documentation. The lab (`ntslab.loc`) was offline when slices 1,
+2 and 3 were built.
 
 Slice 1 (CSV translation) *is* verified — against a real 37-device export from a
 production deployment, translated into a synthetic newer-release template.
@@ -273,15 +350,29 @@ the stub→detail fetch, both OpenAPI list shapes, the error propagation, the
 bundle crypto and the remaps — and proves nothing about whether ISE actually
 speaks that way.
 
+Slice 3 (trusted certificates) sits in the same position, with one difference:
+the sniffing means the export body only has to be *one of* PEM, DER or ZIP for
+the slice to work, rather than the single shape the code guessed. Its test
+certificates are generated in-process with `crypto/x509`, so no certificate file
+ever lands in the repository.
+
 Known-uncertain shapes, in rough order of risk:
 
 1. `/api/v1/endpoint` — list shape, paging parameters, and which fields carry
    `staticGroupAssignment` / `staticProfileAssignment` / `groupId` / `profileId`.
 2. `/ers/config/profilerprofile` — used for the profile-name remap.
 3. `/ers/config/node` — node list shape for the probe.
-4. System certificate export body and the 3.3 export endpoint (not yet built).
-5. Egress matrix cell shape (not yet built).
-6. Condition library payloads (not yet built).
+4. `GET /api/v1/certs/trusted-certificate/{id}/export` — whether the body is PEM,
+   DER or ZIP. Sniffed rather than assumed, so all three work; what is unproven
+   is that it is one of the three at all.
+5. The target's trusted-certificate fingerprint field (`sha256Fingerprint`) and
+   its formatting. Absent means a silent fall back to name matching.
+6. Whether the trusted-certificate read-side field names match the import-side
+   ones (`trustForIseAuth` and friends), and whether the CRL PUT accepts the
+   field set the source object hands over.
+7. System certificate export body and the 3.3 export endpoint (not yet built).
+8. Egress matrix cell shape (not yet built).
+9. Condition library payloads (not yet built).
 
 The code reports what it actually received when a shape does not match, rather
 than panicking or returning empty. Read those messages literally.
@@ -310,6 +401,27 @@ slice on unverified shapes.
    nothing is duplicated.
 10. Try a bundle with the wrong passphrase; confirm the error is legible.
 
+Trusted certificates, same session:
+
+11. Export one trusted certificate and **say which shape came back** — PEM, DER
+    or ZIP, and whether the ZIP held a chain. This is the single most useful
+    thing the lab can answer for this slice.
+12. Confirm the picker excludes the internal CA certificates and each node's
+    self-signed default server certificate, and nothing else.
+13. Compare the picker's list against Administration → System → Certificates →
+    Trusted Certificates in the GUI.
+14. Confirm the target's certificate list exposes a fingerprint; if pre-flight
+    reports the name-matching fallback, send the note back verbatim.
+15. Import into the throwaway standalone; confirm the four trust flags arrive as
+    the source had them, and that an expired certificate was blocked and never
+    attempted.
+16. Confirm the CRL settings PUT is accepted, and what ISE says if it is not.
+17. Re-run the same import; confirm every certificate is skipped, none
+    duplicated, and that a certificate renamed on the target is still recognised
+    by fingerprint.
+18. With OpenAPI disabled on the target, confirm pre-flight blocks the family
+    once with a legible reason rather than per certificate.
+
 Send back whatever it gets wrong — the error text is designed to be quotable.
 
 ---
@@ -321,15 +433,18 @@ Ordered by dependency, not by size.
 1. ~~Network device CSV translation~~ — done, verified against real data.
 2. ~~API core: client, probe, encrypted bundle, endpoint groups + static
    endpoints~~ — done, fake-ISE verified only.
-3. **Lab verification of slice 2.** Blocking; see the checklist above.
-4. **Certificates** — trusted store, then system certificates with the
-   3.2 GUI-ZIP fallback. Self-contained, independent of policy, good next slice
-   while policy questions settle.
-5. **Policy elements** — network device groups, condition library, dACLs,
+3. ~~Trusted certificates~~ — built 2026-08-07, fake-ISE verified only. Taken out
+   of order because it is self-contained and needed no lab answers that policy
+   work also needs.
+4. **Lab verification of slices 2 and 3.** Blocking; see the checklist above.
+5. **System certificates** — operator-selected, the 3.3 export-with-private-key
+   API and the 3.2 GUI-ZIP fallback, admin role off. Held back deliberately: four
+   unverified shapes and a private key, none of it testable without the lab.
+6. **Policy elements** — network device groups, condition library, dACLs,
    authorization profiles, identity source sequences. Introduces the factory
    allowlist update mechanism.
-6. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
-7. **Policy sets and rules** — the two-pass UUID remap. Most dependent on lab
+7. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
+8. **Policy sets and rules** — the two-pass UUID remap. Most dependent on lab
    iteration; deliberately last.
-8. **AD join point** config export, creation, and `addGroups`.
-9. **Network device CSV → API import.**
+9. **AD join point** config export, creation, and `addGroups`.
+10. **Network device CSV → API import.**

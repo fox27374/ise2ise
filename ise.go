@@ -153,6 +153,41 @@ func (c *Client) do(method, u string, body any) ([]byte, error) {
 	return rb, nil
 }
 
+// doRaw is like do but returns both the body and the response headers, for cases
+// where we need the Content-Type or other metadata.
+func (c *Client) doRaw(method, u string, body any) ([]byte, http.Header, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, nil, err
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, u, rdr)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.SetBasicAuth(c.User, c.Pass)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s %s: %w", method, u, err)
+	}
+	defer resp.Body.Close()
+	rb, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRespBody))
+	if resp.StatusCode >= 400 {
+		return rb, resp.Header, &APIError{Method: method, URL: u, Status: resp.StatusCode, Body: string(rb)}
+	}
+	if readErr != nil {
+		return nil, resp.Header, fmt.Errorf("%s %s: reading response: %w", method, u, readErr)
+	}
+	return rb, resp.Header, nil
+}
+
 // Stub is one entry of an ERS SearchResult: identity plus name, no content.
 type Stub struct {
 	ID   string `json:"id"`
@@ -269,6 +304,20 @@ func (c *Client) ersGetAll(path, rootKey string, stubs []Stub) ([]map[string]any
 func (c *Client) ersCreate(path, rootKey string, obj map[string]any) error {
 	u := c.ersBase + path
 	_, err := c.do(http.MethodPost, u, map[string]any{rootKey: obj})
+	return err
+}
+
+// openAPICreate POSTs an object directly to the OpenAPI (no root key wrapping).
+func (c *Client) openAPICreate(path string, obj map[string]any) error {
+	u := c.apiBase + path
+	_, err := c.do(http.MethodPost, u, obj)
+	return err
+}
+
+// ersPut updates an ERS object. ISE wants it wrapped in its root key.
+func (c *Client) ersPut(path, rootKey string, obj map[string]any) error {
+	u := c.ersBase + path
+	_, err := c.do(http.MethodPut, u, map[string]any{rootKey: obj})
 	return err
 }
 

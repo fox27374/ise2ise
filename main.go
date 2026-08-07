@@ -55,6 +55,7 @@ func newMux() *http.ServeMux {
 	mux.HandleFunc("/api/translate", handleTranslate)
 	mux.HandleFunc("/api/probe", handleProbe)
 	mux.HandleFunc("/api/endpoint-groups", handleEndpointGroups)
+	mux.HandleFunc("/api/trusted-certs", handleTrustedCerts)
 	mux.HandleFunc("/api/export", handleExport)
 	mux.HandleFunc("/api/import/preflight", handlePreflight)
 	mux.HandleFunc("/api/import/apply", handleApply)
