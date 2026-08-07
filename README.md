@@ -78,9 +78,10 @@ that already exists is skipped and counted, never overwritten.
 ### Export
 
 Connect to the source, look at the probe result (version, nodes, which APIs are
-on), pick the object families and — for endpoints — the endpoint identity
-groups to export from, give a passphrase, run. Progress streams live. The
-result is a single encrypted file.
+on), pick the object families and then what to take from them — the endpoint
+identity groups to export endpoints from, the trusted certificates to carry —
+give a passphrase, run. Progress streams live. The result is a single encrypted
+file.
 
 Endpoints are filtered to the ones with a **static** group or profile
 assignment. Everything else is profiler output that the new deployment
@@ -120,6 +121,44 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 |---|---|
 | Endpoint identity groups | All groups, so an endpoint's group exists on the target. Group nesting is not carried and is reported. |
 | Static endpoints | Only in the groups you select, only static assignments, identified by MAC. |
+| Trusted certificates | The ones you select. Internal CA and per-node self-signed certificates are excluded for you. See below. |
+
+### Trusted certificates
+
+Pick them from a list, the same way you pick endpoint identity groups. Two kinds
+are excluded automatically, unticked and labelled with the reason:
+
+- **ISE internal CA certificates.** The internal CA cannot be moved — Cisco's own
+  procedure regenerates it on a new deployment — and its root on the target would
+  be trust the target should not have.
+- **Per-node self-signed server certificates.** Their CN is a source node
+  hostname that will never exist again.
+
+Cisco's factory roots are not filtered out; they are already on the target, so
+they land in the pre-flight report as "already exists" and cost nothing.
+
+What to expect:
+
+- **Duplicates are matched by SHA-256 fingerprint**, not by name, so a
+  certificate the target already holds under a different friendly name is still
+  recognised and skipped. If the target does not report fingerprints, the tool
+  falls back to name matching and says so once in the report.
+- **Expired certificates are blocked** at pre-flight with the expiry date, and
+  never attempted.
+- **All four trust purposes travel as they were on the source**, including
+  certificate-based admin authentication. Check them on the target if that one is
+  in use.
+- **A certificate chain is split** into its members. Members that had no friendly
+  name of their own on the source are named from their subject CN.
+- **CRL settings are restored** after the certificate is created. If that second
+  step fails the certificate still stays — the report names the settings to enter
+  by hand. An OCSP service selection is never carried, because OCSP service
+  configurations are out of scope; the report names the service.
+- **Importing needs OpenAPI on the target.** It is the only create path ISE
+  offers for this family; with OpenAPI off, the whole family is blocked with one
+  line in the report rather than one line per certificate.
+
+System certificates — the ones with a private key — are a later slice.
 
 ## Running
 
@@ -172,8 +211,7 @@ even as a stub:
 - Full TrustSec: SGTs, SGACLs, egress matrix
 - Policy sets and rules, with UUID remapping
 - AD join point configuration and `addGroups`
-- Trusted certificates
-- System certificates
+- System certificates (the ones with a private key)
 - Network device CSV → API import
 
 The API field names come from Cisco's documentation, not from a live box. When
