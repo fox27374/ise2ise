@@ -554,9 +554,11 @@ their answers are in "Verified against ISE 3.4.0.608" above. What is left:
     still reported 0 create / 71 skip. Only the SHA-256 fingerprint could have
     matched it, which is what the fingerprint path exists for.
 
-    The report says "already exists on the target" either way. It does not say
-    the match was by content under a different name, which is the one case where
-    an operator would want to know.
+    A content match under a different name now says so — `already exists on the
+    target as "ROOTCA NTSLAB 2" (same certificate, different name)` — while a
+    name match keeps the plain wording. A skip the operator cannot account for is
+    the one worth reading twice: the target already trusts that CA under a name
+    nobody here chose.
 14. With OpenAPI disabled on the target, confirm pre-flight blocks the family
     once with a legible reason rather than per certificate.
 15. Import a certificate whose description contains a comma and confirm the

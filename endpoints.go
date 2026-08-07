@@ -451,7 +451,11 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 			return
 		}
 
-		targetByFingerprint := map[string]bool{}
+		// Fingerprint -> the name the target knows that certificate by. The same
+		// trust often sits in two stores under two friendly names, so the
+		// target's name is worth reporting: "already exists" under a name the
+		// operator does not recognise is the one skip worth looking at.
+		targetByFingerprint := map[string]string{}
 		targetByName := map[string]bool{}
 		fingerprints := 0
 
@@ -459,7 +463,7 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 			if fp := str(cert, "sha256Fingerprint"); fp != "" {
 				// Normalize: lowercase, strip whitespace and colons.
 				fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-				targetByFingerprint[fp] = true
+				targetByFingerprint[fp] = str(cert, "friendlyName")
 				fingerprints++
 			}
 			if friendlyName := str(cert, "friendlyName"); friendlyName != "" {
@@ -507,8 +511,14 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 			// Dedup by fingerprint if available, else by name.
 			if fingerprints > 0 && fp != "" {
 				fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-				if targetByFingerprint[fpNorm] {
+				if targetName, ok := targetByFingerprint[fpNorm]; ok {
 					it.Action, it.Reason = actionSkip, "already exists on the target"
+					// Matched by content, not by name: the target holds this
+					// exact certificate under a name of its own, and the
+					// operator cannot tell that from the skip alone.
+					if targetName != "" && targetName != name {
+						it.Reason = fmt.Sprintf("already exists on the target as %q (same certificate, different name)", targetName)
+					}
 					r.add(it)
 					continue
 				}

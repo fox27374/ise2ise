@@ -301,9 +301,13 @@ func TestPreflightFingerprintDedup(t *testing.T) {
 	// Target already has it with a fingerprint.
 	tgtFake := newFakeISE(t)
 	fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
+	// Renamed on the target, which is the case fingerprint matching exists for:
+	// a real 3.4 target answered exactly this way after the certificate was
+	// renamed in its GUI.
 	tgtCertObj := map[string]any{
-		"id": "tgt-1", "name": "imported-example", "sha256Fingerprint": fp,
-		"link": map[string]any{"rel": "self"},
+		"id": "tgt-1", "name": "imported-example", "friendlyName": "imported-example",
+		"sha256Fingerprint": fp,
+		"link":              map[string]any{"rel": "self"},
 	}
 	tgtFake.mu.Lock()
 	tgtFake.certs = append(tgtFake.certs, tgtCertObj)
@@ -322,6 +326,9 @@ func TestPreflightFingerprintDedup(t *testing.T) {
 			found++
 			if it.Action != actionSkip {
 				t.Errorf("action = %s, want skip (duplicate fingerprint)", it.Action)
+			}
+			if !strings.Contains(it.Reason, `"imported-example"`) {
+				t.Errorf("reason = %q, want the target's own name for the certificate", it.Reason)
 			}
 		}
 	}
