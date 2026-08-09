@@ -22,7 +22,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          # Pinned to the patch, not the minor: the toolchain version is one of
+          # the three inputs that decide the bytes, alongside -trimpath and
+          # CGO_ENABLED, both set in the Makefile. With all three fixed, a local
+          # `make dist` at a tag reproduces the published SHA256SUMS, so a
+          # recipient can verify a binary came from this source rather than
+          # trusting the pipeline. Bump deliberately, not incidentally.
+          go-version: "1.24.3"
 
       - name: Verify
         run: |
