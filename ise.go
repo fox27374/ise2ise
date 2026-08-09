@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -37,6 +38,14 @@ const (
 	// A single ISE response body is never legitimately this large; the cap is
 	// there so a misdirected request cannot exhaust memory.
 	maxRespBody = 32 << 20
+
+	// A mistyped address is the most likely reason a connection does not open,
+	// and an unroutable one black-holes the SYN rather than refusing it. The
+	// request timeout below is sized for reading thousands of endpoints, so on
+	// its own it leaves the operator staring at "Connecting…" for two minutes per
+	// API — four before the probe says a word. A TCP connect that has not
+	// completed in seconds is a wrong address, not a slow deployment.
+	connectTimeout = 6 * time.Second
 )
 
 // Client talks to one ISE deployment. The credentials live in this struct and
@@ -94,6 +103,8 @@ func NewClient(host, user, pass string, verifyTLS bool) *Client {
 			// ISE ships a self-signed certificate. Verification is off unless
 			// the operator passes -verify-tls; the UI says so out loud.
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: !verifyTLS},
+			DialContext:         (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: connectTimeout,
 			MaxIdleConns:        detailWorkers * 2,
 			MaxIdleConnsPerHost: detailWorkers * 2,
 			IdleConnTimeout:     90 * time.Second,
@@ -562,8 +573,24 @@ type Probe struct {
 func (c *Client) ProbeDeployment() *Probe {
 	p := &Probe{Host: c.Host, Nodes: []string{}, Notes: []string{}}
 
-	version, ersErr := c.iseVersion()
-	_, apiErr := c.do(http.MethodGet, c.apiBase+"/api/v1/endpoint?size=1&page=1", nil)
+	// The two checks are independent, and a wrong address costs a connect
+	// timeout on each: run them together so that is paid once, not twice.
+	var (
+		version string
+		ersErr  error
+		apiErr  error
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		version, ersErr = c.iseVersion()
+	}()
+	go func() {
+		defer wg.Done()
+		_, apiErr = c.do(http.MethodGet, c.apiBase+"/api/v1/endpoint?size=1&page=1", nil)
+	}()
+	wg.Wait()
 
 	p.ERS = ersErr == nil
 	p.OpenAPI = apiErr == nil
