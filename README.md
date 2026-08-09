@@ -216,18 +216,30 @@ ise2ise-linux-amd64
 `SHA256SUMS` is attached alongside them. On macOS and Linux, `chmod +x` the file
 you downloaded.
 
-The builds are reproducible from **v0.5.0 onward**: `-trimpath`, `CGO_ENABLED=0`
-and a pinned Go patch version mean a local build of a tag produces the published
-bytes, so you can check that a binary came from this source rather than trusting
-the pipeline that built it:
+### Verifying a download
+
+Releases from **v0.5.0** are reproducible: building the tag yourself produces the
+published bytes, so you can establish that a binary came from this source instead
+of trusting the pipeline that built it. `-trimpath` keeps the builder's directory
+out of the binary, `CGO_ENABLED=0` stops a native macOS build from linking the
+host SDK when a cross build does not, and the Go patch version is pinned in the
+release workflow. Those three are the whole difference between a checksum that
+says "this is what CI produced" and one anybody can check.
 
 ```
 git checkout v0.5.0
 make dist
-cd dist && shasum -a 256 -c ../SHA256SUMS   # SHA256SUMS from the release page
+cd dist
+curl -sLO https://github.com/fox27374/ise2ise/releases/download/v0.5.0/SHA256SUMS
+shasum -a 256 -c SHA256SUMS
 ```
 
-v0.4.0 and earlier were built before those flags, so they will not match.
+Four `OK` lines means the release matches this source. This was confirmed for
+v0.5.0 on macOS against binaries the Ubuntu runner cross-compiled — all four
+targets byte-identical.
+
+v0.4.0 and earlier were built before those flags and will **not** match; for
+those, `SHA256SUMS` only tells you a download arrived intact.
 
 Or from source (Go 1.24+, stdlib only, no third-party modules):
 
