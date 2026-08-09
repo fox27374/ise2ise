@@ -154,12 +154,18 @@ func normMAC(m string) string {
 
 // ExportEndpoints fills the bundle with endpoint identity groups and, for the
 // groups the operator selected, their statically assigned endpoints.
-// groupNames empty means "no endpoints, groups only".
+// groupNames empty means "no endpoints, groups only" - but if either family is
+// selected and groupNames is empty, an error is returned.
 func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []string, log func(string, ...any)) error {
 	wantGroups := slices.Contains(families, familyEndpointGroups)
 	wantEndpoints := slices.Contains(families, familyEndpoints)
 	if !wantGroups && !wantEndpoints {
 		return nil
+	}
+
+	// Validate: if either family is selected and no groups are selected, error
+	if (wantGroups || wantEndpoints) && len(groupNames) == 0 {
+		return fmt.Errorf("select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints")
 	}
 
 	// Endpoint groups are needed either way: they are both an object family and
@@ -176,16 +182,32 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 	}
 
 	groupNameByID := map[string]string{}
+	allGroupNames := []string{}
 	for _, g := range groups {
 		if id := str(g, "id"); id != "" {
-			groupNameByID[id] = str(g, "name")
+			name := str(g, "name")
+			groupNameByID[id] = name
+			allGroupNames = append(allGroupNames, name)
 		}
 	}
 
 	if wantGroups {
+		// Only export the selected groups
+		selectedSet := map[string]bool{}
+		for _, want := range groupNames {
+			selectedSet[want] = true
+		}
+
 		out := make([]map[string]any, 0, len(groups))
+		var leftBehind []string
+
 		for _, g := range groups {
 			name := str(g, "name")
+			if !selectedSet[name] {
+				leftBehind = append(leftBehind, name)
+				continue // Skip unselected groups
+			}
+
 			// A nested group would need its parent to exist first, and the
 			// parent UUID means nothing on the target. Say so rather than
 			// writing a broken reference.
@@ -195,16 +217,18 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 			}
 			out = append(out, stripLocal(g))
 		}
+
+		// Report the left-behind groups
+		if len(leftBehind) > 0 {
+			sort.Strings(leftBehind)
+			b.Note("%d of %d endpoint identity groups on the source were not selected and were not exported: %s", len(leftBehind), len(allGroupNames), strings.Join(leftBehind, ", "))
+		}
+
 		b.Objects[familyEndpointGroups] = out
 		log("Captured %d endpoint identity groups.", len(out))
 	}
 
 	if !wantEndpoints {
-		return nil
-	}
-	if len(groupNames) == 0 {
-		b.Note("No endpoint identity groups were selected, so no endpoints were exported.")
-		b.Objects[familyEndpoints] = []map[string]any{}
 		return nil
 	}
 
@@ -289,6 +313,130 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 	return nil
 }
 
+// scanPolicyUsage counts, per endpoint identity group, how many policy rules and
+// library conditions reference it. It is advisory: the operator uses it to tell a
+// group that is genuinely dead from one a rule still points at.
+//
+// It returns the counts and, when anything could not be read, a sentence naming
+// what. A caller must show that sentence: a scan that failed and a deployment
+// whose policy references no groups both produce zeros, and presenting the first
+// as the second is what would make an operator drop a group a rule depends on.
+// Never fatal — a failed scan costs the badge, not the migration.
+func scanPolicyUsage(c *Client, groupNames []string) (map[string]int, string) {
+	if len(groupNames) == 0 {
+		return map[string]int{}, ""
+	}
+
+	usageMap := make(map[string]int)
+	var scanErrors []string
+	scanned := 0
+
+	// Device admin policy is scanned but never migrated: a group used only by
+	// TACACS rules is still in use, and reporting it as unused is the failure
+	// this whole feature exists to prevent.
+	paths := []string{
+		"/api/v1/policy/network-access/policy-set",
+		"/api/v1/policy/device-admin/policy-set",
+		"/api/v1/policy/network-access/condition",
+		"/api/v1/policy/device-admin/condition",
+	}
+
+	// scan reads one document and walks it. Each rule set is independent, so one
+	// refusal costs that document's references and nothing else.
+	scan := func(path string) []map[string]any {
+		items, err := c.openAPIList(path)
+		if err != nil {
+			scanErrors = append(scanErrors, fmt.Sprintf("%s: %v", path, err))
+			return nil
+		}
+		scanned++
+		for _, item := range items {
+			walkForGroupRefs(item, usageMap)
+		}
+		return items
+	}
+
+	for _, path := range paths {
+		items := scan(path)
+		if !strings.HasSuffix(path, "/policy-set") {
+			continue
+		}
+		// A policy set's rules hang off it and hold the references; the set
+		// itself carries almost none.
+		for _, set := range items {
+			id := str(set, "id")
+			if id == "" {
+				continue
+			}
+			// Both rule sets are read even when the first refuses: an
+			// authentication rule that cannot be read says nothing about the
+			// authorization rules next to it.
+			scan(path + "/" + id + "/authentication")
+			scan(path + "/" + id + "/authorization")
+		}
+	}
+
+	var errMsg string
+	switch {
+	case scanned == 0:
+		errMsg = "Policy usage could not be determined — nothing was read: " + strings.Join(scanErrors, "; ")
+	case len(scanErrors) > 0:
+		errMsg = "Policy usage may be incomplete; some rules could not be read: " + strings.Join(scanErrors, "; ")
+	}
+
+	return usageMap, errMsg
+}
+
+// walkForGroupRefs walks a decoded rule document and counts every endpoint
+// identity group reference in it. The rule schema is deliberately not modelled:
+// conditions nest inside conditions to arbitrary depth and the shapes are not
+// otherwise needed here, so a generic walk cannot miss one by getting the
+// structure wrong.
+func walkForGroupRefs(v any, usageMap map[string]int) {
+	switch t := v.(type) {
+	case map[string]any:
+		if isGroupReference(t) {
+			if name := extractGroupName(str(t, "attributeValue")); name != "" {
+				usageMap[name]++
+			}
+		}
+		for _, sub := range t {
+			walkForGroupRefs(sub, usageMap)
+		}
+	case []any:
+		for _, item := range t {
+			walkForGroupRefs(item, usageMap)
+		}
+	}
+}
+
+// isGroupReference recognises the shape a real ISE 3.4 returns for a rule that
+// matches on an endpoint identity group: dictionary IdentityGroup, attribute
+// Name, and a value carrying the group's path. Matching is by name, not UUID,
+// which is why this survives a migration at all.
+func isGroupReference(obj map[string]any) bool {
+	return str(obj, "dictionaryName") == "IdentityGroup" &&
+		str(obj, "attributeName") == "Name" &&
+		strings.HasPrefix(str(obj, "attributeValue"), groupRefPrefix)
+}
+
+// groupRefPrefix is how ISE writes an endpoint identity group in a rule
+// condition, verified against 3.4: "Endpoint Identity Groups:Production:Siemens".
+const groupRefPrefix = "Endpoint Identity Groups:"
+
+// extractGroupName takes the leaf of a reference value: the value carries the
+// group's nesting path, "Endpoint Identity Groups:Production:Siemens", and the
+// group is the last segment. Endpoint identity group names are unique in ISE —
+// the import's own duplicate check already relies on it — so the leaf identifies
+// the group without the path.
+func extractGroupName(attrValue string) string {
+	if !strings.HasPrefix(attrValue, groupRefPrefix) {
+		return ""
+	}
+	parts := strings.Split(attrValue, ":")
+	return strings.TrimSpace(parts[len(parts)-1])
+}
+
 // fetchEndpoints prefers OpenAPI, which returns whole objects in one list call.
 // ERS needs a GET per MAC, which on a real deployment is thousands of requests.
 func fetchEndpoints(c *Client, log func(string, ...any)) ([]map[string]any, string, error) {
@@ -311,15 +459,60 @@ func fetchEndpoints(c *Client, log func(string, ...any)) ([]map[string]any, stri
 	return eps, "ERS " + pathEndpoints, nil
 }
 
-// ListEndpointGroups is what the UI shows when the operator picks which groups
-// to export endpoints from.
-func ListEndpointGroups(c *Client) ([]Stub, error) {
+// EndpointGroup is a group with its system-defined flag and policy usage count.
+type EndpointGroup struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	SystemDefined bool   `json:"systemDefined"`
+	UsedBy        int    `json:"usedBy"`
+}
+
+// ListEndpointGroups is what the picker shows. The group selection now decides
+// what is created on the target, not just which endpoints are read, so the two
+// things an operator needs to choose well travel with each name: whether ISE
+// defined the group itself, and how many policy rules point at it.
+//
+// systemDefined is only on the detail object, so every group is read; the export
+// makes the same read.
+//
+// The second return is a sentence to show the operator when the policy scan
+// could not complete. Empty means the counts are trustworthy.
+func ListEndpointGroups(c *Client) ([]EndpointGroup, string, error) {
 	stubs, err := c.ersList(pathEndpointGroups)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	sort.Slice(stubs, func(i, j int) bool { return strings.ToLower(stubs[i].Name) < strings.ToLower(stubs[j].Name) })
-	return stubs, nil
+	groups, err := c.ersGetAll(pathEndpointGroups, rootEndpointGroup, stubs)
+	if err != nil {
+		return nil, "", err
+	}
+
+	names := make([]string, len(groups))
+	for i, g := range groups {
+		names[i] = str(g, "name")
+	}
+	usage, scanNote := scanPolicyUsage(c, names)
+
+	out := make([]EndpointGroup, 0, len(groups))
+	for _, g := range groups {
+		name := str(g, "name")
+		out = append(out, EndpointGroup{
+			ID:            str(g, "id"),
+			Name:          name,
+			SystemDefined: truthy(g, "systemDefined"),
+			UsedBy:        usage[name],
+		})
+	}
+
+	// ISE's own groups sort last: they exist on every target already, so the
+	// operator's own groups are what the picker should open on.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SystemDefined == out[j].SystemDefined {
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		}
+		return !out[i].SystemDefined
+	})
+	return out, scanNote, nil
 }
 
 // --- pre-flight and import ---------------------------------------------------

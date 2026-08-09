@@ -569,6 +569,84 @@ Send back whatever it gets wrong — the error text is designed to be quotable.
 
 ---
 
+## The group picker decides what exists, not just what is read
+
+Reversed on 2026-08-09, at the operator's request. Until then, ticking the
+endpoint identity group family carried **all** groups regardless of the picker,
+and the picker only bounded which groups' endpoints were read. The reasoning was
+that a group is cheap and an endpoint's group must exist on the target.
+
+That is true and it misses the point: a deployment that has been alive for years
+accumulates groups nobody uses any more, and a migration is the one moment they
+can be dropped without anyone arguing about it. The tool cannot tell which are
+dead — the operator can. So the picker is now the single scope: a ticked group is
+created on the target and its static endpoints travel; an unticked one is
+neither created nor read.
+
+All groups are still *read* from the source, because the list is also the
+`groupId → name` table that turns an endpoint's group into something portable.
+Only the selected ones enter the bundle, and one note names the rest, so the
+import side can tell a decision from an omission.
+
+Selecting nothing is refused rather than exported, in the browser and again in
+the handler before the client connects. The old behaviour — a note saying no
+endpoints were exported — is the wrong answer now that the same emptiness would
+also mean no groups.
+
+**Built-ins are ISE's own claim, not a list of ours.** The ERS detail object
+carries `systemDefined`, so `Profiled`, `Unknown`, `Blocked List` and the rest
+sort last under a divider without anyone maintaining a per-release name list.
+This is the same rule the trusted store follows for Cisco's factory roots. The
+flag is only on the detail object, so the picker reads all 44 group objects — the
+export makes that identical read anyway.
+
+### Which groups a policy still points at
+
+The operator's question — *which of these are actually dead?* — is answerable
+from the box, so the picker answers it rather than relying on memory.
+
+A rule that matches on an endpoint identity group stores it like this, verified
+on 3.4:
+
+```
+dictionaryName: IdentityGroup
+attributeName:  Name
+attributeValue: Endpoint Identity Groups:Production:Siemens
+```
+
+**By name, not by UUID** — which is why such a reference survives a migration at
+all, and why it can be counted without resolving anything. The value carries the
+group's nesting path and the group is the last segment; endpoint identity group
+names are unique in ISE, which the import's own duplicate check already relies
+on, so the leaf identifies it.
+
+Eight documents are read: the policy sets of both trees, each set's
+authentication and authorization rules, and each tree's shared condition library.
+The lab's source answers 200 on all eight and yields 7 references across 5 policy
+sets. Each is walked generically rather than by modelling the rule schema —
+conditions nest to arbitrary depth, the shapes are needed for nothing else here,
+and a generic walk cannot miss one by getting the structure wrong.
+
+**Device admin policy is scanned and never migrated.** TACACS policy is out of
+scope and stays out of scope; the badge answers "is anything on this box using
+this group", and a group used only by device admin rules is in use. Reporting it
+as unused would be the tool encouraging exactly the deletion this feature exists
+to prevent.
+
+**A scan that fails costs the badge, never the migration.** The groups are
+returned regardless, with one sentence saying what could not be read. This
+matters more than it looks: a refused scan and a deployment whose policy
+references no groups both produce zeros, and presenting the first as the second
+would talk an operator into dropping a group a rule depends on.
+
+The badge is advisory in the other direction too. A referenced group can still be
+left behind deliberately — the tool reports, it does not veto. The consequence is
+recorded rather than prevented: once the policy slice lands, a rule whose group
+was left behind fails pre-flight, correctly, and that is the trade this feature
+buys.
+
+---
+
 ## Roadmap
 
 Ordered by dependency, not by size.

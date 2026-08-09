@@ -31,7 +31,10 @@ type fakeISE struct {
 	profiles    []map[string]any
 	nodes       []string
 	certs       []map[string]any
-	certExports map[string][]byte // cert id -> export body
+	certExports map[string][]byte           // cert id -> export body
+	policies    map[string][]map[string]any // policy path -> list of policy objects
+
+	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
 	csrfRequired bool   // ERS demands a CSRF nonce on writes, as a real 3.4 does
 	csrfToken    string // the nonce currently issued
@@ -52,6 +55,7 @@ func newFakeISE(t *testing.T) *fakeISE {
 		nodes:       []string{"ise-src-1"},
 		pagesServed: map[string]int{},
 		created:     map[string][]map[string]any{},
+		policies:    map[string][]map[string]any{},
 	}
 	f.ers = httptest.NewServer(http.HandlerFunc(f.serveERS))
 	f.api = httptest.NewServer(http.HandlerFunc(f.serveAPI))
@@ -226,6 +230,20 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSONRaw(w, map[string]any{"response": page, "version": "1.0.0"})
+		return
+	}
+
+	// Policy endpoints: the policy sets, their authentication and authorization
+	// rules, and the shared condition library, for both policy trees.
+	if strings.HasPrefix(path, "/api/v1/policy/") && r.Method == http.MethodGet {
+		f.pagesServed["policy-"+path]++
+		if f.policyForbidden {
+			// What a deployment with the policy API locked down answers.
+			http.Error(w, `{"message":"insufficient privileges"}`, http.StatusForbidden)
+			return
+		}
+		items := f.policies[path] // nil is a legitimate empty rule set
+		writeJSONRaw(w, map[string]any{"response": f.page(r, items)})
 		return
 	}
 
@@ -507,9 +525,13 @@ func writeJSONRaw(w http.ResponseWriter, v any) {
 // --- fixtures ----------------------------------------------------------------
 
 func (f *fakeISE) addGroup(id, name string) map[string]any {
+	return f.addGroupWithSystemFlag(id, name, false)
+}
+
+func (f *fakeISE) addGroupWithSystemFlag(id, name string, systemDefined bool) map[string]any {
 	g := map[string]any{
 		"id": id, "name": name, "description": name + " description",
-		"systemDefined": false,
+		"systemDefined": systemDefined,
 		"link":          map[string]any{"rel": "self", "href": f.ers.URL + "/ers/config/endpointgroup/" + id},
 	}
 	f.groups = append(f.groups, g)
@@ -533,6 +555,51 @@ func (f *fakeISE) addEndpoint(mac, groupID string, static bool, profileID string
 	}
 	f.endpoints = append(f.endpoints, e)
 	return e
+}
+
+// addPolicySet registers a policy set, which on a real box carries almost no
+// conditions itself: the references live in the rules that hang off it.
+func (f *fakeISE) addPolicySet(tree, id, name string) {
+	path := "/api/v1/policy/" + tree + "/policy-set"
+	f.policies[path] = append(f.policies[path], map[string]any{"id": id, "name": name})
+}
+
+// addRuleWithGroupRef puts a rule referencing an endpoint identity group into one
+// of a policy set's rule sets ("authentication" or "authorization"). groupPath is
+// what ISE stores, so it may carry the nesting: "Production:Siemens".
+func (f *fakeISE) addRuleWithGroupRef(tree, setID, ruleSet, groupPath string) {
+	path := "/api/v1/policy/" + tree + "/policy-set/" + setID + "/" + ruleSet
+	f.policies[path] = append(f.policies[path], map[string]any{
+		"rule": map[string]any{
+			"name": "match " + groupPath,
+			"condition": map[string]any{
+				"conditionType": "ConditionAndBlock",
+				"children": []any{
+					map[string]any{
+						"conditionType":  "ConditionAttributes",
+						"dictionaryName": "IdentityGroup",
+						"attributeName":  "Name",
+						"operator":       "equals",
+						"attributeValue": "Endpoint Identity Groups:" + groupPath,
+					},
+				},
+			},
+		},
+	})
+}
+
+// addLibraryConditionWithGroupRef puts a reference in the shared condition
+// library, which rules point at rather than inlining.
+func (f *fakeISE) addLibraryConditionWithGroupRef(tree, name, groupPath string) {
+	path := "/api/v1/policy/" + tree + "/condition"
+	f.policies[path] = append(f.policies[path], map[string]any{
+		"conditionType":  "LibraryConditionAttributes",
+		"name":           name,
+		"dictionaryName": "IdentityGroup",
+		"attributeName":  "Name",
+		"operator":       "equals",
+		"attributeValue": "Endpoint Identity Groups:" + groupPath,
+	})
 }
 
 func quiet(string, ...any) {}

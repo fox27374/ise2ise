@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 )
 
 // HTTP handlers for the API-driven half of the tool. Credentials arrive in the
@@ -73,12 +74,15 @@ func handleEndpointGroups(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	groups, err := ListEndpointGroups(c)
+	groups, note, err := ListEndpointGroups(c)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+	// note is set when the policy usage scan could not complete. The groups are
+	// still returned: the badge is advisory, and a migration must not stop
+	// because a rule could not be read.
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups, "note": note})
 }
 
 func handleTrustedCerts(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +177,12 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.Families) == 0 {
 		writeErr(w, http.StatusBadRequest, "select at least one object family to export")
+		return
+	}
+	// Checked here as well as in ExportEndpoints so a request that cannot
+	// succeed never reaches the deployment with credentials attached.
+	if len(in.Groups) == 0 && (slices.Contains(in.Families, familyEndpointGroups) || slices.Contains(in.Families, familyEndpoints)) {
+		writeErr(w, http.StatusBadRequest, "select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints")
 		return
 	}
 
