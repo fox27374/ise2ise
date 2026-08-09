@@ -216,6 +216,19 @@ ise2ise-linux-amd64
 `SHA256SUMS` is attached alongside them. On macOS and Linux, `chmod +x` the file
 you downloaded.
 
+The builds are reproducible from **v0.5.0 onward**: `-trimpath`, `CGO_ENABLED=0`
+and a pinned Go patch version mean a local build of a tag produces the published
+bytes, so you can check that a binary came from this source rather than trusting
+the pipeline that built it:
+
+```
+git checkout v0.5.0
+make dist
+cd dist && shasum -a 256 -c ../SHA256SUMS   # SHA256SUMS from the release page
+```
+
+v0.4.0 and earlier were built before those flags, so they will not match.
+
 Or from source (Go 1.24+, stdlib only, no third-party modules):
 
 ```
