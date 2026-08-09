@@ -48,6 +48,35 @@ workflow that re-runs the checks, cross-compiles and attaches the binaries plus
 `SHA256SUMS`. The blobs already in the history stay there — rewriting it is a
 bigger cost than the space it reclaims.
 
+**Release binaries are reproducible**, from v0.5.0. Until then `SHA256SUMS`
+proved only that a download matched what CI happened to produce; nobody could
+rebuild a tag and check the bytes. That is enough while the binaries are
+hand-carried by the person who built them, and not enough the moment someone
+else runs one against their own ISE deployment on the strength of that file.
+
+Three inputs decided the bytes and all three were varying:
+
+- The absolute source path was baked in — seven occurrences of the builder's
+  home directory in the binary. `-trimpath`.
+- A native macOS build links the host SDK (`CGO_ENABLED=1`) while the runner
+  cross-compiles macOS from Linux with cgo off, so the same commit produced
+  different binaries depending on where `make` ran. `CGO_ENABLED=0` everywhere,
+  which costs nothing here and is implied by stdlib-only anyway.
+- `go-version` was pinned to the minor, leaving the patch to whatever was
+  newest that day. Pinned to the patch in the workflow.
+
+Confirmed rather than assumed: v0.5.0 built on macOS matches all four binaries
+the Ubuntu runner cross-compiled, byte for byte, and the README's verification
+recipe was run from a fresh clone of the public repository.
+
+What this buys is narrow and worth being precise about. It removes the build
+pipeline from the set of things a recipient has to trust — the binary can be
+shown to come from this source. It says nothing about whether the source
+deserves trust, and it does not defend against a compromised toolchain. The
+standing cost is that a Go patch bump is now a deliberate commit rather than
+something that happens by itself, which is the right trade for a tool that holds
+ISE admin credentials.
+
 **Stdlib only.** `go.mod` has no requirements and should stay that way.
 AES-GCM, PBKDF2, CSV, HTTP and `embed` are all in the standard library as of
 Go 1.24. If something seems to need a dependency, check the stdlib again first.
