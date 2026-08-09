@@ -211,6 +211,10 @@ handshake is a GET carrying `X-CSRF-TOKEN: fetch`, which answers **415** while
 returning `X-CSRF-Token` plus `JSESSIONIDSSO`/`APPSESSIONID` cookies; the token
 and the cookies must both travel with the write.
 
+The check is per deployment: the second lab box has it **disabled**, so the
+box-to-box import run on 2026-08-09 never exercised the handshake. That
+behaviour stays proven on the source box only.
+
 The client does the handshake itself rather than asking the operator to turn the
 check off. Weakening a security setting on a production source deployment to run
 a migration tool is the wrong trade, and the fetch header is harmless on a
@@ -519,7 +523,16 @@ slice on unverified shapes.
 2. ~~Probe with a deliberately wrong password~~ — done. Both APIs report 401 with
    the either/or wording, no false "API off".
 3. Probe with OpenAPI disabled — confirm it distinguishes that from a bad
-   password. **Still open**; needs the setting turned off in the GUI.
+   password. **Still open, and harder to reach than expected.** ISE 3.4's API
+   Settings page offers no OpenAPI switch at all: under API Service Settings
+   there is only ERS, for the primary administration node and for the others.
+   An ERS-only admin account does not stand in for it either — an account in the
+   **ERS Admin group and nothing else** was granted OpenAPI reads on trusted
+   certificates, endpoints and the policy tree on 2026-08-09, so the role does
+   not gate OpenAPI on this release. Whatever makes OpenAPI unusable in the field
+   is the service being unreachable, not RBAC. Fake-verified only, and the fake
+   is the honest place for it until a box turns up where the gateway can be
+   stopped.
 4. ~~Export endpoint identity groups~~ — done, 44 returned. Still worth comparing
    the count against the GUI.
 5. ~~Export static endpoints from one group~~ — done. 171 endpoints read from the
@@ -560,7 +573,9 @@ their answers are in "Verified against ISE 3.4.0.608" above. What is left:
     the one worth reading twice: the target already trusts that CA under a name
     nobody here chose.
 14. With OpenAPI disabled on the target, confirm pre-flight blocks the family
-    once with a legible reason rather than per certificate.
+    once with a legible reason rather than per certificate. **Blocked on the same
+    thing as item 3** — 3.4 offers no way to turn OpenAPI off, and the ERS Admin
+    role does not withhold it. Fake-verified only.
 15. Import a certificate whose description contains a comma and confirm the
     retry lands it without the description and reports what was dropped. The lab
     cannot hold such a description, so this too is fake-verified only.
