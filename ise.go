@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ type Client struct {
 	ersBase string // https://host:9060
 	apiBase string // https://host
 	hc      *http.Client
+
+	mu        sync.Mutex
+	csrfToken string // ERS CSRF nonce, fetched on demand; never persisted
 }
 
 // normalizeHost accepts what an operator actually types: "ise.example.net",
@@ -79,7 +83,12 @@ func NewClient(host, user, pass string, verifyTLS bool) *Client {
 		ersBase: fmt.Sprintf("https://%s:%d", host, ersPort),
 		apiBase: "https://" + host,
 	}
+	// The CSRF nonce is only accepted alongside the session cookies ISE hands
+	// out with it, so the client needs a jar. It lives for the life of this
+	// client and is never written anywhere.
+	jar, _ := cookiejar.New(nil)
 	c.hc = &http.Client{
+		Jar:     jar,
 		Timeout: 120 * time.Second,
 		Transport: &http.Transport{
 			// ISE ships a self-signed certificate. Verification is off unless
@@ -120,13 +129,31 @@ func snippet(b []byte) string {
 }
 
 func (c *Client) do(method, u string, body any) ([]byte, error) {
-	var rdr io.Reader
+	var raw []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rdr = bytes.NewReader(b)
+		raw = b
+	}
+
+	rb, err := c.attempt(method, u, raw)
+	// An ERS write can be refused because the CSRF nonce is missing or stale.
+	// Fetch a fresh one and try exactly once more; a second failure is real.
+	if err != nil && isCSRFFailure(err) && c.needsCSRF(method, u) {
+		c.clearCSRF()
+		if tokErr := c.fetchCSRF(u); tokErr == nil {
+			return c.attempt(method, u, raw)
+		}
+	}
+	return rb, err
+}
+
+func (c *Client) attempt(method, u string, raw []byte) ([]byte, error) {
+	var rdr io.Reader
+	if raw != nil {
+		rdr = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequest(method, u, rdr)
 	if err != nil {
@@ -134,8 +161,21 @@ func (c *Client) do(method, u string, body any) ([]byte, error) {
 	}
 	req.SetBasicAuth(c.User, c.Pass)
 	req.Header.Set("Accept", "application/json")
-	if body != nil {
+	if raw != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.needsCSRF(method, u) {
+		// ISE refuses ERS writes with "CSRF nonce validation failed" when the
+		// CSRF check is enabled (Administration -> System -> Settings -> API
+		// Settings). The token rides with the session cookies the jar holds.
+		if tok := c.csrf(); tok == "" {
+			if err := c.fetchCSRF(u); err != nil {
+				return nil, err
+			}
+		}
+		if tok := c.csrf(); tok != "" {
+			req.Header.Set("X-CSRF-TOKEN", tok)
+		}
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -151,6 +191,85 @@ func (c *Client) do(method, u string, body any) ([]byte, error) {
 		return nil, fmt.Errorf("%s %s: reading response: %w", method, u, readErr)
 	}
 	return rb, nil
+}
+
+// needsCSRF reports whether this is an ERS write. OpenAPI writes are not
+// covered by the check - the trusted certificate import goes through without a
+// token - and a GET never needs one.
+func (c *Client) needsCSRF(method, u string) bool {
+	return method != http.MethodGet && strings.HasPrefix(u, c.ersBase)
+}
+
+func (c *Client) csrf() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.csrfToken
+}
+
+func (c *Client) clearCSRF() {
+	c.mu.Lock()
+	c.csrfToken = ""
+	c.mu.Unlock()
+}
+
+// fetchCSRF asks ISE for a nonce. The token comes back in a response header on
+// a GET carrying "X-CSRF-TOKEN: fetch"; the accompanying session cookies are
+// kept by the client's jar and must travel with the write. ISE answers the
+// fetch with 415 rather than 200, so the status is deliberately ignored - only
+// the header matters.
+func (c *Client) fetchCSRF(writeURL string) error {
+	u := csrfFetchURL(writeURL)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.User, c.Pass)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-CSRF-TOKEN", "fetch")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetching a CSRF token from %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, maxRespBody))
+
+	tok := resp.Header.Get("X-CSRF-Token")
+	if tok == "" {
+		// Not an error: a deployment with the check disabled issues no token,
+		// and the write will simply go through without one.
+		return nil
+	}
+	c.mu.Lock()
+	c.csrfToken = tok
+	c.mu.Unlock()
+	return nil
+}
+
+// csrfFetchURL turns a write URL into a cheap GET on the same collection, so
+// the nonce is fetched from the resource being written rather than a hardcoded
+// one that may not exist on every deployment.
+func csrfFetchURL(writeURL string) string {
+	u := writeURL
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		u = u[:i]
+	}
+	u = strings.TrimSuffix(u, "/")
+	// A write to .../endpoint/<uuid> fetches from .../endpoint.
+	if i := strings.LastIndexByte(u, '/'); i > 0 {
+		if last := u[i+1:]; strings.Count(last, "-") == 4 && len(last) >= 32 {
+			u = u[:i]
+		}
+	}
+	return u + "?size=1"
+}
+
+func isCSRFFailure(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	b := strings.ToLower(ae.Body)
+	return strings.Contains(b, "csrf") || strings.Contains(b, "nonce")
 }
 
 // doRaw is like do but returns both the body and the response headers, for cases
@@ -303,8 +422,43 @@ func (c *Client) ersGetAll(path, rootKey string, stubs []Stub) ([]map[string]any
 // ersCreate POSTs one object. ISE wants it wrapped in its root key.
 func (c *Client) ersCreate(path, rootKey string, obj map[string]any) error {
 	u := c.ersBase + path
-	_, err := c.do(http.MethodPost, u, map[string]any{rootKey: obj})
+	// ERS refuses a create whose body carries JSON nulls - "Resource
+	// Initialization Failed due to JSON invalidity" - and the OpenAPI reads
+	// these objects come from are full of them (an endpoint arrives with
+	// ipAddress, vendor, mdmAttributes and a dozen asset fields all null). A
+	// null means "unset", so dropping it is lossless. Verified on 3.4.
+	_, err := c.do(http.MethodPost, u, map[string]any{rootKey: withoutNulls(obj)})
 	return err
+}
+
+// withoutNulls returns a copy of obj with every nil value removed, at any
+// depth. The original is left alone: callers keep using it for reporting.
+func withoutNulls(obj map[string]any) map[string]any {
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		switch t := v.(type) {
+		case nil:
+			continue
+		case map[string]any:
+			out[k] = withoutNulls(t)
+		case []any:
+			arr := make([]any, 0, len(t))
+			for _, item := range t {
+				if item == nil {
+					continue
+				}
+				if m, ok := item.(map[string]any); ok {
+					arr = append(arr, withoutNulls(m))
+					continue
+				}
+				arr = append(arr, item)
+			}
+			out[k] = arr
+		default:
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // openAPICreate POSTs an object directly to the OpenAPI (no root key wrapping).
@@ -318,6 +472,13 @@ func (c *Client) openAPICreate(path string, obj map[string]any) error {
 func (c *Client) ersPut(path, rootKey string, obj map[string]any) error {
 	u := c.ersBase + path
 	_, err := c.do(http.MethodPut, u, map[string]any{rootKey: obj})
+	return err
+}
+
+// openAPIPut updates an OpenAPI object (no root key wrapping).
+func (c *Client) openAPIPut(path string, obj map[string]any) error {
+	u := c.apiBase + path
+	_, err := c.do(http.MethodPut, u, obj)
 	return err
 }
 
@@ -335,7 +496,8 @@ func isDuplicate(err error) bool {
 	}
 	b := strings.ToLower(ae.Body)
 	return strings.Contains(b, "already exist") || strings.Contains(b, "duplicate") ||
-		strings.Contains(b, "same name") || strings.Contains(b, "resource already")
+		strings.Contains(b, "same name") || strings.Contains(b, "resource already") ||
+		strings.Contains(b, "binary equal") || strings.Contains(b, "skipping the replace")
 }
 
 // openAPIList reads an OpenAPI collection. The shape is not consistent across

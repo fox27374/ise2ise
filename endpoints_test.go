@@ -120,8 +120,8 @@ func TestExportKeepsOnlyStaticEndpointsOfSelectedGroups(t *testing.T) {
 		t.Fatalf("ExportEndpoints: %v", err)
 	}
 
-	if got := len(b.Objects[familyEndpointGroups]); got != 2 {
-		t.Fatalf("groups exported = %d, want 2 (all groups travel, endpoints are filtered)", got)
+	if got := len(b.Objects[familyEndpointGroups]); got != 1 {
+		t.Fatalf("groups exported = %d, want 1 (only selected group Printers)", got)
 	}
 	eps := b.Objects[familyEndpoints]
 	macs := map[string]map[string]any{}
@@ -194,7 +194,7 @@ func TestExportFallsBackToERSWhenOpenAPIIsOff(t *testing.T) {
 func TestExportGroupsOnly(t *testing.T) {
 	f := sourceISE(t)
 	b := NewBundle(&Probe{Host: "src"})
-	if err := ExportEndpoints(f.client(), b, []string{familyEndpointGroups}, nil, quiet); err != nil {
+	if err := ExportEndpoints(f.client(), b, []string{familyEndpointGroups}, []string{"Printers", "Cameras"}, quiet); err != nil {
 		t.Fatalf("ExportEndpoints: %v", err)
 	}
 	if _, ok := b.Objects[familyEndpoints]; ok {
@@ -353,5 +353,297 @@ func TestApplyReportsISEErrorText(t *testing.T) {
 	}
 	if res.Skipped != 1 || res.Created != 0 || res.Failed != 0 {
 		t.Errorf("a race with an existing object is a skip, not a failure: %+v", res)
+	}
+}
+
+// A deployment with the ERS CSRF check enabled refuses every write until the
+// client fetches a nonce and sends it back with the session cookie. Without
+// this the endpoint import fails on a stock 3.4 box with an HTML error body.
+func TestImportWithERSCSRFCheck(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "ise2ise-test-group")
+	src.addEndpoint("02:00:5E:00:53:01", "grp-1", true, "")
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"ise2ise-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	tgt.csrfRequired = true
+	c := tgt.client()
+
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	if res.Created == 0 {
+		t.Fatal("nothing was created against a target requiring a CSRF nonce")
+	}
+	if tgt.csrfIssued == 0 {
+		t.Error("the client never fetched a CSRF nonce")
+	}
+}
+
+// Endpoints read from the OpenAPI arrive with a dozen null fields (ipAddress,
+// vendor, mdmAttributes, the asset* set). ERS refuses a create whose body
+// carries any of them: "Resource Initialization Failed due to JSON invalidity".
+func TestImportStripsNullsFromERSCreate(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "null-test-group")
+	ep := src.addEndpoint("02:00:5E:00:53:03", "grp-1", true, "")
+	ep["ipAddress"] = nil
+	ep["vendor"] = nil
+	ep["mdmAttributes"] = nil
+	ep["description"] = nil
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"null-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	c := tgt.client()
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	created := false
+	for _, e := range tgt.endpoints {
+		if endpointMAC(e) == "02:00:5E:00:53:03" {
+			created = true
+		}
+	}
+	if !created {
+		t.Error("the endpoint was not created on the target")
+	}
+}
+
+// A real 3.4 box refused every endpoint that carried a DHCP-learned ipAddress
+// with HTTP 400 "Resource Initialization Failed due to JSON invalidity": the
+// field exists on the OpenAPI resource and not on the ERS one. Null stripping
+// did not cover it, because a learned address is not null.
+func TestImportStripsOpenAPIOnlyEndpointFields(t *testing.T) {
+	src := newFakeISE(t)
+	src.addGroup("grp-1", "asset-test-group")
+	ep := src.addEndpoint("02:00:5E:00:53:04", "grp-1", true, "")
+	ep["ipAddress"] = "10.20.1.196"
+	ep["vendor"] = "Cisco Systems, Inc"
+	ep["assetId"] = "asset-42"
+
+	b := NewBundle(&Probe{Nodes: []string{"node1"}})
+	if err := ExportEndpoints(src.client(), b, []string{familyEndpointGroups, familyEndpoints},
+		[]string{"asset-test-group"}, quiet); err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	c := tgt.client()
+	rep, err := Preflight(c, b)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	res, err := ApplyImport(c, rep, quiet)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0. Errors: %v", res.Failed, res.Errors)
+	}
+	for _, e := range tgt.endpoints {
+		if endpointMAC(e) != "02:00:5E:00:53:04" {
+			continue
+		}
+		for _, f := range openAPIOnlyEndpointFields {
+			if v, ok := e[f]; ok {
+				t.Errorf("%s reached the ERS create as %v; ERS rejects the whole object", f, v)
+			}
+		}
+		return
+	}
+	t.Error("the endpoint was not created on the target")
+}
+
+func TestExportSubsetSelection(t *testing.T) {
+	f := sourceISE(t)
+	b := NewBundle(&Probe{Host: "src"})
+	err := ExportEndpoints(f.client(), b, []string{familyEndpointGroups}, []string{"Printers"}, quiet)
+	if err != nil {
+		t.Fatalf("ExportEndpoints: %v", err)
+	}
+
+	groups := b.Objects[familyEndpointGroups]
+	if len(groups) != 1 {
+		t.Fatalf("groups exported = %d, want 1 (only Printers)", len(groups))
+	}
+	if str(groups[0], "name") != "Printers" {
+		t.Errorf("exported group name = %v, want Printers", str(groups[0], "name"))
+	}
+
+	notes := strings.Join(b.Notes, "\n")
+	if !strings.Contains(notes, "Cameras") {
+		t.Errorf("left-behind groups must be reported in a note, got: %s", notes)
+	}
+	if !strings.Contains(notes, "1 of 2") {
+		t.Errorf("note must report the count, got: %s", notes)
+	}
+}
+
+func TestExportEmptyGroupSelectionWithGroupsErrors(t *testing.T) {
+	f := sourceISE(t)
+	b := NewBundle(&Probe{Host: "src"})
+	err := ExportEndpoints(f.client(), b, []string{familyEndpointGroups}, []string{}, quiet)
+	if err == nil {
+		t.Fatal("ExportEndpoints should error when groups family is selected and no groups are selected")
+	}
+	if !strings.Contains(err.Error(), "select at least one endpoint identity group") {
+		t.Errorf("error message should guide the user: %v", err)
+	}
+}
+
+func TestExportEmptyGroupSelectionWithEndpointsErrors(t *testing.T) {
+	f := sourceISE(t)
+	b := NewBundle(&Probe{Host: "src"})
+	err := ExportEndpoints(f.client(), b, []string{familyEndpoints}, []string{}, quiet)
+	if err == nil {
+		t.Fatal("ExportEndpoints should error when endpoints family is selected and no groups are selected")
+	}
+	if !strings.Contains(err.Error(), "select at least one endpoint identity group") {
+		t.Errorf("error message should guide the user: %v", err)
+	}
+}
+
+func TestExportNoGroupsWithCertsOnly(t *testing.T) {
+	f := sourceISE(t)
+	b := NewBundle(&Probe{Host: "src"})
+	// Only trusted certs, no endpoint families
+	err := ExportEndpoints(f.client(), b, []string{}, []string{}, quiet)
+	if err != nil {
+		t.Fatalf("ExportEndpoints should not error when endpoint families are not selected: %v", err)
+	}
+	if len(b.Objects[familyEndpointGroups]) > 0 {
+		t.Error("groups should not be exported when the family is not selected")
+	}
+}
+
+// The references a real 3.4 returns are nested inside a policy set's rules and
+// inside the shared condition library, never in the policy set object itself,
+// and the value carries the group's nesting path.
+func TestScanPolicyUsageFindsReferences(t *testing.T) {
+	f := newFakeISE(t)
+	f.addPolicySet("network-access", "ps1", "SDA")
+	f.addRuleWithGroupRef("network-access", "ps1", "authorization", "Printers")
+	f.addRuleWithGroupRef("network-access", "ps1", "authorization", "Production:Printers")
+	f.addRuleWithGroupRef("network-access", "ps1", "authentication", "Cameras")
+	f.addLibraryConditionWithGroupRef("network-access", "is-a-camera", "Cameras")
+	// A group used only by TACACS rules is still in use.
+	f.addPolicySet("device-admin", "da1", "Device Admin")
+	f.addRuleWithGroupRef("device-admin", "da1", "authorization", "Netadmin")
+
+	usage, note := scanPolicyUsage(f.client(), []string{"Printers", "Cameras", "Netadmin"})
+	if note != "" {
+		t.Fatalf("a healthy scan must report no problem, got %q", note)
+	}
+	for name, want := range map[string]int{"Printers": 2, "Cameras": 2, "Netadmin": 1} {
+		if usage[name] != want {
+			t.Errorf("%s used by %d, want %d (usage: %v)", name, usage[name], want, usage)
+		}
+	}
+}
+
+// A scan that read nothing must say so. Zero counts from a refused scan look
+// exactly like zero counts from a deployment whose policy uses no groups, and
+// presenting the first as the second is what would make an operator drop a group
+// a rule depends on.
+func TestScanPolicyUsageReportsATotalFailure(t *testing.T) {
+	f := newFakeISE(t)
+	f.policyForbidden = true
+
+	usage, note := scanPolicyUsage(f.client(), []string{"Printers"})
+	if note == "" {
+		t.Fatal("a scan that read nothing must not pass silently as zero usage")
+	}
+	if !strings.Contains(note, "403") && !strings.Contains(note, "privileges") {
+		t.Errorf("the note must carry what ISE actually said, got %q", note)
+	}
+	if len(usage) != 0 {
+		t.Errorf("usage = %v, want nothing counted", usage)
+	}
+}
+
+// One refused rule set must not cost the references in the others.
+func TestScanPolicyUsagePartialFailureStillCounts(t *testing.T) {
+	f := newFakeISE(t)
+	f.addPolicySet("network-access", "ps1", "SDA")
+	f.addRuleWithGroupRef("network-access", "ps1", "authorization", "Printers")
+
+	// The device-admin tree is absent on this box: its paths answer 404.
+	f.policies["/api/v1/policy/device-admin/policy-set"] = nil
+
+	usage, _ := scanPolicyUsage(f.client(), []string{"Printers"})
+	if usage["Printers"] != 1 {
+		t.Errorf("Printers used by %d, want 1 (usage: %v)", usage["Printers"], usage)
+	}
+}
+
+func TestScanPolicyUsageSurvivesUnexpectedShapes(t *testing.T) {
+	f := newFakeISE(t)
+	f.policies["/api/v1/policy/network-access/policy-set"] = []map[string]any{
+		{"id": "p1", "name": "broken", "junk": "not a condition"},
+		{"id": "p2", "condition": []any{"a bare string where an object belongs", 42, nil}},
+		// The right dictionary, the wrong attribute: not a group reference.
+		{"id": "p3", "condition": map[string]any{
+			"dictionaryName": "IdentityGroup", "attributeName": "Description",
+			"attributeValue": "Endpoint Identity Groups:Printers"}},
+	}
+
+	usage, _ := scanPolicyUsage(f.client(), []string{"Printers"})
+	if usage["Printers"] != 0 {
+		t.Errorf("Printers used by %d, want 0 — only dictionary+attribute Name is a reference", usage["Printers"])
+	}
+}
+
+func TestListEndpointGroupsSurfacesSystemDefinedAndUsage(t *testing.T) {
+	f := newFakeISE(t)
+	f.addGroup("g1", "Printers")
+	f.addGroupWithSystemFlag("g2", "Profiled", true)
+	f.addPolicySet("network-access", "ps1", "SDA")
+	f.addRuleWithGroupRef("network-access", "ps1", "authorization", "Printers")
+
+	groups, note, err := ListEndpointGroups(f.client())
+	if err != nil {
+		t.Fatalf("ListEndpointGroups: %v", err)
+	}
+	if note != "" {
+		t.Errorf("unexpected scan note: %q", note)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("groups = %v", groups)
+	}
+	// ISE's own groups sort last, whatever their name.
+	if groups[0].Name != "Printers" || groups[1].Name != "Profiled" {
+		t.Errorf("system-defined groups must sort last, got %v", groups)
+	}
+	if groups[0].SystemDefined || !groups[1].SystemDefined {
+		t.Errorf("systemDefined was not carried from the detail object: %v", groups)
+	}
+	if groups[0].UsedBy != 1 {
+		t.Errorf("Printers usedBy = %d, want 1", groups[0].UsedBy)
 	}
 }

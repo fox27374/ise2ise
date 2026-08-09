@@ -165,19 +165,22 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       <h2>2. Choose what to export</h2>
       <div class="families">
         <label><input type="checkbox" id="famGroups" checked> Endpoint identity groups
-          <span class="hint">All groups travel, so an endpoint's group exists on the target.</span></label>
+          <span class="hint">The groups you select below are created on the target. Unselected groups are left behind.</span></label>
         <label><input type="checkbox" id="famEndpoints" checked> Static endpoints
-          <span class="hint">Only endpoints with a static group or static profile assignment. Profiler-assigned
-            endpoints are left behind: the new deployment regenerates them.</span></label>
+          <span class="hint">Endpoints from the groups you select below, and only those with a static group or
+            static profile assignment. Profiler-assigned endpoints are left behind: the new deployment
+            regenerates them.</span></label>
         <label><input type="checkbox" id="famCerts"> Trusted certificates
           <span class="hint">Portable certificate authority, root and intermediate certificates.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
-        <label>Export endpoints from these groups
-          <span class="hint">Endpoints outside the selected groups are not read.</span></label>
+        <label>Migrate these endpoint identity groups
+          <span class="hint">Selected groups are created on the target and their endpoints are read. Groups outside
+            the selection are not touched at all. A group a policy rule points at is marked.</span></label>
         <div style="margin-bottom:.5rem">
           <button type="button" class="link" id="expSelAll">select all</button> ·
-          <button type="button" class="link" id="expSelNone">select none</button>
+          <button type="button" class="link" id="expSelNone">select none</button> ·
+          <button type="button" class="link" id="expSelUsed" style="display:none">used by policy</button>
         </div>
         <div class="picker" id="expGroups">Loading groups…</div>
       </div>
@@ -436,10 +439,47 @@ async function loadGroups() {
     const data = await postJSON("/api/endpoint-groups", expCreds);
     const gs = data.groups || [];
     if (!gs.length) { $("expGroups").textContent = "This deployment has no endpoint identity groups."; return; }
-    $("expGroups").innerHTML = gs.map(g =>
-      '<label><input type="checkbox" class="grp" value="' + esc(g.name) + '"> ' + esc(g.name) + "</label>").join("");
+
+    // Separate system and non-system groups
+    const nonSystem = gs.filter(g => !g.systemDefined);
+    const system = gs.filter(g => g.systemDefined);
+
+    let html = "";
+
+    // Render non-system groups
+    html += nonSystem.map(g => {
+      let badge = "";
+      if (g.usedBy > 0) {
+        badge = ' <span class="badge" style="font-weight:400">used by ' + g.usedBy + ' rule' + (g.usedBy !== 1 ? 's' : '') + '</span>';
+      }
+      return '<label><input type="checkbox" class="grp" value="' + esc(g.name) + '" data-used="' + (g.usedBy || 0) + '"> ' + esc(g.name) + badge + "</label>";
+    }).join("");
+
+    // Add divider and render system groups
+    if (system.length > 0) {
+      html += '<div style="border-top:1px solid var(--line); margin:.5rem 0; padding-top:.5rem; color:var(--muted); font-size:.8rem">ISE built-in</div>';
+      html += system.map(g => {
+        let badge = "";
+        if (g.usedBy > 0) {
+          badge = ' <span class="badge" style="font-weight:400">used by ' + g.usedBy + ' rule' + (g.usedBy !== 1 ? 's' : '') + '</span>';
+        }
+        return '<label><input type="checkbox" class="grp" value="' + esc(g.name) + '" data-used="' + (g.usedBy || 0) + '"> ' + esc(g.name) + badge + "</label>";
+      }).join("");
+    }
+
+    $("expGroups").innerHTML = html;
+
+    // Show/hide "used by policy" link
+    if (data.note) {
+      // Scan failed, hide the link
+      $("expSelUsed").style.display = "none";
+    } else {
+      // Scan succeeded, show the link
+      $("expSelUsed").style.display = "inline";
+    }
   } catch (err) {
     $("expGroups").textContent = "Could not list groups: " + err.message;
+    $("expSelUsed").style.display = "none";
   }
 }
 
@@ -465,11 +505,16 @@ const eachGroup = fn => document.querySelectorAll("#expGroups .grp").forEach(fn)
 const eachCert = fn => document.querySelectorAll("#expCerts .cert").forEach(fn);
 $("expSelAll").addEventListener("click", () => eachGroup(c => c.checked = true));
 $("expSelNone").addEventListener("click", () => eachGroup(c => c.checked = false));
+$("expSelUsed").addEventListener("click", () => eachGroup(c => c.checked = parseInt(c.dataset.used) > 0));
 $("expSelAllCerts").addEventListener("click", () => eachCert(c => { if (!c.disabled) c.checked = true; }));
 $("expSelNoneCerts").addEventListener("click", () => eachCert(c => c.checked = false));
-$("famEndpoints").addEventListener("change", () => {
-  $("expGroupsWrap").classList.toggle("hidden", !$("famEndpoints").checked);
-});
+
+function updateGroupsWrapVisibility() {
+  $("expGroupsWrap").classList.toggle("hidden", !($("famGroups").checked || $("famEndpoints").checked));
+}
+
+$("famGroups").addEventListener("change", updateGroupsWrapVisibility);
+$("famEndpoints").addEventListener("change", updateGroupsWrapVisibility);
 $("famCerts").addEventListener("change", () => {
   $("expCertsWrap").classList.toggle("hidden", !$("famCerts").checked);
   if ($("famCerts").checked) loadCerts();
@@ -488,8 +533,8 @@ $("expGo").addEventListener("click", async () => {
   if (phrase !== $("expPhrase2").value) return showErr($("expError"), "The two passphrases do not match.");
   const groups = [];
   eachGroup(c => { if (c.checked) groups.push(c.value); });
-  if ($("famEndpoints").checked && !groups.length) {
-    return showErr($("expError"), "Select at least one endpoint identity group, or untick “Static endpoints”.");
+  if (($("famGroups").checked || $("famEndpoints").checked) && !groups.length) {
+    return showErr($("expError"), "Select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints.");
   }
   const certs = [];
   eachCert(c => { if (c.checked) certs.push(c.value); });

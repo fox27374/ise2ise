@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -30,7 +31,14 @@ type fakeISE struct {
 	profiles    []map[string]any
 	nodes       []string
 	certs       []map[string]any
-	certExports map[string][]byte // cert id -> export body
+	certExports map[string][]byte           // cert id -> export body
+	policies    map[string][]map[string]any // policy path -> list of policy objects
+
+	policyForbidden bool // the policy API answers 403, as a locked-down box does
+
+	csrfRequired bool   // ERS demands a CSRF nonce on writes, as a real 3.4 does
+	csrfToken    string // the nonce currently issued
+	csrfIssued   int    // how many nonces were handed out
 
 	ersUnauthorized bool // ERS answers 401 (disabled, or wrong credentials)
 	apiUnauthorized bool // OpenAPI answers 401
@@ -47,6 +55,7 @@ func newFakeISE(t *testing.T) *fakeISE {
 		nodes:       []string{"ise-src-1"},
 		pagesServed: map[string]int{},
 		created:     map[string][]map[string]any{},
+		policies:    map[string][]map[string]any{},
 	}
 	f.ers = httptest.NewServer(http.HandlerFunc(f.serveERS))
 	f.api = httptest.NewServer(http.HandlerFunc(f.serveAPI))
@@ -56,10 +65,19 @@ func newFakeISE(t *testing.T) *fakeISE {
 }
 
 func (f *fakeISE) client() *Client {
+	hc := f.ers.Client()
+	// NewClient gives the real client a cookie jar because the ERS CSRF nonce
+	// is only accepted alongside the session cookie issued with it. The fake's
+	// client has to match, or it cannot exercise that path.
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		f.t.Fatalf("cookie jar: %v", err)
+	}
+	hc.Jar = jar
 	return &Client{
 		Host: "fake-ise", User: f.user, Pass: f.pass,
 		ersBase: f.ers.URL, apiBase: f.api.URL,
-		hc: f.ers.Client(),
+		hc: hc,
 	}
 }
 
@@ -89,6 +107,40 @@ func (f *fakeISE) serveERS(w http.ResponseWriter, r *http.Request) {
 	if !f.auth(w, r, f.ersUnauthorized) {
 		return
 	}
+
+	// Real ISE refuses ERS writes with "CSRF nonce validation failed" unless the
+	// client has fetched a nonce and sends it back with the session cookie.
+	// Observed on 3.4 with the CSRF check enabled.
+	if f.csrfRequired {
+		if r.Header.Get("X-CSRF-TOKEN") == "fetch" {
+			f.mu.Lock()
+			f.csrfIssued++
+			tok := fmt.Sprintf("nonce-%d", f.csrfIssued)
+			f.csrfToken = tok
+			f.mu.Unlock()
+			http.SetCookie(w, &http.Cookie{Name: "APPSESSIONID", Value: "fake-session", Path: "/"})
+			w.Header().Set("X-CSRF-Token", tok)
+			// ISE answers the fetch with 415, not 200.
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		if r.Method != http.MethodGet {
+			f.mu.Lock()
+			want, cookieOK := f.csrfToken, false
+			for _, ck := range r.Cookies() {
+				if ck.Name == "APPSESSIONID" {
+					cookieOK = true
+				}
+			}
+			f.mu.Unlock()
+			if want == "" || r.Header.Get("X-CSRF-TOKEN") != want || !cookieOK {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, "<html><body>CSRF nonce validation failed</body></html>")
+				return
+			}
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	path := r.URL.Path
@@ -127,6 +179,16 @@ func (f *fakeISE) serveERS(w http.ResponseWriter, r *http.Request) {
 		if obj == nil {
 			iseError(w, http.StatusBadRequest, "expected root key "+root)
 			return
+		}
+		// Real ERS refuses a body containing JSON nulls. Observed on 3.4:
+		// "Resource Initialization Failed due to JSON invalidity: please if
+		// properties names are correct: ipAddress->..."
+		for k, v := range obj {
+			if v == nil {
+				iseError(w, http.StatusBadRequest,
+					"Resource Initialization Failed due to JSON invalidity: please if properties names are correct: "+k+"->null")
+				return
+			}
 		}
 		name, _ := obj["name"].(string)
 		if name == "" {
@@ -171,15 +233,32 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Trusted certificate listing.
+	// Policy endpoints: the policy sets, their authentication and authorization
+	// rules, and the shared condition library, for both policy trees.
+	if strings.HasPrefix(path, "/api/v1/policy/") && r.Method == http.MethodGet {
+		f.pagesServed["policy-"+path]++
+		if f.policyForbidden {
+			// What a deployment with the policy API locked down answers.
+			http.Error(w, `{"message":"insufficient privileges"}`, http.StatusForbidden)
+			return
+		}
+		items := f.policies[path] // nil is a legitimate empty rule set
+		writeJSONRaw(w, map[string]any{"response": f.page(r, items)})
+		return
+	}
+
+	// Trusted certificate listing (OpenAPI only).
 	if path == "/api/v1/certs/trusted-certificate" && r.Method == http.MethodGet {
 		f.pagesServed["openapi-cert"]++
 		page := f.page(r, f.certs)
-		if f.apiBareArray {
-			writeJSONRaw(w, page)
-			return
-		}
-		writeJSONRaw(w, page)
+		// Real ISE 3.4 returns {"response": [...]}
+		writeJSONRaw(w, map[string]any{"response": page})
+		return
+	}
+
+	// ERS trusted certificate path returns 404 (does not exist in ISE 3.4).
+	if strings.HasPrefix(path, "/ers/config/trustedcertificate") {
+		iseError(w, http.StatusNotFound, "Resource not found: "+path)
 		return
 	}
 
@@ -192,42 +271,175 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check for duplicates by name.
+		// Check for comma in description (real ISE 3.4 rejects this).
+		if desc, ok := body["description"].(string); ok && strings.Contains(desc, ",") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{
+				"response": map[string]any{
+					"status":  "Fail",
+					"message": "Security Check Failed",
+					"id":      nil,
+				},
+			})
+			return
+		}
+
+		// Check for duplicates by friendly name and binary content.
 		name, _ := body["name"].(string)
+		data, _ := body["data"].(string)
+
 		for _, existing := range f.certs {
-			if str(existing, "name") == name {
-				iseError(w, http.StatusBadRequest, "Certificate with name "+name+" already exists")
-				return
+			if str(existing, "friendlyName") == name {
+				// This is a duplicate by name - the real error is the "binary equal" one.
+				// Check if data matches.
+				if str(existing, "pem") == data {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusConflict)
+					json.NewEncoder(w).Encode(map[string]any{
+						"response": map[string]any{
+							"status":  "Fail",
+							"message": "Certificates are having same subject, same serial number and they are binary equal. Hence skipping the replace",
+							"id":      nil,
+						},
+					})
+					return
+				}
 			}
 		}
 
-		// Create the cert object.
-		cert := maps.Clone(body)
-		cert["id"] = fmt.Sprintf("tgt-cert-%d", len(f.certs)+1)
-		if cert["sha256Fingerprint"] == nil {
-			// Fake a fingerprint.
-			cert["sha256Fingerprint"] = "00112233445566778899aabbccddeeff"
+		// Create the cert object with real field names and types.
+		cert := map[string]any{
+			"id":                            fmt.Sprintf("tgt-cert-%d", len(f.certs)+1),
+			"friendlyName":                  name,
+			"subject":                       "CN=example.com",
+			"issuedTo":                      "example.com",
+			"issuedBy":                      "example.com",
+			"keySize":                       256,
+			"signatureAlgorithm":            "SHA256withECDSA",
+			"validFrom":                     "Mon Jan 01 00:00:00 UTC 2024",
+			"expirationDate":                "Mon Dec 31 23:59:59 UTC 2025",
+			"serialNumberDecimalFormat":     "1",
+			"status":                        "Enabled",
+			"trustedFor":                    "Infrastructure,Endpoints",
+			"internalCA":                    false,
+			"downloadCRL":                   "off",
+			"automaticCRLUpdate":            "off",
+			"authenticateBeforeCRLReceived": "off",
+			"enableOCSPValidation":          "off",
+			"enableServerIdentityCheck":     "off",
+			"rejectIfNoStatusFromOCSP":      "off",
+			"rejectIfUnreachableFromOCSP":   "off",
+			"sha256Fingerprint":             "00112233445566778899aabbccddeeff",
 		}
+
+		// Copy from request body if present.
+		for _, field := range []string{"description", "trustForIseAuth", "trustForClientAuth", "trustForCertificateBasedAdminAuth", "trustForCiscoServicesAuth"} {
+			if v, ok := body[field]; ok {
+				cert[field] = v
+			}
+		}
+
+		// Store the PEM data for later export.
+		cert["pem"] = data
+
 		f.certs = append(f.certs, cert)
 		if f.created["certs"] == nil {
 			f.created["certs"] = []map[string]any{}
 		}
 		f.created["certs"] = append(f.created["certs"], body)
-		w.WriteHeader(http.StatusCreated)
-		writeJSONRaw(w, cert)
+
+		// Real ISE 3.4 import response.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"response": map[string]any{
+				"status":  "Success",
+				"message": "Trust certificate was added successfully",
+				"id":      cert["id"],
+			},
+		})
+		return
+	}
+
+	// Trusted certificate PUT (CRL settings).
+	if strings.HasPrefix(path, "/api/v1/certs/trusted-certificate/") && r.Method == http.MethodPut {
+		parts := strings.Split(path, "/")
+		if len(parts) >= 6 {
+			id := parts[5]
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+
+			// Real ISE 3.4 refuses these when CRL download is off, and rejects
+			// the whole PUT with 400.
+			if dl, _ := body["downloadCRL"].(bool); !dl {
+				for _, dep := range []string{"automaticCRLUpdate", "enableServerIdentityCheck", "authenticateBeforeCRLReceived", "ignoreCRLExpiration"} {
+					if b, _ := body[dep].(bool); b {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusBadRequest)
+						json.NewEncoder(w).Encode(map[string]any{"response": map[string]any{
+							"message": "One or more of these parameters: automaticCRLUpdate, enableServerIdentityCheck, authenticateBeforeCRLReceived, ignoreCRLExpiration can only be set true if downloadCRL parameter is set to be true",
+						}})
+						return
+					}
+				}
+			}
+
+			// Find the cert and update it.
+			for i, cert := range f.certs {
+				if str(cert, "id") == id {
+					// Merge in the updates.
+					for k, v := range body {
+						f.certs[i][k] = v
+					}
+					// The real PUT replaces rather than patches: a trust flag
+					// left out of the body comes back false, which is how a
+					// certificate ends up trusted for nothing after an
+					// otherwise successful import.
+					trusted := []string{}
+					for _, m := range []struct{ flag, token string }{
+						{"trustForIseAuth", "Infrastructure"},
+						{"trustForClientAuth", "Endpoints"},
+						{"trustForCiscoServicesAuth", "Cisco Services"},
+						{"trustForCertificateBasedAdminAuth", "AdminAuth"},
+					} {
+						if b, _ := body[m.flag].(bool); b {
+							trusted = append(trusted, m.token)
+						}
+					}
+					if len(trusted) == 0 {
+						f.certs[i]["trustedFor"] = "Unknown"
+					} else {
+						f.certs[i]["trustedFor"] = strings.Join(trusted, ",")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(map[string]any{
+						"response": f.certs[i],
+					})
+					return
+				}
+			}
+		}
+		iseError(w, http.StatusNotFound, "Certificate not found")
 		return
 	}
 
 	// Trusted certificate export (by id).
-	if strings.HasPrefix(path, "/api/v1/certs/trusted-certificate/") && strings.HasSuffix(path, "/export") {
-		parts := strings.Split(path, "/")
-		if len(parts) >= 7 {
-			// parts[5] is the id, parts[6] is "export"
-			id := parts[5]
-			if body, ok := f.certExports[id]; ok {
-				w.Header().Set("Content-Type", "application/octet-stream")
-				w.Write(body)
-				return
+	// Path is /api/v1/certs/trusted-certificate/export/{id}
+	if strings.HasPrefix(path, "/api/v1/certs/trusted-certificate/export/") {
+		id := strings.TrimPrefix(path, "/api/v1/certs/trusted-certificate/export/")
+		for _, cert := range f.certs {
+			if str(cert, "id") == id {
+				// Return the PEM data stored in the cert.
+				pem := str(cert, "pem")
+				if pem != "" {
+					w.Header().Set("Content-Type", "application/octet-stream")
+					w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.pem", str(cert, "friendlyName")))
+					w.Write([]byte(pem))
+					return
+				}
+				break
 			}
 		}
 		iseError(w, http.StatusNotFound, "Certificate not found")
@@ -276,8 +488,6 @@ func (f *fakeISE) collection(coll string) ([]map[string]any, string, bool) {
 		return f.endpoints, rootEndpoint, true
 	case "profilerprofile":
 		return f.profiles, "ProfilerProfile", true
-	case "trustedcertificate":
-		return f.certs, rootTrustedCert, true
 	case "node":
 		nodes := make([]map[string]any, 0, len(f.nodes))
 		for i, n := range f.nodes {
@@ -296,8 +506,6 @@ func (f *fakeISE) append(coll string, o map[string]any) {
 		f.endpoints = append(f.endpoints, o)
 	case "profilerprofile":
 		f.profiles = append(f.profiles, o)
-	case "trustedcertificate":
-		f.certs = append(f.certs, o)
 	}
 }
 
@@ -317,9 +525,13 @@ func writeJSONRaw(w http.ResponseWriter, v any) {
 // --- fixtures ----------------------------------------------------------------
 
 func (f *fakeISE) addGroup(id, name string) map[string]any {
+	return f.addGroupWithSystemFlag(id, name, false)
+}
+
+func (f *fakeISE) addGroupWithSystemFlag(id, name string, systemDefined bool) map[string]any {
 	g := map[string]any{
 		"id": id, "name": name, "description": name + " description",
-		"systemDefined": false,
+		"systemDefined": systemDefined,
 		"link":          map[string]any{"rel": "self", "href": f.ers.URL + "/ers/config/endpointgroup/" + id},
 	}
 	f.groups = append(f.groups, g)
@@ -343,6 +555,51 @@ func (f *fakeISE) addEndpoint(mac, groupID string, static bool, profileID string
 	}
 	f.endpoints = append(f.endpoints, e)
 	return e
+}
+
+// addPolicySet registers a policy set, which on a real box carries almost no
+// conditions itself: the references live in the rules that hang off it.
+func (f *fakeISE) addPolicySet(tree, id, name string) {
+	path := "/api/v1/policy/" + tree + "/policy-set"
+	f.policies[path] = append(f.policies[path], map[string]any{"id": id, "name": name})
+}
+
+// addRuleWithGroupRef puts a rule referencing an endpoint identity group into one
+// of a policy set's rule sets ("authentication" or "authorization"). groupPath is
+// what ISE stores, so it may carry the nesting: "Production:Siemens".
+func (f *fakeISE) addRuleWithGroupRef(tree, setID, ruleSet, groupPath string) {
+	path := "/api/v1/policy/" + tree + "/policy-set/" + setID + "/" + ruleSet
+	f.policies[path] = append(f.policies[path], map[string]any{
+		"rule": map[string]any{
+			"name": "match " + groupPath,
+			"condition": map[string]any{
+				"conditionType": "ConditionAndBlock",
+				"children": []any{
+					map[string]any{
+						"conditionType":  "ConditionAttributes",
+						"dictionaryName": "IdentityGroup",
+						"attributeName":  "Name",
+						"operator":       "equals",
+						"attributeValue": "Endpoint Identity Groups:" + groupPath,
+					},
+				},
+			},
+		},
+	})
+}
+
+// addLibraryConditionWithGroupRef puts a reference in the shared condition
+// library, which rules point at rather than inlining.
+func (f *fakeISE) addLibraryConditionWithGroupRef(tree, name, groupPath string) {
+	path := "/api/v1/policy/" + tree + "/condition"
+	f.policies[path] = append(f.policies[path], map[string]any{
+		"conditionType":  "LibraryConditionAttributes",
+		"name":           name,
+		"dictionaryName": "IdentityGroup",
+		"attributeName":  "Name",
+		"operator":       "equals",
+		"attributeValue": "Endpoint Identity Groups:" + groupPath,
+	})
 }
 
 func quiet(string, ...any) {}

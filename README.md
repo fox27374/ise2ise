@@ -65,23 +65,53 @@ Handle both CSVs as credential material and delete them when you are done.
 Both ISE APIs are off out of the box. On **each** deployment:
 `Administration → System → Settings → API Settings` → enable **ERS** (port
 9060) and **OpenAPI** (port 443), and use an account with the **ERS Admin**
-role (plus **API Admin** for OpenAPI). ise2ise probes both and tells you which
+role (plus **API Admin** for OpenAPI). Leave the **CSRF check** however you like
+— the tool performs ISE's nonce handshake, so it works either way. ise2ise probes both and tells you which
 one answered; when only ERS is available everything still works, just slower,
 because ERS needs one GET per object.
 
 Nothing decides behaviour from the ISE version — capability is probed, and
 whatever is missing is skipped and reported. Both ends are expected to be
-ISE 3.x. The source may be standalone or distributed; the target is expected to
-be a **freshly installed standalone**, so import is **create-only**: an object
-that already exists is skipped and counted, never overwritten.
+ISE 3.x. The source may be standalone or distributed; the target is *expected*
+to be a **freshly installed standalone**, because import is **create-only**: an
+object that already exists is skipped and counted, never overwritten, and the
+tool issues no DELETE under any circumstances.
+
+That expectation is a design assumption, not a requirement the tool enforces.
+A migration has been run into a two-node target that was not fresh, and the
+create-only rule is what made it uneventful: everything already present was
+skipped by name. Nothing today carries a node reference, so the single-node
+assumption has not been exercised yet — system certificates will be the first
+family that cares.
 
 ### Export
 
 Connect to the source, look at the probe result (version, nodes, which APIs are
 on), pick the object families and then what to take from them — the endpoint
-identity groups to export endpoints from, the trusted certificates to carry —
-give a passphrase, run. Progress streams live. The result is a single encrypted
-file.
+identity groups to migrate, the trusted certificates to carry — give a
+passphrase, run. Progress streams live. The result is a single encrypted file.
+
+**The group selection is the scope for both endpoint families.** A group you
+tick is created on the target and its static endpoints travel; a group you leave
+unticked is neither created nor read. That is how a deployment sheds the groups
+it stopped using years ago — the tool cannot tell which those are, you can. One
+note in the bundle names everything left behind, so the import side can tell a
+decision from an omission. Selecting no groups at all is refused rather than
+quietly producing an empty bundle.
+
+Two things in the picker help you choose:
+
+- **ISE's own built-in groups sort last**, under a divider. That comes from the
+  `systemDefined` flag ISE puts on each group, not from a list in this tool, so a
+  future release's new groups land in the right place without a code change.
+- **A group a policy rule points at is badged** with how many rules use it, and a
+  `used by policy` link ticks exactly those. Both policy trees are read, network
+  access and TACACS device admin, because a group used only by device admin rules
+  is still in use — device admin policy itself is never migrated. The badge is
+  advisory: you can still leave a referenced group behind on purpose. If the scan
+  cannot read the policy tree it says so rather than showing zeros, because a
+  refused scan and a deployment that references no groups look identical
+  otherwise.
 
 Endpoints are filtered to the ones with a **static** group or profile
 assignment. Everything else is profiler output that the new deployment
@@ -119,7 +149,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 
 | Family | Notes |
 |---|---|
-| Endpoint identity groups | All groups, so an endpoint's group exists on the target. Group nesting is not carried and is reported. |
+| Endpoint identity groups | The ones you select, and only those. Group nesting is not carried and is reported. |
 | Static endpoints | Only in the groups you select, only static assignments, identified by MAC. |
 | Trusted certificates | The ones you select. Internal CA and per-node self-signed certificates are excluded for you. See below. |
 
@@ -141,8 +171,10 @@ What to expect:
 
 - **Duplicates are matched by SHA-256 fingerprint**, not by name, so a
   certificate the target already holds under a different friendly name is still
-  recognised and skipped. If the target does not report fingerprints, the tool
-  falls back to name matching and says so once in the report.
+  recognised and skipped — and the report names the target's own name for it,
+  since a skip you cannot account for is the one worth reading twice. If the
+  target does not report fingerprints, the tool falls back to name matching and
+  says so once in the report.
 - **Expired certificates are blocked** at pre-flight with the expiry date, and
   never attempted.
 - **All four trust purposes travel as they were on the source**, including
@@ -154,9 +186,18 @@ What to expect:
   step fails the certificate still stays — the report names the settings to enter
   by hand. An OCSP service selection is never carried, because OCSP service
   configurations are out of scope; the report names the service.
+- **A description containing a comma cannot be set.** ISE refuses the import
+  outright ("Security Check Failed"), so the certificate is imported without its
+  description and the report tells you what to paste back in.
 - **Importing needs OpenAPI on the target.** It is the only create path ISE
-  offers for this family; with OpenAPI off, the whole family is blocked with one
-  line in the report rather than one line per certificate.
+  offers for this family — the ERS resource does not exist. With OpenAPI off, the
+  whole family is blocked with one line in the report rather than one line per
+  certificate.
+
+This path has been run against a real ISE 3.4 deployment: 33 certificates listed,
+14 excluded, export and encrypted bundle, pre-flight recognising duplicates by
+fingerprint, and a confirmed import creating a certificate with its trust
+purposes intact.
 
 System certificates — the ones with a private key — are a later slice.
 
@@ -225,7 +266,10 @@ even as a stub:
 - System certificates (the ones with a private key)
 - Network device CSV → API import
 
-The API field names come from Cisco's documentation, not from a live box. When
-a response does not have the expected shape, the tool reports what it actually
-received instead of failing silently — please read those messages literally
-when you hit one in a lab.
+The probe, both endpoint families and the whole trusted certificate path have
+been exercised between two real ISE 3.4 deployments, import included: groups,
+statically assigned endpoints and trusted certificates exported from one box and
+created on another, with re-runs creating nothing. Everything still to be built
+comes from Cisco's documentation rather than a live box. When a response does not
+have the expected shape, the tool reports what it actually received instead of
+failing silently; please read those messages literally when you hit one in a lab.

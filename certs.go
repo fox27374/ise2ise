@@ -12,44 +12,81 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ISE paths for trusted certificates.
 const (
 	pathTrustedCertsAPI = "/api/v1/certs/trusted-certificate"
-	pathTrustedCerts    = "/ers/config/trustedcertificate"
-	rootTrustedCert     = "TrustedCertificate"
+)
+
+// A trusted certificate's CRL settings, split by the type the OpenAPI PUT
+// expects. ISE returns all of them as strings ("on"/"off", "5"), so the export
+// converts and the import sends them back in the shape the PUT accepts.
+var (
+	crlBoolFields = []string{
+		"downloadCRL", "automaticCRLUpdate", "ignoreCRLExpiration",
+		"authenticateBeforeCRLReceived", "enableOCSPValidation",
+		"enableServerIdentityCheck", "rejectIfNoStatusFromOCSP",
+		"rejectIfUnreachableFromOCSP",
+	}
+	crlIntFields = []string{
+		"automaticCRLUpdatePeriod", "nonAutomaticCRLUpdatePeriod",
+		"crlDownloadFailureRetries",
+	}
+	// The four trust purposes, in the boolean form both writes use. ISE returns
+	// them as the comma-separated `trustedFor` string instead.
+	trustFlagFields = []string{
+		"trustForIseAuth", "trustForClientAuth",
+		"trustForCertificateBasedAdminAuth", "trustForCiscoServicesAuth",
+	}
+
+	// ISE refuses these on the PUT when downloadCRL is false. Verified on 3.4:
+	// "can only be set true if downloadCRL parameter is set to be true".
+	crlDownloadDependentFields = []string{
+		"automaticCRLUpdate", "enableServerIdentityCheck",
+		"authenticateBeforeCRLReceived", "ignoreCRLExpiration",
+	}
+	crlStringFields = []string{
+		"crlDistributionUrl", "automaticCRLUpdateUnits",
+		"nonAutomaticCRLUpdateUnits", "crlDownloadFailureRetriesUnits",
+	}
 )
 
 // --- export ------------------------------------------------------------------
 
 // ExportTrustedCerts fills the bundle with trusted certificates that the
-// operator selected.
+// operator selected. It reads from the OpenAPI only; the ERS path does not
+// exist for this family in ISE 3.4+.
 func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []string, log func(string, ...any)) error {
 	if !slices.Contains(families, familyTrustedCerts) {
 		return nil
 	}
 
 	log("Listing trusted certificates…")
-	stubs, source, err := fetchTrustedCerts(c, log)
+	certs, err := c.openAPIList(pathTrustedCertsAPI)
 	if err != nil {
-		return err
-	}
-	log("Found %d trusted certificates from %s; reading them…", len(stubs), source)
-	b.Note("Trusted certificates were read from %s.", source)
-
-	// Map stub name -> id for quick lookup.
-	stubByName := map[string]string{}
-	for _, s := range stubs {
-		stubByName[s.Name] = s.ID
+		return fmt.Errorf("could not read trusted certificates from OpenAPI: %w", err)
 	}
 
-	// Selected names -> source ids.
-	selected := map[string]string{}
+	log("Found %d trusted certificates; filtering selected…", len(certs))
+	b.Note("Trusted certificates were read from OpenAPI %s.", pathTrustedCertsAPI)
+
+	// Map friendlyName -> full cert object for quick lookup.
+	certByName := map[string]map[string]any{}
+	for _, cert := range certs {
+		if friendlyName := str(cert, "friendlyName"); friendlyName != "" {
+			certByName[friendlyName] = cert
+		}
+	}
+
+	// Selected names -> cert objects.
+	selected := []map[string]any{}
 	for _, want := range certNames {
-		if id, ok := stubByName[want]; ok {
-			selected[want] = id
+		if cert, ok := certByName[want]; ok {
+			selected = append(selected, cert)
 		} else {
 			b.Note("Selected trusted certificate %q no longer exists on the source; skipped.", want)
 		}
@@ -57,31 +94,10 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 
 	out := make([]map[string]any, 0, len(selected))
 	nameSeen := map[string]bool{}
-	for _, g := range b.Objects[familyEndpointGroups] {
-		if name := str(g, "name"); name != "" {
-			nameSeen[name] = true
-		}
-	}
-	for _, ep := range b.Objects[familyEndpoints] {
-		if name := str(ep, "mac"); name != "" {
-			nameSeen[name] = true
-		}
-	}
-
-	// Read the full metadata for each certificate.
-	certs := make([]map[string]any, 0, len(selected))
-	for certName, certID := range selected {
-		cert, err := c.ersGetByID(pathTrustedCerts, certID, rootTrustedCert)
-		if err != nil {
-			b.Note("Could not read trusted certificate %q: %v", certName, err)
-			continue
-		}
-		certs = append(certs, cert)
-	}
 
 	// Export the certificate bodies for each one selected.
-	for _, cert := range certs {
-		name := str(cert, "name")
+	for _, cert := range selected {
+		name := str(cert, "friendlyName")
 		id := str(cert, "id")
 		if id == "" {
 			b.Note("Trusted certificate %q has no id; skipped.", name)
@@ -93,7 +109,7 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 		}
 
 		// Fetch the exported body.
-		body, headers, err := c.doRaw(http.MethodGet, c.apiBase+pathTrustedCertsAPI+"/"+id+"/export", nil)
+		body, headers, err := c.doRaw(http.MethodGet, c.apiBase+pathTrustedCertsAPI+"/export/"+id, nil)
 		if err != nil {
 			b.Note("Could not export trusted certificate %q: %v", name, err)
 			continue
@@ -114,8 +130,10 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 			bundleObj := maps.Clone(cert)
 			delete(bundleObj, "id")
 			stripLinks(bundleObj)
+			// Remove fields from the read response that are not needed.
+			delete(bundleObj, "link")
 
-			// Name: first one uses the source name, others use CN or fingerprint.
+			// Name: first one uses the source friendlyName, others use CN or fingerprint.
 			if i == 0 {
 				bundleObj["name"] = name
 			} else {
@@ -130,7 +148,7 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 			}
 
 			// Check for self-signed + CN in source nodes.
-			if isSelfSigned(parsedCert) && slices.Contains(b.Source.Nodes, parsedCert.Subject.CommonName) {
+			if isSelfSigned(parsedCert) && isNodeHostname(parsedCert.Subject.CommonName, b.Source.Nodes) {
 				b.Note("Trusted certificate %q is self-signed with CN matching a source node hostname; skipped.", name)
 				continue
 			}
@@ -141,17 +159,88 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 			bundleObj["subject"] = parsedCert.Subject.String()
 			bundleObj["issuer"] = parsedCert.Issuer.String()
 
-			// The four trustFor* flags and the allow*/validate* flags are already
-			// in bundleObj, cloned from the source object, and travel verbatim.
-			// ApplyImport picks the ones the import payload accepts.
+			// Parse trustedFor string into the four trust booleans.
+			// trustedFor is a comma-separated string like "Infrastructure,Endpoints".
+			trustedForStr := str(cert, "trustedFor")
+			if trustedForStr != "" {
+				bundleObj["trustForIseAuth"] = false
+				bundleObj["trustForClientAuth"] = false
+				bundleObj["trustForCiscoServicesAuth"] = false
+				bundleObj["trustForCertificateBasedAdminAuth"] = false
+				for _, token := range strings.Split(trustedForStr, ",") {
+					token = strings.TrimSpace(token)
+					switch strings.ToLower(token) {
+					case "infrastructure":
+						bundleObj["trustForIseAuth"] = true
+					case "endpoints":
+						bundleObj["trustForClientAuth"] = true
+					case "cisco services":
+						bundleObj["trustForCiscoServicesAuth"] = true
+					case "adminauth":
+						bundleObj["trustForCertificateBasedAdminAuth"] = true
+					default:
+						if token != "" {
+							b.Note("Trusted certificate %q: unrecognised trustedFor token %q", name, token)
+						}
+					}
+				}
+			}
+			delete(bundleObj, "trustedFor")
 
-			// Carry CRL settings if present.
-			crlFields := []string{"downloadCRL", "crlDistributionUrl", "automaticCRLUpdate", "automaticCRLUpdatePeriod", "automaticCRLUpdateUnits", "crlDownloadFailureRetries", "nonAutomaticCRLUpdatePeriod", "ignoreCRLExpiration", "rejectIfNoStatusFromOCSP", "rejectIfUnreachableFromOCSP"}
+			// The read side and the write side disagree about types: ISE returns
+			// "on"/"off" and stringified integers, and the PUT wants booleans and
+			// integers. Normalise once, here, so the import can send the bundle's
+			// values straight back. Verified against 3.4.
 			crlObj := make(map[string]any)
-			for _, field := range crlFields {
-				if v, ok := bundleObj[field]; ok {
-					crlObj[field] = v
-					delete(bundleObj, field)
+			for _, field := range crlBoolFields {
+				v, ok := bundleObj[field]
+				delete(bundleObj, field)
+				if !ok || v == nil {
+					continue
+				}
+				switch t := v.(type) {
+				case bool:
+					crlObj[field] = t
+				case string:
+					switch strings.ToLower(strings.TrimSpace(t)) {
+					case "on", "true", "enabled":
+						crlObj[field] = true
+					case "off", "false", "disabled":
+						crlObj[field] = false
+					default:
+						b.Note("Trusted certificate %q: CRL setting %q reads %q, which is neither on nor off; it was not carried.", name, field, t)
+					}
+				default:
+					b.Note("Trusted certificate %q: CRL setting %q reads %v (%T), not a switch; it was not carried.", name, field, v, v)
+				}
+			}
+			for _, field := range crlIntFields {
+				v, ok := bundleObj[field]
+				delete(bundleObj, field)
+				if !ok || v == nil {
+					continue
+				}
+				switch t := v.(type) {
+				case float64: // JSON numbers decode as float64
+					crlObj[field] = int(t)
+				case string:
+					n, err := strconv.Atoi(strings.TrimSpace(t))
+					if err != nil {
+						b.Note("Trusted certificate %q: CRL setting %q reads %q, which is not a number; it was not carried.", name, field, t)
+						continue
+					}
+					crlObj[field] = n
+				default:
+					b.Note("Trusted certificate %q: CRL setting %q reads %v (%T), not a number; it was not carried.", name, field, v, v)
+				}
+			}
+			// Units and the distribution URL are free-form strings on both sides
+			// and travel unchanged.
+			for _, field := range crlStringFields {
+				v, ok := bundleObj[field]
+				delete(bundleObj, field)
+				if s, isStr := v.(string); ok && isStr && s != "" {
+					crlObj[field] = s
 				}
 			}
 			if len(crlObj) > 0 {
@@ -175,24 +264,24 @@ func ExportTrustedCerts(c *Client, b *Bundle, families []string, certNames []str
 	return nil
 }
 
-// fetchTrustedCerts tries OpenAPI first, then falls back to ERS.
-func fetchTrustedCerts(c *Client, log func(string, ...any)) ([]Stub, string, error) {
-	log("Reading trusted certificates from the OpenAPI…")
-	certs, err := c.openAPIList(pathTrustedCertsAPI)
-	if err == nil {
-		stubs := make([]Stub, 0, len(certs))
-		for _, cert := range certs {
-			stubs = append(stubs, Stub{ID: str(cert, "id"), Name: str(cert, "name")})
-		}
-		return stubs, "OpenAPI " + pathTrustedCertsAPI, nil
-	}
-	log("OpenAPI trusted certificate list unavailable (%v); falling back to ERS.", err)
+// fetchTrustedCertsOpenAPI reads the full certificate objects from the OpenAPI.
+// The shape already has everything needed; no second read is necessary.
+func fetchTrustedCertsOpenAPI(c *Client) ([]map[string]any, error) {
+	return c.openAPIList(pathTrustedCertsAPI)
+}
 
-	stubs, ersErr := c.ersList(pathTrustedCerts)
-	if ersErr != nil {
-		return nil, "", fmt.Errorf("could not read trusted certificates from either API. OpenAPI: %v. ERS: %w", err, ersErr)
+// fetchTrustedCerts is a compatibility wrapper for code that needs stubs (id + friendlyName).
+// It calls the OpenAPI and extracts the minimal fields.
+func fetchTrustedCerts(c *Client, log func(string, ...any)) ([]Stub, string, error) {
+	certs, err := fetchTrustedCertsOpenAPI(c)
+	if err != nil {
+		return nil, "", fmt.Errorf("could not read trusted certificates from OpenAPI %s: %w", pathTrustedCertsAPI, err)
 	}
-	return stubs, "ERS " + pathTrustedCerts, nil
+	stubs := make([]Stub, 0, len(certs))
+	for _, cert := range certs {
+		stubs = append(stubs, Stub{ID: str(cert, "id"), Name: str(cert, "friendlyName")})
+	}
+	return stubs, "OpenAPI " + pathTrustedCertsAPI, nil
 }
 
 // extractCertificates sniffs the body and extracts certificates, handling PEM, DER, and ZIP.
@@ -290,6 +379,32 @@ func isSelfSigned(cert *x509.Certificate) bool {
 	return cert.Subject.String() == cert.Issuer.String()
 }
 
+// isNodeHostname reports whether host is one of the deployment's nodes. ISE
+// names a node by its short hostname in /ers/config/node ("ibk-sda-ise1") but
+// issues its default server certificate to the FQDN
+// ("ibk-sda-ise1.ntslab.loc"), so an exact comparison never matches and the
+// per-node certificates end up offered for export. Verified on 3.4.
+func isNodeHostname(host string, nodes []string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	short, _, _ := strings.Cut(host, ".")
+	for _, n := range nodes {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" {
+			continue
+		}
+		if host == n || short == n {
+			return true
+		}
+		if nShort, _, _ := strings.Cut(n, "."); nShort != "" && nShort == short {
+			return true
+		}
+	}
+	return false
+}
+
 func pemEncode(der []byte) []byte {
 	var buf bytes.Buffer
 	pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
@@ -316,20 +431,27 @@ type TrustedCertInfo struct {
 }
 
 // ListTrustedCerts lists all trusted certificates from the source, computing exclusion reasons.
+// It fetches the source nodes from /ers/config/node to identify self-signed node certificates.
 func ListTrustedCerts(c *Client) ([]TrustedCertInfo, error) {
-	stubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+	// Get full certificate objects from the OpenAPI.
+	certs, err := fetchTrustedCertsOpenAPI(c)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []TrustedCertInfo
-	sourceNodes := []string{} // In real usage, this would come from a probe; for picker, we have no context.
-	// The picker can't know the source nodes, so self-signed detection uses just the selfSigned field.
+	// Get source node hostnames to detect self-signed node certificates.
+	sourceNodes := []string{}
+	if nodes, err := c.ersList("/ers/config/node"); err == nil {
+		for _, node := range nodes {
+			sourceNodes = append(sourceNodes, node.Name)
+		}
+	}
 
-	for _, stub := range stubs {
-		cert, err := c.ersGetByID(pathTrustedCerts, stub.ID, rootTrustedCert)
-		if err != nil {
-			continue // Skip on read error.
+	var result []TrustedCertInfo
+	for _, cert := range certs {
+		friendlyName := str(cert, "friendlyName")
+		if friendlyName == "" {
+			continue // Skip certs without a name.
 		}
 
 		excluded := false
@@ -340,19 +462,29 @@ func ListTrustedCerts(c *Client) ([]TrustedCertInfo, error) {
 			reason = "ISE internal CA"
 		}
 
-		// Self-signed check: try the field first, then fallback to string comparison.
-		if !excluded && (truthy(cert, "selfSigned") || str(cert, "subject") == str(cert, "issuer")) {
-			if slices.Contains(sourceNodes, str(cert, "subject")) {
+		// Self-signed check: issuedTo == issuedBy combined with node hostname check.
+		if !excluded && str(cert, "issuedTo") == str(cert, "issuedBy") {
+			if isNodeHostname(str(cert, "issuedTo"), sourceNodes) {
 				excluded = true
 				reason = "Self-signed with CN matching a source node hostname"
 			}
 		}
 
+		// Parse expirationDate from Java format if possible; pass raw if parsing fails.
+		expiresAt := str(cert, "expirationDate")
+		if expiresAt != "" {
+			// Try parsing Java format: "Mon Aug 04 09:14:23 CEST 2036"
+			if parsed, err := time.Parse("Mon Jan 02 15:04:05 MST 2006", expiresAt); err == nil {
+				expiresAt = parsed.Format("2006-01-02T15:04:05Z07:00")
+			}
+			// If parsing fails, pass the raw string through.
+		}
+
 		result = append(result, TrustedCertInfo{
-			Name:          stub.Name,
+			Name:          friendlyName,
 			Subject:       str(cert, "subject"),
 			Issuer:        str(cert, "issuer"),
-			ExpiresAt:     str(cert, "expirationDate"),
+			ExpiresAt:     expiresAt,
 			Excluded:      excluded,
 			ExcludeReason: reason,
 		})

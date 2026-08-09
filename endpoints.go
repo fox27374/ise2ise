@@ -1,9 +1,10 @@
 package main
 
 import (
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
 	"sort"
 	"strings"
@@ -27,6 +28,24 @@ const (
 	pathProfiles       = "/ers/config/profilerprofile"
 	pathEndpointsAPI   = "/api/v1/endpoint"
 )
+
+// openAPIOnlyEndpointFields are fields the OpenAPI endpoint resource returns and
+// the ERS endpoint resource does not know. ERS answers a create carrying any of
+// them with HTTP 400 "Resource Initialization Failed due to JSON invalidity",
+// naming every property in the payload rather than the offending one — so this
+// list is what a real 3.4 box actually rejected, not a guess at its schema.
+//
+// Nulls are already stripped at ersCreate, which hid this for every endpoint ISE
+// had never learned an IP or an asset attribute for. A DHCP-learned ipAddress is
+// a non-null value and failed the create outright. All of it is runtime state
+// the target relearns, so dropping it loses nothing.
+var openAPIOnlyEndpointFields = []string{
+	"ipAddress", "vendor", "productId", "serialNumber", "deviceType",
+	"softwareRevision", "hardwareRevision", "protocol",
+	"assetId", "assetName", "assetIpAddress", "assetVendor", "assetProductId",
+	"assetSerialNumber", "assetDeviceType", "assetSwRevision",
+	"assetHwRevision", "assetProtocol", "assetConnectedLinks",
+}
 
 // --- cross-reference remapping ----------------------------------------------
 //
@@ -135,12 +154,18 @@ func normMAC(m string) string {
 
 // ExportEndpoints fills the bundle with endpoint identity groups and, for the
 // groups the operator selected, their statically assigned endpoints.
-// groupNames empty means "no endpoints, groups only".
+// groupNames empty means "no endpoints, groups only" - but if either family is
+// selected and groupNames is empty, an error is returned.
 func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []string, log func(string, ...any)) error {
 	wantGroups := slices.Contains(families, familyEndpointGroups)
 	wantEndpoints := slices.Contains(families, familyEndpoints)
 	if !wantGroups && !wantEndpoints {
 		return nil
+	}
+
+	// Validate: if either family is selected and no groups are selected, error
+	if (wantGroups || wantEndpoints) && len(groupNames) == 0 {
+		return fmt.Errorf("select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints")
 	}
 
 	// Endpoint groups are needed either way: they are both an object family and
@@ -157,16 +182,32 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 	}
 
 	groupNameByID := map[string]string{}
+	allGroupNames := []string{}
 	for _, g := range groups {
 		if id := str(g, "id"); id != "" {
-			groupNameByID[id] = str(g, "name")
+			name := str(g, "name")
+			groupNameByID[id] = name
+			allGroupNames = append(allGroupNames, name)
 		}
 	}
 
 	if wantGroups {
+		// Only export the selected groups
+		selectedSet := map[string]bool{}
+		for _, want := range groupNames {
+			selectedSet[want] = true
+		}
+
 		out := make([]map[string]any, 0, len(groups))
+		var leftBehind []string
+
 		for _, g := range groups {
 			name := str(g, "name")
+			if !selectedSet[name] {
+				leftBehind = append(leftBehind, name)
+				continue // Skip unselected groups
+			}
+
 			// A nested group would need its parent to exist first, and the
 			// parent UUID means nothing on the target. Say so rather than
 			// writing a broken reference.
@@ -176,16 +217,18 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 			}
 			out = append(out, stripLocal(g))
 		}
+
+		// Report the left-behind groups
+		if len(leftBehind) > 0 {
+			sort.Strings(leftBehind)
+			b.Note("%d of %d endpoint identity groups on the source were not selected and were not exported: %s", len(leftBehind), len(allGroupNames), strings.Join(leftBehind, ", "))
+		}
+
 		b.Objects[familyEndpointGroups] = out
 		log("Captured %d endpoint identity groups.", len(out))
 	}
 
 	if !wantEndpoints {
-		return nil
-	}
-	if len(groupNames) == 0 {
-		b.Note("No endpoint identity groups were selected, so no endpoints were exported.")
-		b.Objects[familyEndpoints] = []map[string]any{}
 		return nil
 	}
 
@@ -270,6 +313,130 @@ func ExportEndpoints(c *Client, b *Bundle, families []string, groupNames []strin
 	return nil
 }
 
+// scanPolicyUsage counts, per endpoint identity group, how many policy rules and
+// library conditions reference it. It is advisory: the operator uses it to tell a
+// group that is genuinely dead from one a rule still points at.
+//
+// It returns the counts and, when anything could not be read, a sentence naming
+// what. A caller must show that sentence: a scan that failed and a deployment
+// whose policy references no groups both produce zeros, and presenting the first
+// as the second is what would make an operator drop a group a rule depends on.
+// Never fatal — a failed scan costs the badge, not the migration.
+func scanPolicyUsage(c *Client, groupNames []string) (map[string]int, string) {
+	if len(groupNames) == 0 {
+		return map[string]int{}, ""
+	}
+
+	usageMap := make(map[string]int)
+	var scanErrors []string
+	scanned := 0
+
+	// Device admin policy is scanned but never migrated: a group used only by
+	// TACACS rules is still in use, and reporting it as unused is the failure
+	// this whole feature exists to prevent.
+	paths := []string{
+		"/api/v1/policy/network-access/policy-set",
+		"/api/v1/policy/device-admin/policy-set",
+		"/api/v1/policy/network-access/condition",
+		"/api/v1/policy/device-admin/condition",
+	}
+
+	// scan reads one document and walks it. Each rule set is independent, so one
+	// refusal costs that document's references and nothing else.
+	scan := func(path string) []map[string]any {
+		items, err := c.openAPIList(path)
+		if err != nil {
+			scanErrors = append(scanErrors, fmt.Sprintf("%s: %v", path, err))
+			return nil
+		}
+		scanned++
+		for _, item := range items {
+			walkForGroupRefs(item, usageMap)
+		}
+		return items
+	}
+
+	for _, path := range paths {
+		items := scan(path)
+		if !strings.HasSuffix(path, "/policy-set") {
+			continue
+		}
+		// A policy set's rules hang off it and hold the references; the set
+		// itself carries almost none.
+		for _, set := range items {
+			id := str(set, "id")
+			if id == "" {
+				continue
+			}
+			// Both rule sets are read even when the first refuses: an
+			// authentication rule that cannot be read says nothing about the
+			// authorization rules next to it.
+			scan(path + "/" + id + "/authentication")
+			scan(path + "/" + id + "/authorization")
+		}
+	}
+
+	var errMsg string
+	switch {
+	case scanned == 0:
+		errMsg = "Policy usage could not be determined — nothing was read: " + strings.Join(scanErrors, "; ")
+	case len(scanErrors) > 0:
+		errMsg = "Policy usage may be incomplete; some rules could not be read: " + strings.Join(scanErrors, "; ")
+	}
+
+	return usageMap, errMsg
+}
+
+// walkForGroupRefs walks a decoded rule document and counts every endpoint
+// identity group reference in it. The rule schema is deliberately not modelled:
+// conditions nest inside conditions to arbitrary depth and the shapes are not
+// otherwise needed here, so a generic walk cannot miss one by getting the
+// structure wrong.
+func walkForGroupRefs(v any, usageMap map[string]int) {
+	switch t := v.(type) {
+	case map[string]any:
+		if isGroupReference(t) {
+			if name := extractGroupName(str(t, "attributeValue")); name != "" {
+				usageMap[name]++
+			}
+		}
+		for _, sub := range t {
+			walkForGroupRefs(sub, usageMap)
+		}
+	case []any:
+		for _, item := range t {
+			walkForGroupRefs(item, usageMap)
+		}
+	}
+}
+
+// isGroupReference recognises the shape a real ISE 3.4 returns for a rule that
+// matches on an endpoint identity group: dictionary IdentityGroup, attribute
+// Name, and a value carrying the group's path. Matching is by name, not UUID,
+// which is why this survives a migration at all.
+func isGroupReference(obj map[string]any) bool {
+	return str(obj, "dictionaryName") == "IdentityGroup" &&
+		str(obj, "attributeName") == "Name" &&
+		strings.HasPrefix(str(obj, "attributeValue"), groupRefPrefix)
+}
+
+// groupRefPrefix is how ISE writes an endpoint identity group in a rule
+// condition, verified against 3.4: "Endpoint Identity Groups:Production:Siemens".
+const groupRefPrefix = "Endpoint Identity Groups:"
+
+// extractGroupName takes the leaf of a reference value: the value carries the
+// group's nesting path, "Endpoint Identity Groups:Production:Siemens", and the
+// group is the last segment. Endpoint identity group names are unique in ISE —
+// the import's own duplicate check already relies on it — so the leaf identifies
+// the group without the path.
+func extractGroupName(attrValue string) string {
+	if !strings.HasPrefix(attrValue, groupRefPrefix) {
+		return ""
+	}
+	parts := strings.Split(attrValue, ":")
+	return strings.TrimSpace(parts[len(parts)-1])
+}
+
 // fetchEndpoints prefers OpenAPI, which returns whole objects in one list call.
 // ERS needs a GET per MAC, which on a real deployment is thousands of requests.
 func fetchEndpoints(c *Client, log func(string, ...any)) ([]map[string]any, string, error) {
@@ -292,15 +459,60 @@ func fetchEndpoints(c *Client, log func(string, ...any)) ([]map[string]any, stri
 	return eps, "ERS " + pathEndpoints, nil
 }
 
-// ListEndpointGroups is what the UI shows when the operator picks which groups
-// to export endpoints from.
-func ListEndpointGroups(c *Client) ([]Stub, error) {
+// EndpointGroup is a group with its system-defined flag and policy usage count.
+type EndpointGroup struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	SystemDefined bool   `json:"systemDefined"`
+	UsedBy        int    `json:"usedBy"`
+}
+
+// ListEndpointGroups is what the picker shows. The group selection now decides
+// what is created on the target, not just which endpoints are read, so the two
+// things an operator needs to choose well travel with each name: whether ISE
+// defined the group itself, and how many policy rules point at it.
+//
+// systemDefined is only on the detail object, so every group is read; the export
+// makes the same read.
+//
+// The second return is a sentence to show the operator when the policy scan
+// could not complete. Empty means the counts are trustworthy.
+func ListEndpointGroups(c *Client) ([]EndpointGroup, string, error) {
 	stubs, err := c.ersList(pathEndpointGroups)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	sort.Slice(stubs, func(i, j int) bool { return strings.ToLower(stubs[i].Name) < strings.ToLower(stubs[j].Name) })
-	return stubs, nil
+	groups, err := c.ersGetAll(pathEndpointGroups, rootEndpointGroup, stubs)
+	if err != nil {
+		return nil, "", err
+	}
+
+	names := make([]string, len(groups))
+	for i, g := range groups {
+		names[i] = str(g, "name")
+	}
+	usage, scanNote := scanPolicyUsage(c, names)
+
+	out := make([]EndpointGroup, 0, len(groups))
+	for _, g := range groups {
+		name := str(g, "name")
+		out = append(out, EndpointGroup{
+			ID:            str(g, "id"),
+			Name:          name,
+			SystemDefined: truthy(g, "systemDefined"),
+			UsedBy:        usage[name],
+		})
+	}
+
+	// ISE's own groups sort last: they exist on every target already, so the
+	// operator's own groups are what the picker should open on.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SystemDefined == out[j].SystemDefined {
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		}
+		return !out[i].SystemDefined
+	})
+	return out, scanNote, nil
 }
 
 // --- pre-flight and import ---------------------------------------------------
@@ -422,8 +634,8 @@ func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 	certs := b.Objects[familyTrustedCerts]
 	if len(certs) > 0 {
-		// Read target's trusted certificates.
-		targetStubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+		// Read target's trusted certificates from OpenAPI.
+		targetCerts, err := fetchTrustedCertsOpenAPI(c)
 		if err != nil {
 			// The only create path is OpenAPI, so one blocked item stands for the
 			// whole family rather than one per certificate.
@@ -432,22 +644,24 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 			return
 		}
 
-		targetByFingerprint := map[string]bool{}
+		// Fingerprint -> the name the target knows that certificate by. The same
+		// trust often sits in two stores under two friendly names, so the
+		// target's name is worth reporting: "already exists" under a name the
+		// operator does not recognise is the one skip worth looking at.
+		targetByFingerprint := map[string]string{}
 		targetByName := map[string]bool{}
 		fingerprints := 0
 
-		for _, stub := range targetStubs {
-			cert, err := c.ersGetByID(pathTrustedCerts, stub.ID, rootTrustedCert)
-			if err != nil {
-				continue
-			}
+		for _, cert := range targetCerts {
 			if fp := str(cert, "sha256Fingerprint"); fp != "" {
 				// Normalize: lowercase, strip whitespace and colons.
 				fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-				targetByFingerprint[fp] = true
+				targetByFingerprint[fp] = str(cert, "friendlyName")
 				fingerprints++
 			}
-			targetByName[stub.Name] = true
+			if friendlyName := str(cert, "friendlyName"); friendlyName != "" {
+				targetByName[friendlyName] = true
+			}
 		}
 
 		// If no usable fingerprints, emit exactly one note.
@@ -490,8 +704,14 @@ func preflightTrustedCerts(c *Client, b *Bundle, r *PreflightReport) {
 			// Dedup by fingerprint if available, else by name.
 			if fingerprints > 0 && fp != "" {
 				fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-				if targetByFingerprint[fpNorm] {
+				if targetName, ok := targetByFingerprint[fpNorm]; ok {
 					it.Action, it.Reason = actionSkip, "already exists on the target"
+					// Matched by content, not by name: the target holds this
+					// exact certificate under a name of its own, and the
+					// operator cannot tell that from the skip alone.
+					if targetName != "" && targetName != name {
+						it.Reason = fmt.Sprintf("already exists on the target as %q (same certificate, different name)", targetName)
+					}
 					r.add(it)
 					continue
 				}
@@ -566,6 +786,7 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 			name := str(obj, "name")
 			pemData := str(obj, "pem")
 			crlSettings := obj["crl"]
+			description := str(obj, "description")
 
 			// Remove fields not in the import payload.
 			delete(obj, "fingerprint")
@@ -574,37 +795,68 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 			delete(obj, "issuer")
 			delete(obj, "crl")
 			delete(obj, "pem")
+			delete(obj, "friendlyName")
 
-			// Build the import payload.
+			// Build the import payload with plain-text PEM data (not base64-encoded).
 			payload := map[string]any{
-				"name": name,
-				"data": base64.StdEncoding.EncodeToString([]byte(pemData)),
+				"name":                        name,
+				"data":                        pemData,
+				"allowOutOfDateCert":          false,
+				"allowSHA1Certificates":       false,
+				"allowBasicConstraintCAFalse": false,
 			}
-			if desc := str(obj, "description"); desc != "" {
-				payload["description"] = desc
-			}
+
+			// Add optional fields from the bundle.
 			for _, flag := range []string{"trustForIseAuth", "trustForClientAuth", "trustForCertificateBasedAdminAuth", "trustForCiscoServicesAuth", "allowBasicConstraintCAFalse", "allowOutOfDateCert", "allowSHA1Certificates", "validateCertificateExtensions"} {
 				if v, ok := obj[flag]; ok {
 					payload[flag] = v
 				}
 			}
 
-			// POST the import.
+			// POST the import. If description contains a comma, the import will fail with
+			// "Security Check Failed". Retry without the description on that specific error.
+			if description != "" {
+				payload["description"] = description
+			}
+
 			if err := c.openAPICreate(pathTrustedCertsAPI+"/import", payload); err != nil {
-				if isDuplicate(err) {
+				// Check if this is the "Security Check Failed" + comma-in-description case.
+				var ae *APIError
+				if errors.As(err, &ae) && ae.Status == http.StatusBadRequest && strings.Contains(strings.ToLower(ae.Body), "security check failed") && strings.Contains(description, ",") {
+					// Retry without the description.
+					log("Trusted certificate %q: description contains a comma and was rejected; retrying without description.", name)
+					delete(payload, "description")
+					if retryErr := c.openAPICreate(pathTrustedCertsAPI+"/import", payload); retryErr != nil {
+						if isDuplicate(retryErr) {
+							res.Skipped++
+							log("Trusted certificate %q already exists; skipped.", name)
+							continue
+						}
+						res.Failed++
+						res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, retryErr))
+						log("FAILED trusted certificate %q: %v", name, retryErr)
+						continue
+					}
+					// Created without description; record that the description was not set.
+					res.Created++
+					log("Created trusted certificate %q (description could not be set).", name)
+					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: description %q contains a comma and could not be set; please enter it manually in the GUI", name, description))
+				} else if isDuplicate(err) {
 					res.Skipped++
 					log("Trusted certificate %q already exists; skipped.", name)
 					continue
+				} else {
+					res.Failed++
+					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, err))
+					log("FAILED trusted certificate %q: %v", name, err)
+					continue
 				}
-				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: %v", name, err))
-				log("FAILED trusted certificate %q: %v", name, err)
-				continue
+			} else {
+				res.Created++
+				log("Created trusted certificate %q.", name)
 			}
-			res.Created++
-			log("Created trusted certificate %q.", name)
 
-			// If there are CRL settings, look up the cert and update via ERS.
+			// If there are CRL settings, look up the cert and update via OpenAPI PUT.
 			if crlSettings != nil {
 				// The bundle is operator-supplied data: a shape that is not an
 				// object is reported, never asserted.
@@ -613,8 +865,9 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 					res.Errors = append(res.Errors, fmt.Sprintf("trusted certificate %q: the bundle's CRL settings are %T, not an object; they were not applied", name, crlSettings))
 					continue
 				}
-				// Re-read the target's certs to find the new one by name.
-				stubs, _, err := fetchTrustedCerts(c, func(string, ...any) {})
+
+				// Re-read the target's certs to find the new one by friendlyName.
+				targetCerts, err := fetchTrustedCertsOpenAPI(c)
 				if err != nil {
 					// Can't look it up; record the error but don't fail the whole import.
 					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied (could not read target certs): %v", name, err)
@@ -624,9 +877,9 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 				}
 
 				var targetID string
-				for _, stub := range stubs {
-					if stub.Name == name {
-						targetID = stub.ID
+				for _, cert := range targetCerts {
+					if str(cert, "friendlyName") == name {
+						targetID = str(cert, "id")
 						break
 					}
 				}
@@ -637,15 +890,46 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 					continue
 				}
 
-				// PUT the CRL settings via ERS.
-				crlUpdate := maps.Clone(crlMap)
-				// Don't include selectedOCSPService in the PUT.
-				delete(crlUpdate, "selectedOCSPService")
+				// Build the CRL PUT payload. The bundle has booleans and integers;
+				// the API PUT expects the same types.
+				crlUpdate := map[string]any{"name": name}
+				for k, v := range crlMap {
+					if k != "selectedOCSPService" {
+						crlUpdate[k] = v
+					}
+				}
+				// ISE 3.4 rejects the whole PUT with "can only be set true if
+				// downloadCRL parameter is set to be true" when any of these is
+				// true while CRL download is off. They are inert in that state
+				// anyway, so they are forced false rather than losing the rest of
+				// the settings to a 400.
+				if dl, _ := crlUpdate["downloadCRL"].(bool); !dl {
+					for _, dependent := range crlDownloadDependentFields {
+						if b, _ := crlUpdate[dependent].(bool); b {
+							crlUpdate[dependent] = false
+						}
+					}
+				}
+				if description != "" && !strings.Contains(description, ",") {
+					crlUpdate["description"] = description
+				}
+				// The PUT replaces the object rather than patching it: a trust
+				// flag left out of the body comes back false, and the certificate
+				// ends up trusted for nothing ("trustedFor": "Unknown") despite
+				// the import having set it correctly. Carry them again. Verified
+				// on 3.4.
+				for _, flag := range trustFlagFields {
+					if v, ok := obj[flag]; ok {
+						crlUpdate[flag] = v
+					}
+				}
 
-				if err := c.ersPut(pathTrustedCerts+"/"+targetID, rootTrustedCert, crlUpdate); err != nil {
+				// PUT the CRL settings via OpenAPI.
+				if err := c.openAPIPut(pathTrustedCertsAPI+"/"+targetID, crlUpdate); err != nil {
 					errMsg := fmt.Sprintf("trusted certificate %q: CRL settings could not be applied: %v", name, err)
 					res.Errors = append(res.Errors, errMsg)
 					log("WARNING: %s; these settings must be entered manually.", errMsg)
+					// Don't fail the whole import; the cert was created successfully.
 				}
 			}
 		}
@@ -707,6 +991,11 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 		}
 		done++
 		obj := maps.Clone(it.obj)
+		// Stripped here rather than on export so a bundle written before this
+		// was known imports too.
+		for _, f := range openAPIOnlyEndpointFields {
+			delete(obj, f)
+		}
 		if ok, why := nameToRef(obj, "groupName", "groupId", "endpoint identity group", groupIDByName); !ok {
 			res.Failed++
 			res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))

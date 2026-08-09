@@ -133,6 +133,22 @@ func TestEndToEndExportThenImport(t *testing.T) {
 			t.Errorf("endpoint points at a non-target group id %q", id)
 		}
 	}
+
+	// 7. Re-running a completed import must create nothing and still report what
+	// is already there. Reporting four zeros reads like the bundle was empty.
+	res3 := postMultipartRaw(t, ui.URL+"/api/import/apply", sealed, passphrase, "yes")
+	msgs3 := readNDJSON(t, res3)
+	last3 := msgs3[len(msgs3)-1]
+	if last3["type"] != "done" {
+		t.Fatalf("re-run did not finish: %+v", msgs3)
+	}
+	rerun := last3["result"].(map[string]any)
+	if rerun["created"].(float64) != 0 || rerun["failed"].(float64) != 0 {
+		t.Errorf("re-run wrote to the target: %+v", rerun)
+	}
+	if rerun["skipped"].(float64) != 5 {
+		t.Errorf("re-run reported %v skipped, want 5 already present", rerun["skipped"])
+	}
 }
 
 func postJSONTest(t *testing.T, url string, body any, out any) {
