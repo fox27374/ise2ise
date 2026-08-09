@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestERSListPages(t *testing.T) {
@@ -213,6 +214,33 @@ func TestProbeUnreachable(t *testing.T) {
 	joined := strings.Join(p.Notes, " ")
 	if !strings.Contains(joined, "could not connect") || !strings.Contains(joined, "ports 443 and 9060") {
 		t.Errorf("notes should say what to check: %v", p.Notes)
+	}
+}
+
+// A mistyped address is not a refused connection: the SYN is dropped and nothing
+// answers, so the client waits for a timeout rather than an RST. With only the
+// request timeout that was two minutes per API, and the probe checks two, so the
+// UI sat on "Connecting…" for four minutes before saying anything.
+//
+// 192.0.2.1 is TEST-NET-1 (RFC 5737) and is not routable. The assertion is an
+// upper bound: an environment that answers instantly still passes.
+func TestProbeGivesUpQuicklyOnAnUnroutableAddress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("makes a real connection attempt")
+	}
+	c := NewClient("192.0.2.1", "admin", "irrelevant", false)
+
+	start := time.Now()
+	p := c.ProbeDeployment()
+	took := time.Since(start)
+
+	if p.Reachable {
+		t.Fatal("TEST-NET-1 must not be reachable")
+	}
+	// Both checks run together, so one connect timeout covers both, with room
+	// for a slow machine.
+	if limit := 3 * connectTimeout; took > limit {
+		t.Errorf("probe took %s, want under %s — the operator is staring at a spinner for that long", took, limit)
 	}
 }
 
