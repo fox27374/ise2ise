@@ -86,12 +86,12 @@ func newFakeISE(t *testing.T) *fakeISE {
 		pagesServed:       map[string]int{},
 		created:           map[string][]map[string]any{},
 		policies:          map[string][]map[string]any{},
+		policySetRules:    map[string][]map[string]any{},
 		systemCerts:       map[string][]map[string]any{},
 		systemCertPEM:     map[string][]byte{},
 		systemCertExports: map[string][]byte{},
 		systemCertCreated: map[string][]map[string]any{},
 		deploymentNodes:   []map[string]any{},
-		policySetRules:    map[string][]map[string]any{},
 	}
 	// Initialize deployment nodes
 	f.deploymentNodes = []map[string]any{
@@ -350,9 +350,65 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSONRaw(w, map[string]any{"response": page})
 			return
 		}
+		// Policy sets, and each set's authentication and authorization rules.
+		// f.policies carries what the policy usage scan's tests registered; the
+		// policy set tests use f.policySets and f.policySetRules, and both are
+		// the same collection on a real deployment.
+		if path == pathPolicySets {
+			items := append(append([]map[string]any{}, f.policies[path]...), f.policySets...)
+			writeJSONRaw(w, map[string]any{"response": f.page(r, items)})
+			return
+		}
+		if setID, kind, ok := splitRulePath(path); ok {
+			items := append(append([]map[string]any{}, f.policies[path]...), f.policySetRules[setID+"|"+kind]...)
+			writeJSONRaw(w, map[string]any{"response": f.page(r, items)})
+			return
+		}
+		for _, l := range []struct {
+			path string
+			objs []map[string]any
+		}{
+			{pathServiceNames, f.serviceNames},
+			{pathSecurityGroups, f.securityGroups},
+			{pathIdentityStores, f.identityStores},
+		} {
+			if path == l.path {
+				writeJSONRaw(w, map[string]any{"response": f.page(r, l.objs)})
+				return
+			}
+		}
+
 		items := f.policies[path] // nil is a legitimate empty rule set
 		writeJSONRaw(w, map[string]any{"response": f.page(r, items)})
 		return
+	}
+
+	// Policy set and rule creation.
+	if r.Method == http.MethodPost && strings.HasPrefix(path, pathPolicySets) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body == nil {
+			iseError(w, http.StatusBadRequest, "empty body")
+			return
+		}
+		if path == pathPolicySets {
+			for _, s := range f.policySets {
+				if str(s, "name") == str(body, "name") {
+					iseError(w, http.StatusBadRequest, "policy set already exists: "+str(body, "name"))
+					return
+				}
+			}
+			body["id"] = fmt.Sprintf("tgt-set-%d", len(f.policySets)+1)
+			f.policySets = append(f.policySets, body)
+			writeJSONRaw(w, map[string]any{"response": body})
+			return
+		}
+		if setID, kind, ok := splitRulePath(path); ok {
+			body["id"] = fmt.Sprintf("tgt-rule-%d", len(f.policySetRules[setID+"|"+kind])+1)
+			f.policySetRules[setID+"|"+kind] = append(f.policySetRules[setID+"|"+kind], body)
+			writeJSONRaw(w, map[string]any{"response": body})
+			return
+		}
 	}
 
 	// Trusted certificate listing (OpenAPI only).
@@ -911,3 +967,68 @@ func (f *fakeISE) addLibraryConditionWithGroupRef(tree, name, groupPath string) 
 }
 
 func quiet(string, ...any) {}
+
+// splitRulePath recognises /api/v1/policy/network-access/policy-set/{id}/{kind}
+// for kind in authentication, authorization.
+func splitRulePath(path string) (setID, kind string, ok bool) {
+	rest, found := strings.CutPrefix(path, pathPolicySets+"/")
+	if !found {
+		return "", "", false
+	}
+	setID, kind, found = strings.Cut(rest, "/")
+	if !found || (kind != "authentication" && kind != "authorization") {
+		return "", "", false
+	}
+	return setID, kind, true
+}
+
+// addPolicySetNA registers a network-access policy set. The older addPolicySet
+// writes into f.policies for the policy usage scan's tests and takes a tree
+// name; this one is the object the policy set slice reads and writes.
+func (f *fakeISE) addPolicySetNA(id, name string, rank int, state, serviceName string, isDefault bool, cond map[string]any) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.policySetRules == nil {
+		f.policySetRules = map[string][]map[string]any{}
+	}
+	s := map[string]any{
+		"id": id, "name": name, "rank": rank, "state": state,
+		"serviceName": serviceName, "default": isDefault, "hitCounts": 0,
+		"description": "", "condition": cond,
+	}
+	f.policySets = append(f.policySets, s)
+	return s
+}
+
+// addRule nests one rule under a set, in the {"rule": {...}, …} shape ISE uses.
+func (f *fakeISE) addRule(setID, kind, name string, isDefault bool, extra map[string]any, cond map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.policySetRules == nil {
+		f.policySetRules = map[string][]map[string]any{}
+	}
+	inner := map[string]any{
+		"id": "src-" + name, "name": name, "default": isDefault,
+		"rank": len(f.policySetRules[setID+"|"+kind]), "state": "enabled",
+		"hitCounts": 0, "condition": cond,
+	}
+	obj := map[string]any{"rule": inner}
+	for k, v := range extra {
+		obj[k] = v
+	}
+	f.policySetRules[setID+"|"+kind] = append(f.policySetRules[setID+"|"+kind], obj)
+}
+
+func (f *fakeISE) addNamedList(which, name, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj := map[string]any{"name": name, "id": id}
+	switch which {
+	case "service":
+		f.serviceNames = append(f.serviceNames, obj)
+	case "sgt":
+		f.securityGroups = append(f.securityGroups, obj)
+	case "store":
+		f.identityStores = append(f.identityStores, obj)
+	}
+}

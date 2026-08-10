@@ -69,10 +69,17 @@ func ExportPolicySets(c *Client, b *Bundle, families []string, log func(string, 
 			b.Note("Policy set %q has MFA rules which are not migrated.", name)
 		}
 
-		// Build the set object
+		// Build the set object. The set gets the same cleaning as its rules: a
+		// hit count describes the source and a condition reference's id means
+		// nothing on the target, and the set carries a condition tree of its own
+		// — cleaning only the rules left that one holding the source's UUID.
 		setObj := maps.Clone(set)
 		setObj["kind"] = "policySet"
 		stripLocal(setObj)
+		delete(setObj, "hitCounts")
+		if cond, ok := setObj["condition"].(map[string]any); ok {
+			setObj["condition"] = cleanCondition(cond)
+		}
 
 		// Strip id, link, hitCounts from rules and nested conditions
 		cleanedAuthRules := cleanRules(authRules)
@@ -286,20 +293,23 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 			// The Default set is special: it cannot be created, but its rules are merged
 			it.Action = actionSkip
 			it.Reason = "the Default set exists on every deployment; its rules will be merged"
-		} else if _, exists := targetSetsByName[name]; exists {
-			// Name clash: will be imported as "Name (imported)"
-			baseName := name
-			suffix := 1
-			for _, exists := targetSetsByName[baseName+" (imported "+fmt.Sprintf("%d", suffix)+")"]; exists; suffix++ {
+		} else if target, exists := targetSetsByName[name]; exists {
+			// A name already on the target is either a set this tool imported on
+			// an earlier run, or somebody else's. The import marker in the
+			// description tells them apart: ours is skipped, so a re-run writes
+			// nothing, and a stranger's is left alone and imported beside.
+			if mine(target) {
+				it.Action, it.Reason = actionSkip, "already imported by this tool"
+			} else {
+				importedName := freeSetName(name, targetSetsByName)
+				if importedName == "" {
+					it.Action, it.Reason = actionSkip, "already imported by this tool"
+				} else {
+					it.obj["targetName"] = importedName
+					it.Action = actionCreate
+					it.Reason = fmt.Sprintf("a set with this name already exists on the target; importing beside it as %q", importedName)
+				}
 			}
-			importedName := baseName + " (imported"
-			if suffix > 1 {
-				importedName += " " + fmt.Sprintf("%d", suffix)
-			}
-			importedName += ")"
-			it.obj["targetName"] = importedName
-			it.Action = actionCreate
-			it.Reason = fmt.Sprintf("a set with this name already exists; will import as %q", importedName)
 		} else {
 			it.Action = actionCreate
 		}
@@ -340,9 +350,9 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 	}
 
 	// Check authentication rules
-	if authRules, ok := set["authentication"].([]any); ok {
-		for _, ar := range authRules {
-			if arMap, ok := ar.(map[string]any); ok {
+	for _, arMap := range ruleList(set["authentication"]) {
+		{
+			{
 				// Check identity source
 				if idSource := str(arMap, "identitySourceName"); idSource != "" && idStores[idSource] == "" {
 					return fmt.Sprintf("identity source %q does not exist on the target and domain join is required", idSource)
@@ -361,9 +371,9 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 	}
 
 	// Check authorization rules
-	if authzRules, ok := set["authorization"].([]any); ok {
-		for _, azr := range authzRules {
-			if azrMap, ok := azr.(map[string]any); ok {
+	for _, azrMap := range ruleList(set["authorization"]) {
+		{
+			{
 				// Check profile references
 				if profiles, ok := azrMap["profile"].([]any); ok {
 					for _, p := range profiles {
@@ -462,13 +472,21 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 	log("Creating %d policy sets…", len(setItems))
 
 	for _, it := range setItems {
-		if it.Action != actionCreate {
+		// The Default set is reported as a skip because it cannot be created —
+		// it exists on every deployment — but its rules still have to be merged
+		// into the target's own. Treating skip as nothing to do left the
+		// source's Default rules, which are the bulk of most policies, behind.
+		mergeDefault := it.Action == actionSkip && truthy(it.obj, "default")
+		if it.Action != actionCreate && !mergeDefault {
 			if it.Action == actionSkip {
 				res.Skipped++
 			} else {
 				res.Blocked++
 			}
 			continue
+		}
+		if mergeDefault {
+			res.Skipped++ // the set itself; its rules are counted as they land
 		}
 
 		setObj := maps.Clone(it.obj)
@@ -511,8 +529,21 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 			delete(setObj, "id")
 			delete(setObj, "rank")
 
+			// The rules are posted separately, to their own endpoints. Sending
+			// them inside the set body means sending ISE fields its policy-set
+			// resource does not have, which is the failure mode the endpoint
+			// import already ran into on real hardware.
+			body := maps.Clone(setObj)
+			delete(body, "authentication")
+			delete(body, "authorization")
+			// The same marker policy elements carry. Here it does more than
+			// label: pre-flight reads it back to tell a set this tool imported
+			// from one that merely shares a name, which is what makes a re-run
+			// write nothing instead of importing a second copy beside the first.
+			body["description"] = tagDescription(str(body, "description"))
+
 			// Create the set
-			err := c.openAPICreate(pathPolicySets, setObj)
+			err := c.openAPICreate(pathPolicySets, body)
 			if err != nil {
 				if isDuplicate(err) {
 					res.Skipped++
@@ -552,33 +583,53 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 			log("Created policy set %q.", targetName)
 		}
 
-		// Now create the rules
-		authRules := setObj["authentication"]
-		authzRules := setObj["authorization"]
-
-		if authRules != nil {
-			if ar, ok := authRules.([]any); ok {
-				for _, rule := range ar {
-					if ruleMap, ok := rule.(map[string]any); ok {
-						if err := createAuthRule(c, targetSetID, ruleMap, conditionIDByName, keepState, log, res); err != nil {
-							res.Failed++
-							res.Errors = append(res.Errors, fmt.Sprintf("authentication rule in %q: %v", targetName, err))
-						}
+		// Merging into an existing set means the target already has rules of its
+		// own. They are matched by name and left alone; the tool adds beside
+		// them, never over them.
+		existing := map[string]bool{}
+		if mergeDefault {
+			for _, kind := range []string{"authentication", "authorization"} {
+				have, err := c.openAPIList(pathPolicySets + "/" + targetSetID + "/" + kind)
+				if err != nil {
+					continue
+				}
+				for _, h := range have {
+					if inner, ok := h["rule"].(map[string]any); ok {
+						existing[kind+"|"+str(inner, "name")] = true
 					}
 				}
 			}
 		}
+		skipExisting := func(kind string, rule map[string]any) bool {
+			inner, _ := rule["rule"].(map[string]any)
+			if inner == nil {
+				return false
+			}
+			if existing[kind+"|"+str(inner, "name")] {
+				res.Skipped++
+				log("Rule %q already exists in %q; skipped.", str(inner, "name"), targetName)
+				return true
+			}
+			return false
+		}
 
-		if authzRules != nil {
-			if azr, ok := authzRules.([]any); ok {
-				for _, rule := range azr {
-					if ruleMap, ok := rule.(map[string]any); ok {
-						if err := createAuthzRule(c, targetSetID, ruleMap, conditionIDByName, authProfileIDByName, keepState, log, res); err != nil {
-							res.Failed++
-							res.Errors = append(res.Errors, fmt.Sprintf("authorization rule in %q: %v", targetName, err))
-						}
-					}
-				}
+		// Now create the rules.
+		for _, rule := range ruleList(setObj["authentication"]) {
+			if skipExisting("authentication", rule) {
+				continue
+			}
+			if err := createAuthRule(c, targetSetID, rule, conditionIDByName, keepState, log, res); err != nil {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("authentication rule in %q: %v", targetName, err))
+			}
+		}
+		for _, rule := range ruleList(setObj["authorization"]) {
+			if skipExisting("authorization", rule) {
+				continue
+			}
+			if err := createAuthzRule(c, targetSetID, rule, conditionIDByName, authProfileIDByName, keepState, log, res); err != nil {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("authorization rule in %q: %v", targetName, err))
 			}
 		}
 	}
@@ -709,4 +760,52 @@ func rewriteConditionReferences(cond map[string]any, conditionIDByName map[strin
 			}
 		}
 	}
+}
+
+// ruleList reads the nested rules whichever way they arrived. Straight out of an
+// export they are []map[string]any; after a bundle has been sealed and reopened
+// they are []any of map[string]any, because that is what JSON gives back. A
+// single type assertion covers only one of the two and silently creates no rules
+// at all in the other, which is how a policy set landed on a target with none.
+func ruleList(v any) []map[string]any {
+	switch t := v.(type) {
+	case []map[string]any:
+		return t
+	case []any:
+		out := make([]map[string]any, 0, len(t))
+		for _, e := range t {
+			if m, ok := e.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// mine reports whether an object on the target was created by this tool, which
+// is recorded in its description the same way policy elements record it.
+func mine(obj map[string]any) bool {
+	return strings.Contains(str(obj, "description"), importMarkerPrefix)
+}
+
+// freeSetName picks the first unused "<name> (imported)", "(imported 2)", … for
+// a set whose name the target already uses. It returns "" when one of those
+// names is already a set this tool imported, which means this bundle has been
+// imported before and there is nothing left to do.
+func freeSetName(name string, existing map[string]map[string]any) string {
+	for i := 1; i < 100; i++ {
+		candidate := name + " (imported)"
+		if i > 1 {
+			candidate = fmt.Sprintf("%s (imported %d)", name, i)
+		}
+		target, taken := existing[candidate]
+		if !taken {
+			return candidate
+		}
+		if mine(target) {
+			return "" // already imported under this name
+		}
+	}
+	return ""
 }
