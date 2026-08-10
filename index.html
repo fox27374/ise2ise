@@ -197,7 +197,7 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       </div>
       <div id="expSysCertsWrap" style="margin-top:1rem" class="hidden">
         <label>Export these system certificates
-          <span class="hint">Disabled when expired. Ticked by default for wildcard or multi-SAN certificates.</span></label>
+          <span class="hint">API-exported: Disabled when expired. Ticked by default for wildcard or multi-SAN certificates. ZIP-imported: Operator selects roles and name.</span></label>
         <div style="margin-bottom:.5rem">
           <button type="button" class="link" id="expSelAllSysCerts">select all</button> ·
           <button type="button" class="link" id="expSelNoneSysCerts">select none</button>
@@ -206,6 +206,19 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <thead><tr><th></th><th>Name</th><th>Subject</th><th>SANs</th><th>Roles</th><th>Expires</th></tr></thead>
           <tbody id="expSysCerts">Loading certificates…</tbody>
         </table>
+        <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line)">
+          <label>Import system certificates from ZIP
+            <span class="hint">3.2 GUI-exported system certificates with private keys. Select roles below for each file.</span></label>
+          <div class="field" style="margin-top:.5rem">
+            <input type="file" id="expZipFiles" accept=".zip" multiple style="margin-bottom:.5rem">
+            <div id="expZipList"></div>
+          </div>
+          <div class="field" style="margin-top:1rem">
+            <label for="expZipPassword">ZIP password (optional)
+              <span class="hint">Password the ZIP was created with. Leave blank if not encrypted.</span></label>
+            <input type="password" id="expZipPassword" autocomplete="off">
+          </div>
+        </div>
       </div>
     </section>
 
@@ -269,19 +282,21 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       <h2>3. System certificate options</h2>
       <div id="impNodePicker" style="margin-bottom:1rem">
         <label>Target nodes to import on
-          <span class="hint">System certificates are per-node. Select which Admin nodes to create certificates on.</span></label>
+          <span class="hint">System certificates are per-node. Select which Admin nodes to create certificates on. All items in the pre-flight above are duplicated per selected node.</span></label>
         <div style="margin-bottom:.5rem">
           <button type="button" class="link" id="impSelAllNodes">select all</button> ·
           <button type="button" class="link" id="impSelNoneNodes">select none</button>
         </div>
         <div class="picker" id="impNodes">Loading nodes…</div>
       </div>
-      <label><input type="checkbox" id="impAdminRole"> Import with admin role
-        <span class="hint" style="color: var(--warn-fg)">WARNING: Taking over the admin certificate restarts the node's application and replaces the GUI certificate. Only check this after testing thoroughly.</span></label>
-      <div id="impZipPassSec" class="hidden" style="margin-top:1rem">
-        <div class="field"><label for="impZipPass">ZIP password
-          <span class="hint">Password used to encrypt the GUI-exported system certificate.</span></label>
-          <input type="password" id="impZipPass" autocomplete="off"></div>
+      <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line)">
+        <label><input type="checkbox" id="impAdminRole"> Import with admin role
+          <span class="hint" style="color: var(--warn-fg)">WARNING: Restarts the node's application and replaces the certificate the GUI is served with.</span></label>
+        <div id="impZipPassSec" class="hidden" style="margin-top:1rem">
+          <div class="field"><label for="impZipPass">ZIP password
+            <span class="hint">Password used to encrypt the GUI-exported system certificate.</span></label>
+            <input type="password" id="impZipPass" autocomplete="off"></div>
+        </div>
       </div>
     </section>
 
@@ -584,9 +599,9 @@ $("famSysCerts").addEventListener("change", () => {
   if ($("famSysCerts").checked) loadSystemCerts();
 });
 
-$("expGo").addEventListener("click", async () => {
-  hide($("expError"));
-  $("expResult").innerHTML = "";
+$(“expGo”).addEventListener(“click”, async () => {
+  hide($(“expError”));
+  $(“expResult”).innerHTML = “”;
   const families = [];
   if ($(“famGroups”).checked) families.push(“endpointGroups”);
   if ($(“famEndpoints”).checked) families.push(“endpoints”);
@@ -614,20 +629,70 @@ $("expGo").addEventListener("click", async () => {
   $(“expLog”).textContent = “”;
   $(“expProgress”).classList.remove(“hidden”);
   try {
+    // Collect ZIP files with role selections
+    const fd = new FormData();
+    const req = Object.assign({}, expCreds, { families, groups, certs, systemCerts, passphrase: phrase });
+    fd.append(“req”, JSON.stringify(req));
+
+    // Add ZIP files if any
+    const zipFiles = $(“expZipFiles”).files;
+    for (let i = 0; i < zipFiles.length; i++) {
+      const f = zipFiles[i];
+      const roleContainer = $(“expZipRole_” + i);
+      if (roleContainer) {
+        // Extract selected roles for this ZIP
+        const roles = {};
+        [“eap”, “radius”, “tacacs”, “pxgrid”, “ims”, “saml”, “portal”].forEach(r => {
+          const cb = roleContainer.querySelector('input[value=”' + r + '”]');
+          if (cb) roles[r] = cb.checked;
+        });
+        f.systemCertRoles = roles; // Store roles in file object for POST
+      }
+      fd.append(“zips”, f);
+    }
+
+    if ($(“expZipPassword”).value) {
+      fd.append(“zipPassword”, $(“expZipPassword”).value);
+    }
+
+    // Use multipart if we have ZIP files, else use JSON
+    const isMultipart = zipFiles.length > 0;
     const res = await fetch(“/api/export”, {
-      method: “POST”, headers: { “Content-Type”: “application/json” },
-      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, certs, systemCerts, passphrase: phrase })),
+      method: “POST”,
+      body: isMultipart ? fd : JSON.stringify(req),
+      headers: isMultipart ? {} : { “Content-Type”: “application/json” },
     });
     await readStream(res, m => {
-      if (m.type === "log") logLine($("expLog"), m.msg);
-      else if (m.type === "error") { logLine($("expLog"), "ERROR: " + m.msg); showErr($("expError"), m.msg); }
-      else if (m.type === "done") renderExportDone(m);
+      if (m.type === “log”) logLine($(“expLog”), m.msg);
+      else if (m.type === “error”) { logLine($(“expLog”), “ERROR: “ + m.msg); showErr($(“expError”), m.msg); }
+      else if (m.type === “done”) renderExportDone(m);
     });
   } catch (err) {
-    showErr($("expError"), err.message);
+    showErr($(“expError”), err.message);
   } finally {
-    $("expGo").disabled = false;
-    $("expGo").textContent = "Export";
+    $(“expGo”).disabled = false;
+    $(“expGo”).textContent = “Export”;
+  }
+});
+
+// Handle ZIP file uploads
+$(“expZipFiles”).addEventListener(“change”, async () => {
+  const files = $(“expZipFiles”).files;
+  const container = $(“expZipList”);
+  container.innerHTML = “”;
+  if (!files.length) return;
+
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const roleBox = document.createElement(“div”);
+    roleBox.id = “expZipRole_” + i;
+    roleBox.style.cssText = “border:1px solid var(--line); border-radius:6px; padding:.7rem .9rem; margin-bottom:.8rem; background:var(--bg)”;
+    roleBox.innerHTML = '<div style=”font-weight:600; margin-bottom:.5rem”>' + esc(f.name) + '</div>';
+    const rolesHtml = ['eap', 'radius', 'tacacs', 'pxgrid', 'ims', 'saml', 'portal']
+      .map(r => '<label style=”display:inline-block; margin-right:1rem”><input type=”checkbox” value=”' + r + '” checked> ' + r.toUpperCase() + '</label>')
+      .join(“”);
+    roleBox.innerHTML += '<div style=”font-size:.85rem”>' + rolesHtml + '</div>';
+    container.appendChild(roleBox);
   }
 });
 
@@ -666,10 +731,12 @@ function importForm(confirm) {
   fd.append("bundle", $("impFile").files[0]);
   fd.append("passphrase", $("impPhrase").value);
   if (confirm) fd.append("confirm", "yes");
-  const nodes = [];
-  eachNode(c => { if (c.checked) nodes.push(c.value); });
-  if (nodes.length) fd.append("selectedNodes", JSON.stringify(nodes));
-  if ($("impAdminRole").checked) fd.append("adminRole", "yes");
+  const nodes = {};
+  eachNode(c => { nodes[c.value] = c.checked; });
+  for (const [hostname, selected] of Object.entries(nodes)) {
+    fd.append("targetNodes:" + hostname, selected ? "true" : "false");
+  }
+  if ($("impAdminRole").checked) fd.append("adminRole", "true");
   if ($("impZipPass").value) fd.append("zipPassword", $("impZipPass").value);
   return fd;
 }
@@ -755,7 +822,7 @@ function renderPreflight(data) {
   const hasSysCerts = p.items.some(it => it.family === "systemCertificates");
   $("impSysCertsSec").classList.toggle("hidden", !hasSysCerts);
   if (hasSysCerts) {
-    renderTargetNodes(data.probe);
+    renderTargetNodes(p);
     const hasZipSource = p.items.some(it => it.family === "systemCertificates" && it.obj && it.obj.keySource === "zip");
     $("impZipPassSec").classList.toggle("hidden", !hasZipSource);
   }
@@ -764,9 +831,18 @@ function renderPreflight(data) {
   $("impGo").textContent = p.create === 0 ? "Nothing to create" : "Confirm and create " + p.create + " objects";
 }
 
-function renderTargetNodes(probe) {
-  const nodes = (probe.nodes || []).map(n => '<label><input type="checkbox" class="impnode" value="' + esc(n) + '" checked> ' + esc(n) + '</label>').join("");
-  $("impNodes").innerHTML = nodes || "No Admin nodes available";
+function renderTargetNodes(preflight) {
+  const nodes = preflight.targetNodes || [];
+  if (!nodes.length) { $("impNodes").innerHTML = "No Admin nodes available"; return; }
+  let html = "";
+  for (const n of nodes) {
+    let label = esc(n.hostname);
+    if (!n.selectable) {
+      label += ' <span style="color: var(--danger-fg); font-size:.85rem">(' + esc(n.reason) + ')</span>';
+    }
+    html += '<label><input type="checkbox" class="impnode" value="' + esc(n.hostname) + '"' + (n.selectable ? ' checked' : ' disabled') + '> ' + label + '</label>';
+  }
+  $("impNodes").innerHTML = html;
 }
 
 const eachNode = fn => document.querySelectorAll("#impNodes .impnode").forEach(fn);
