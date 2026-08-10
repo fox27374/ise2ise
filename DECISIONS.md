@@ -933,9 +933,12 @@ Ordered by dependency, not by size.
    mapping, the portal tag behaviour, the derived export password and the
    restart-mid-import path are proven against the specification and the fake
    deployment only.
-6. **Policy elements** — network device groups, dACLs, authorization profiles,
-   identity source sequences, conditions. Interviewed on 2026-08-10 with the read
-   shapes taken off the source box first; see the section above. In build. The
+6. ~~Policy elements~~ — network device groups, dACLs, authorization profiles,
+   identity source sequences, conditions. Built on 2026-08-10 with the read
+   shapes taken off the source box first; see the section above. **Awaiting
+   hardware**: no policy element has been created on a real target, so every
+   POST body is still the read shape minus `id` and `link` rather than a proven
+   payload. The
    factory allowlist update mechanism is **not** part of it — factory objects are
    skipped with their content drift reported, and the update mechanism waits for
    the policy set slice, where `Default` makes it necessary.
