@@ -709,22 +709,11 @@ func createAuthzRule(c *Client, setID string, ruleObj map[string]any, conditionI
 		rewriteConditionReferences(cond, conditionIDByName)
 	}
 
-	// Rewrite profile references (names to ids)
-	if profiles, ok := rule["profile"].([]any); ok {
-		newProfiles := make([]any, len(profiles))
-		for i, p := range profiles {
-			if pName, ok := p.(string); ok && pName != "" {
-				if pID, exists := authProfileIDByName[pName]; exists {
-					newProfiles[i] = pID
-				} else {
-					newProfiles[i] = pName
-				}
-			} else {
-				newProfiles[i] = p
-			}
-		}
-		rule["profile"] = newProfiles
-	}
+	// The profile list travels by name and stays that way. Rewriting the names
+	// to the target's UUIDs looked like the remap every other reference needs,
+	// and a real 3.4 target refused every rule with "Unknown profile name for
+	// authorization rule: 16943ce0-…" — it was being handed the id it had just
+	// issued. Pre-flight has already checked each name resolves.
 
 	// Force disabled unless keepState
 	if !keepState {

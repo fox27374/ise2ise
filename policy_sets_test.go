@@ -419,3 +419,46 @@ func TestSetCountsOnlyElementsThatWillReallyBeCreated(t *testing.T) {
 		t.Error("the set was allowed through on a sequence whose own creation is blocked")
 	}
 }
+
+// ISE takes an authorization rule's profiles by name. Rewriting them to the
+// target's UUIDs — which looks like the remap every other reference needs — made
+// a real 3.4 target refuse every rule with "Unknown profile name for
+// authorization rule: <the id it had just issued>".
+func TestAuthorizationRuleKeepsProfileNames(t *testing.T) {
+	b := exportSets(t, srcWithPolicySets(t))
+	tgt := tgtForPolicySets(t)
+	ct := tgt.client()
+	rep, err := Preflight(ct, b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, false, quiet); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	var seen bool
+	for key, rules := range tgt.policySetRules {
+		if !strings.HasSuffix(key, "|authorization") {
+			continue
+		}
+		for _, r := range rules {
+			profiles, _ := r["profile"].([]any)
+			for _, p := range profiles {
+				name, _ := p.(string)
+				if name == "" {
+					continue
+				}
+				seen = true
+				if !strings.Contains(name, "-") || name == "CLIENTS-88" {
+					continue
+				}
+				t.Errorf("profile went across as %q, which is not the name the source used", name)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no imported authorization rule carried a profile")
+	}
+}

@@ -111,9 +111,11 @@ func TestPreflightPolicyElements(t *testing.T) {
 	// factory-named — a name that looks like ISE's own is still missing on a
 	// target that does not have it, and dropping it would lose the operator's
 	// own device types.
-	if creates != 6 {
+	// Five objects. "Device Type#Switches" needs no ancestor: its first segment
+	// is the group type, which is not an object.
+	if creates != 5 {
 		t.Logf("got %d creates, %d skips: %+v", creates, skips, r.Items)
-		t.Fatalf("pre-flight creates = %d, want 6", creates)
+		t.Fatalf("pre-flight creates = %d, want 5", creates)
 	}
 	if skips != 0 {
 		t.Fatalf("pre-flight skips = %d, want 0 against an empty target", skips)
@@ -249,11 +251,13 @@ func TestNetworkDeviceGroupAncestors(t *testing.T) {
 			}
 		}
 	}
-	if creates < 2 {
-		t.Fatalf("creates = %d, want at least 2 (child + ancestors)", creates)
+	// "Location#EMEA#Ireland" depends on one group, "Location#EMEA". The first
+	// segment is the group type, not a group: ISE refuses a create for it.
+	if creates != 1 {
+		t.Fatalf("creates = %d, want 1 (the one real ancestor)", creates)
 	}
-	if ancestorCreates != 2 {
-		t.Fatalf("ancestor creates = %d, want 2", ancestorCreates)
+	if ancestorCreates != 1 {
+		t.Fatalf("ancestor creates = %d, want 1", ancestorCreates)
 	}
 }
 

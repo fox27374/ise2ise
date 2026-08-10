@@ -278,9 +278,13 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 		for _, ancestor := range ancestors {
 			if !ndgIDByName[ancestor] && !willExist["networkDeviceGroup"][ancestor] {
 				// Create a synthetic ancestor for pre-flight reporting
+				// othername is the group type — the first segment of the path —
+				// and ERS refuses a device group without it.
+				root, _, _ := strings.Cut(ancestor, "#")
 				ancestorItem := map[string]any{
-					"name": ancestor,
-					"kind": "networkDeviceGroup",
+					"name":      ancestor,
+					"kind":      "networkDeviceGroup",
+					"othername": root,
 				}
 				willExist["networkDeviceGroup"][ancestor] = true
 				it := PreflightItem{
@@ -354,13 +358,20 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 
 // extractAncestors returns all ancestors of a hierarchical name.
 // E.g., "Device Type#All Device Types#Router" -> ["Device Type", "Device Type#All Device Types"]
+// extractAncestors returns the groups a hierarchical name depends on.
+//
+// The first segment is the group *type* ("Device Type", "Location"), not a
+// group: the topmost object is "Device Type#All Device Types". Treating that
+// first segment as an ancestor made the import try to create "Device Type",
+// which a real 3.4 target refused with "Mandatory fields missing: [othername]",
+// five times in one run.
 func extractAncestors(name string) []string {
 	parts := strings.Split(name, "#")
-	if len(parts) <= 1 {
+	if len(parts) <= 2 {
 		return nil
 	}
 	var ancestors []string
-	for i := 1; i < len(parts); i++ {
+	for i := 2; i < len(parts); i++ {
 		ancestors = append(ancestors, strings.Join(parts[:i], "#"))
 	}
 	return ancestors
