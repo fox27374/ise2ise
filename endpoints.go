@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"maps"
@@ -538,13 +540,23 @@ type PreflightItem struct {
 	obj map[string]any // the object to create; not serialised to the UI
 }
 
+// TargetNode represents an eligible node on the target deployment for system certificate import.
+type TargetNode struct {
+	Hostname   string   `json:"hostname"`
+	Address    string   `json:"address"`
+	Roles      []string `json:"roles"`
+	Selectable bool     `json:"selectable"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
 type PreflightReport struct {
-	Source  BundleSource    `json:"source"`
-	Items   []PreflightItem `json:"items"`
-	Create  int             `json:"create"`
-	Skip    int             `json:"skip"`
-	Blocked int             `json:"blocked"`
-	Notes   []string        `json:"notes"`
+	Source      BundleSource    `json:"source"`
+	Items       []PreflightItem `json:"items"`
+	Create      int             `json:"create"`
+	Skip        int             `json:"skip"`
+	Blocked     int             `json:"blocked"`
+	Notes       []string        `json:"notes"`
+	TargetNodes []TargetNode    `json:"targetNodes"`
 }
 
 func (r *PreflightReport) add(it PreflightItem) {
@@ -631,6 +643,37 @@ func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 	return r, nil
 }
 
+// normalizeDN normalizes an X.500 distinguished name for comparison.
+// Splits on comma, trims each key=value pair, lowercases, and sorts to handle different orderings.
+func normalizeDN(dn string) string {
+	if dn == "" {
+		return ""
+	}
+	parts := strings.Split(dn, ",")
+	var normalized []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			normalized = append(normalized, strings.ToLower(part))
+		}
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, ",")
+}
+
+// parseRolesFromArray extracts roles from a []any array as returned by the API.
+func parseRolesFromArray(v any) []string {
+	var result []string
+	if roleArray, ok := v.([]any); ok {
+		for _, roleItem := range roleArray {
+			if roleStr, ok := roleItem.(string); ok && roleStr != "" {
+				result = append(result, roleStr)
+			}
+		}
+	}
+	return result
+}
+
 // preflightSystemCerts resolves the system certificate family.
 func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 	sysCerts := b.Objects[familySystemCerts]
@@ -638,47 +681,89 @@ func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 		return
 	}
 
-	// Fetch target's system certificates per node
-	targetByNode := map[string][]map[string]any{}
-	nodeSet := map[string]bool{}
-
-	for _, cert := range sysCerts {
-		sourceNode := str(cert, "sourceNode")
-		if sourceNode != "" {
-			nodeSet[sourceNode] = true
-		}
+	// Read target's deployment nodes
+	deploymentNodes, err := c.openAPIList(pathDeploymentNode)
+	if err != nil {
+		return
 	}
 
-	// If no source nodes specified, read from deployment node list
-	if len(nodeSet) == 0 {
-		nodes, err := c.openAPIList(pathDeploymentNode)
-		if err == nil {
-			for _, node := range nodes {
-				if hostName := str(node, "hostname"); hostName != "" {
-					nodeSet[hostName] = true
+	// Build list of target nodes eligible for system certificate import:
+	// Admin role and Connected status
+	targetByNode := map[string][]map[string]any{}
+	var targetNodes []TargetNode
+	for _, node := range deploymentNodes {
+		hostname := str(node, "hostname")
+		address := str(node, "ipAddress")
+		if hostname == "" || address == "" {
+			continue
+		}
+
+		// Check for Admin role and Connected status
+		hasAdminRole := false
+		roles := node["roles"]
+		if roleArray, ok := roles.([]any); ok {
+			for _, roleItem := range roleArray {
+				if roleStr, ok := roleItem.(string); ok && strings.Contains(roleStr, "Admin") {
+					hasAdminRole = true
+					break
 				}
 			}
 		}
-	}
 
-	for node := range nodeSet {
-		certs, _ := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, node))
-		targetByNode[node] = certs
-	}
+		nodeStatus := str(node, "nodeStatus")
+		isConnected := nodeStatus == "Connected"
 
-	// Fetch target's trusted certificates to validate issuer chains
+		// Fetch this node's system certificates
+		certs, _ := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, hostname))
+		targetByNode[hostname] = certs
+
+		tn := TargetNode{
+			Hostname:   hostname,
+			Address:    address,
+			Roles:      parseRolesFromArray(roles),
+			Selectable: hasAdminRole && isConnected,
+		}
+		if !tn.Selectable {
+			if !hasAdminRole {
+				tn.Reason = "node does not have Admin role"
+			} else if !isConnected {
+				tn.Reason = "node status is not Connected"
+			}
+		}
+		targetNodes = append(targetNodes, tn)
+	}
+	r.TargetNodes = targetNodes
+
+	// Fetch target's trusted certificates to validate issuer chains.
+	// Build a map of subject DNs that will exist (for issuer validation).
 	trustedCerts, _ := fetchTrustedCertsOpenAPI(c)
 	willExistTrusted := map[string]bool{}
+
+	// Add issuer subjects from the bundle's own trusted certs
 	for _, tc := range b.Objects[familyTrustedCerts] {
-		willExistTrusted[str(tc, "fingerprint")] = true
-	}
-	for _, tc := range trustedCerts {
-		if fp := str(tc, "sha256Fingerprint"); fp != "" {
-			fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-			willExistTrusted[fp] = true
+		// Extract subject DN from the bundled certificate's PEM if available
+		if pemData := str(tc, "pem"); pemData != "" {
+			if block, _ := pem.Decode([]byte(pemData)); block != nil {
+				if parsedCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					willExistTrusted[normalizeDN(parsedCert.Subject.String())] = true
+				}
+			}
+		}
+		// Also use the subject field if present
+		if subject := str(tc, "subject"); subject != "" {
+			willExistTrusted[normalizeDN(subject)] = true
 		}
 	}
 
+	// Add subjects from the target's trusted certs
+	for _, tc := range trustedCerts {
+		if subject := str(tc, "subject"); subject != "" {
+			willExistTrusted[normalizeDN(subject)] = true
+		}
+	}
+
+	// Emit one pre-flight item per certificate per selectable target node.
+	// This makes counts honest: 3 certs × 2 nodes = 6 items.
 	for _, certObj := range sysCerts {
 		name := str(certObj, "name")
 		sourceNode := str(certObj, "sourceNode")
@@ -688,108 +773,137 @@ func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 		notAfter := str(certObj, "notAfter")
 		keySource := str(certObj, "keySource")
 
-		it := PreflightItem{Family: familySystemCerts, Name: name + " -> " + sourceNode, obj: maps.Clone(certObj)}
+		// First, do certificate-level checks that apply globally
+		var certBlockReason string
 
 		// Expired check
 		if notAfter != "" {
 			exp, err := time.Parse(time.RFC3339, notAfter)
-			if err == nil && exp.Before(time.Now()) {
-				it.Action, it.Reason = actionBlocked, fmt.Sprintf("certificate expired on %s", exp.Format(time.RFC3339))
-				r.add(it)
-				continue
+			if err != nil {
+				certBlockReason = fmt.Sprintf("certificate expiry %q is not a date this build understands", notAfter)
+			} else if exp.Before(time.Now()) {
+				certBlockReason = fmt.Sprintf("certificate expired on %s", exp.Format(time.RFC3339))
 			}
 		}
 
 		// Missing pem or keyBlob
-		if pemData == "" {
-			it.Action, it.Reason = actionBlocked, "certificate has no PEM data"
-			r.add(it)
-			continue
+		if certBlockReason == "" && pemData == "" {
+			certBlockReason = "certificate has no PEM data"
 		}
-		if keyBlob == "" {
-			it.Action, it.Reason = actionBlocked, "certificate has no private key"
+		if certBlockReason == "" && keyBlob == "" {
+			certBlockReason = "certificate has no private key"
+		}
+
+		// For API-exported certs, check issuer is on target (but skip for self-signed)
+		if certBlockReason == "" && keySource == "api" {
+			issuer := str(certObj, "issuer")
+			subject := str(certObj, "subject")
+			// Self-signed: issuer == subject, so no separate issuer needed
+			isSelfSigned := issuer != "" && issuer == subject
+			if issuer != "" && !isSelfSigned && !willExistTrusted[normalizeDN(issuer)] {
+				certBlockReason = fmt.Sprintf("issuer DN %q is not on the target; export the issuer certificate first", issuer)
+			}
+		}
+
+		// Now emit one item per selectable target node
+		fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+
+		// If cert has a global block reason, emit one item with that reason (not per-node)
+		if certBlockReason != "" {
+			displayName := name
+			if sourceNode != "" {
+				displayName = name + " (from " + sourceNode + ")"
+			}
+			it := PreflightItem{
+				Family: familySystemCerts,
+				Name:   displayName,
+				Action: actionBlocked,
+				Reason: certBlockReason,
+				obj:    maps.Clone(certObj),
+			}
 			r.add(it)
 			continue
 		}
 
-		// For API-exported certs, check issuer is on target
-		if keySource == "api" {
-			issuer := str(certObj, "issuer")
-			if issuer != "" && !willExistTrusted[issuer] {
-				it.Action, it.Reason = actionBlocked, fmt.Sprintf("issuer DN %q is not on the target; export the issuer certificate first", issuer)
+		// Emit an item per selectable target node
+		for _, tn := range targetNodes {
+			if !tn.Selectable {
+				continue
+			}
+
+			displayName := name
+			if sourceNode != "" {
+				displayName = name + " -> " + sourceNode
+			}
+			displayName = displayName + " to " + tn.Hostname
+
+			it := PreflightItem{
+				Family: familySystemCerts,
+				Name:   displayName,
+				obj:    maps.Clone(certObj),
+			}
+
+			targetCerts := targetByNode[tn.Hostname]
+			if targetCerts == nil {
+				it.Action, it.Reason = actionBlocked, fmt.Sprintf("target node %q is not available", tn.Hostname)
 				r.add(it)
 				continue
 			}
-		}
 
-		// Per-node checks
-		if sourceNode == "" {
-			it.Action, it.Reason = actionBlocked, "certificate has no source node specified"
-			r.add(it)
-			continue
-		}
-
-		targetCerts := targetByNode[sourceNode]
-		if targetCerts == nil {
-			it.Action, it.Reason = actionBlocked, fmt.Sprintf("target node %q is not available", sourceNode)
-			r.add(it)
-			continue
-		}
-
-		// Check for existing cert (by SHA-256)
-		fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
-		var existing string
-		for _, target := range targetCerts {
-			if tfp := str(target, "sha256Fingerprint"); tfp != "" {
-				tfpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(tfp, ":", ""), " ", ""))
-				if tfpNorm == fpNorm {
-					existing = str(target, "friendlyName")
-					break
-				}
-			}
-		}
-		if existing != "" {
-			it.Action, it.Reason = actionSkip, fmt.Sprintf("already exists on %s as %q", sourceNode, existing)
-			r.add(it)
-			continue
-		}
-
-		// Check for name collision
-		var nameCollision bool
-		for _, target := range targetCerts {
-			if str(target, "friendlyName") == name {
-				nameCollision = true
-				break
-			}
-		}
-		if nameCollision {
-			it.Action, it.Reason = actionBlocked, fmt.Sprintf("a different certificate on %s already uses this name; import never replaces", sourceNode)
-			r.add(it)
-			continue
-		}
-
-		// Check for portal group tag collision
-		portalTag := str(certObj, "portalGroupTag")
-		portalRoleSet := false
-		if portalTag != "" && truthy(certObj, "portal") {
+			// Check for existing cert (by SHA-256)
+			var existing string
 			for _, target := range targetCerts {
-				if tTag := str(target, "groupTag"); tTag == portalTag && str(target, "friendlyName") != name {
-					// Tag is held by another cert
-					it.Action = actionCreate
-					it.Reason = fmt.Sprintf("portal group tag %q is held by another certificate on %s; certificate will be created without portal role", portalTag, sourceNode)
-					// Remove portal role from the object before creation
-					delete(it.obj, "portal")
-					delete(it.obj, "portalGroupTag")
-					portalRoleSet = true
+				if tfp := str(target, "sha256Fingerprint"); tfp != "" {
+					tfpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(tfp, ":", ""), " ", ""))
+					if tfpNorm == fpNorm {
+						existing = str(target, "friendlyName")
+						break
+					}
+				}
+			}
+			if existing != "" {
+				it.Action, it.Reason = actionSkip, fmt.Sprintf("already exists on %s as %q", tn.Hostname, existing)
+				r.add(it)
+				continue
+			}
+
+			// Check for name collision
+			var nameCollision bool
+			for _, target := range targetCerts {
+				if str(target, "friendlyName") == name {
+					nameCollision = true
 					break
 				}
 			}
-		}
+			if nameCollision {
+				it.Action, it.Reason = actionBlocked, fmt.Sprintf("a different certificate on %s already uses this name; import never replaces", tn.Hostname)
+				r.add(it)
+				continue
+			}
 
-		if !portalRoleSet {
-			it.Action = actionCreate
+			// Check for portal group tag collision
+			portalTag := str(certObj, "portalGroupTag")
+			portalRoleSet := false
+			if portalTag != "" && truthy(certObj, "portal") {
+				for _, target := range targetCerts {
+					if tTag := str(target, "groupTag"); tTag == portalTag && str(target, "friendlyName") != name {
+						// Tag is held by another cert
+						it.Action = actionCreate
+						it.Reason = fmt.Sprintf("portal group tag %q is held by another certificate on %s; certificate will be created without portal role", portalTag, tn.Hostname)
+						// Remove portal role from the object before creation
+						delete(it.obj, "portal")
+						delete(it.obj, "portalGroupTag")
+						portalRoleSet = true
+						break
+					}
+				}
+			}
+
+			if !portalRoleSet {
+				it.Action = actionCreate
+			}
+			r.add(it)
 		}
-		r.add(it)
 	}
 }
 
@@ -931,7 +1045,9 @@ type ImportResult struct {
 // ApplyImport writes the objects the pre-flight report marked as creatable, in
 // dependency order: trusted certificates first, then system certificates, then groups, then endpoints.
 // Nothing else is touched; existing objects are never overwritten.
-func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(string, ...any)) (*ImportResult, error) {
+// selectedTargetNodes maps hostname -> selected (for system certificates only).
+// adminRole indicates whether to allow the admin certificate role.
+func ApplyImport(c *Client, r *PreflightReport, passphrase string, selectedTargetNodes map[string]bool, adminRole bool, log func(string, ...any)) (*ImportResult, error) {
 	res := &ImportResult{Errors: []string{}}
 
 	// Trusted certificates.
@@ -1104,23 +1220,28 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(stri
 		}
 	}
 
-	// System certificates: must have a client per node.
-	// Build a map of node -> client (all using the same credentials).
+	// System certificates: build clients for selected target nodes.
+	// Extract target hostnames from r.TargetNodes and selectedTargetNodes.
 	nodeClients := map[string]*Client{}
 	var sysCertCount int
 	for _, it := range r.Items {
 		if it.Family == familySystemCerts && it.Action == actionCreate {
 			sysCertCount++
-			sourceNode := str(it.obj, "sourceNode")
-			if sourceNode != "" && nodeClients[sourceNode] == nil {
-				// Create a client pointing to this node
-				nodeClients[sourceNode] = NewClient(sourceNode, c.User, c.Pass, c.hc.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify)
-			}
 		}
 	}
 
 	if sysCertCount > 0 {
 		log("Creating %d system certificates…", sysCertCount)
+
+		// Build clients for selected target nodes
+		for _, tn := range r.TargetNodes {
+			if selectedTargetNodes[tn.Hostname] {
+				if nodeClients[tn.Hostname] == nil {
+					nodeClients[tn.Hostname] = NewClient(tn.Address, c.User, c.Pass, c.hc.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify)
+				}
+			}
+		}
+
 		for _, it := range r.Items {
 			if it.Family != familySystemCerts || it.Action != actionCreate {
 				continue
@@ -1128,18 +1249,33 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(stri
 
 			obj := maps.Clone(it.obj)
 			name := str(obj, "name")
-			sourceNode := str(obj, "sourceNode")
 			pemData := str(obj, "pem")
 			keyBlob := str(obj, "keyBlob")
 			keySource := str(obj, "keySource")
 			isWildcard := strings.HasPrefix(extractCN(str(obj, "subject")), "*.")
+			bundleAdminRole := truthy(obj, "admin")
 
-			// Get the client for this node
-			nodeClient := nodeClients[sourceNode]
+			// Extract target node from the pre-flight item name
+			// Name format is "certname -> sourcenode to targetnode"
+			// We need to extract the targetnode
+			var targetNode string
+			parts := strings.Split(it.Name, " to ")
+			if len(parts) > 1 {
+				targetNode = strings.TrimSpace(parts[1])
+			}
+			if targetNode == "" {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: could not determine target node from pre-flight item", name))
+				log("FAILED system certificate %q: no target node specified", name)
+				continue
+			}
+
+			// Get the client for this target node
+			nodeClient := nodeClients[targetNode]
 			if nodeClient == nil {
 				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: no client available for node %s", name, sourceNode))
-				log("FAILED system certificate %q on %s: no client available", name, sourceNode)
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: no client available for target node %s", name, targetNode))
+				log("FAILED system certificate %q on %s: no client available", name, targetNode)
 				continue
 			}
 
@@ -1148,15 +1284,13 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(stri
 			if keySource == "api" {
 				password = certPassword(passphrase)
 			} else if keySource == "zip" {
-				// For ZIP source, password is not available; the key keeps GUI password.
-				// The spec says the second password field appears at import only for ZIP sources,
-				// but for now we'll use empty password or skip this.
-				// Actually, the bundle should have carried the password. For now, we'll leave it empty
-				// and let ISE handle it (it should work if the ZIP was properly exported).
 				password = ""
 			}
 
 			// Build the create payload
+			// Admin role is only set true if BOTH the bundle says admin=true AND operator ticked adminRole
+			adminRoleValue := bundleAdminRole && adminRole
+
 			payload := map[string]any{
 				"data":                             pemData,
 				"privateKeyData":                   keyBlob,
@@ -1169,7 +1303,7 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(stri
 				"allowExtendedValidity":            true,
 				"allowWildCardCertificates":        isWildcard,
 				"name":                             name,
-				"admin":                            false, // Always false unless operator ticks a run-level box
+				"admin":                            adminRoleValue,
 				"eap":                              truthy(obj, "eap"),
 				"radius":                           truthy(obj, "radius"),
 				"tacacs":                           truthy(obj, "tacacs"),
@@ -1186,32 +1320,32 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, log func(stri
 				payload["portalGroupTag"] = tag
 			}
 
-			// POST to the node's import endpoint
+			// POST to the target node's import endpoint
 			if err := nodeClient.openAPICreate(pathSystemCertsAPI+"/import", payload); err != nil {
 				// Check if it's a connection error (node restarting after role change)
 				var ae *APIError
 				if !errors.As(err, &ae) {
 					// Network error
 					res.Failed++
-					res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v (the node may be restarting after a role change; do not retry)", name, sourceNode, err))
-					log("FAILED system certificate %q on %s: %v (node may be restarting)", name, sourceNode, err)
+					res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v (the node may be restarting after a role change; do not retry)", name, targetNode, err))
+					log("FAILED system certificate %q on %s: %v (node may be restarting)", name, targetNode, err)
 					continue
 				}
 
 				if isDuplicate(err) {
 					res.Skipped++
-					log("System certificate %q on %s already exists; skipped.", name, sourceNode)
+					log("System certificate %q on %s already exists; skipped.", name, targetNode)
 					continue
 				}
 
 				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v", name, sourceNode, err))
-				log("FAILED system certificate %q on %s: %v", name, sourceNode, err)
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v", name, targetNode, err))
+				log("FAILED system certificate %q on %s: %v", name, targetNode, err)
 				continue
 			}
 
 			res.Created++
-			log("Created system certificate %q on %s.", name, sourceNode)
+			log("Created system certificate %q on %s.", name, targetNode)
 		}
 		if sysCertCount > 0 {
 			log("Completed %d system certificates.", sysCertCount)

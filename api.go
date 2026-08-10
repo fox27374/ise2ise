@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -319,11 +320,138 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+
+	// Parse the request: JSON in the body, files as multipart if present
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
+	contentType := r.Header.Get("Content-Type")
+
 	var in exportReq
-	if err := decodeBody(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "could not read the request: "+err.Error())
-		return
+	var systemCertZips []map[string]any
+	var zipPassword string
+
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Parse multipart form
+		if err := r.ParseMultipartForm(maxUpload); err != nil {
+			writeErr(w, http.StatusBadRequest, "could not read the upload: "+err.Error())
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+
+		// Read JSON from form field "req"
+		reqJSON := r.FormValue("req")
+		if reqJSON == "" {
+			writeErr(w, http.StatusBadRequest, "missing req field in multipart form")
+			return
+		}
+		if err := json.Unmarshal([]byte(reqJSON), &in); err != nil {
+			writeErr(w, http.StatusBadRequest, "could not parse request JSON: "+err.Error())
+			return
+		}
+
+		zipPassword = r.FormValue("zipPassword")
+
+		// Process uploaded ZIP files
+		for _, fileHeader := range r.MultipartForm.File["zips"] {
+			f, err := fileHeader.Open()
+			if err != nil {
+				continue
+			}
+			data, _ := io.ReadAll(io.LimitReader(f, maxUpload))
+			f.Close()
+
+			// Parse ZIP and extract certificate metadata
+			zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid ZIP: %v", fileHeader.Filename, err))
+				return
+			}
+
+			var pemData, keyBlobData string
+			for _, zf := range zr.File {
+				rc, _ := zf.Open()
+				entryBody, _ := io.ReadAll(rc)
+				rc.Close()
+
+				if bytes.HasPrefix(entryBody, []byte("-----BEGIN")) {
+					block, _ := pem.Decode(entryBody)
+					if block != nil && block.Type == "CERTIFICATE" {
+						pemData = string(entryBody)
+						continue
+					}
+				}
+				if strings.Contains(string(entryBody), "ENCRYPTED PRIVATE KEY") {
+					keyBlobData = string(entryBody)
+				}
+			}
+
+			if pemData == "" {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q: no .pem entry", fileHeader.Filename))
+				return
+			}
+			if keyBlobData == "" {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q: no private key entry", fileHeader.Filename))
+				return
+			}
+
+			// Parse certificate to extract metadata
+			block, _ := pem.Decode([]byte(pemData))
+			var cn string
+			var sans []string
+			var keySize int
+			var selfSigned bool
+			var expiresAt string
+			var subject string
+
+			if block != nil {
+				if parsedCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					cn = parsedCert.Subject.CommonName
+					subject = parsedCert.Subject.String()
+					for _, dns := range parsedCert.DNSNames {
+						sans = append(sans, dns)
+					}
+					for _, ip := range parsedCert.IPAddresses {
+						sans = append(sans, ip.String())
+					}
+					// Extract key size from public key
+					switch pk := parsedCert.PublicKey.(type) {
+					case *rsa.PublicKey:
+						keySize = pk.N.BitLen()
+					}
+					selfSigned = parsedCert.Subject.String() == parsedCert.Issuer.String()
+					expiresAt = parsedCert.NotAfter.Format(time.RFC3339)
+				}
+			}
+
+			if cn == "" {
+				cn = fileHeader.Filename
+			}
+
+			fpBytes := sha256.Sum256(block.Bytes)
+			fp := fmt.Sprintf("%x", fpBytes)
+
+			zipInfo := map[string]any{
+				"filename":    fileHeader.Filename,
+				"name":        cn,
+				"subject":     subject,
+				"sans":        sans,
+				"keySize":     keySize,
+				"expiresAt":   expiresAt,
+				"hasKey":      keyBlobData != "",
+				"fingerprint": fp,
+				"selfSigned":  selfSigned,
+				"pem":         pemData,
+				"keyBlob":     keyBlobData,
+			}
+			systemCertZips = append(systemCertZips, zipInfo)
+		}
+	} else {
+		// JSON-only path (existing behavior)
+		if err := decodeBody(r, &in); err != nil {
+			writeErr(w, http.StatusBadRequest, "could not read the request: "+err.Error())
+			return
+		}
 	}
+
 	c, err := in.client()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -363,7 +491,7 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		s.fail("%v", err)
 		return
 	}
-	if err := ExportSystemCerts(c, b, in.Families, in.SystemCerts, in.Passphrase, []map[string]any{}, "", s.log); err != nil {
+	if err := ExportSystemCerts(c, b, in.Families, in.SystemCerts, in.Passphrase, systemCertZips, zipPassword, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}
@@ -502,7 +630,19 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	res, err := ApplyImport(in.client, rep, in.passphrase, s.log)
+
+	// Extract selectedTargetNodes and adminRole from the form
+	selectedTargetNodes := map[string]bool{}
+	for _, tn := range rep.TargetNodes {
+		// Check if the form has this target node selected
+		// Form field name is "targetNodes:<hostname>"
+		if r.FormValue("targetNodes:"+tn.Hostname) == "true" {
+			selectedTargetNodes[tn.Hostname] = true
+		}
+	}
+	adminRole := r.FormValue("adminRole") == "true"
+
+	res, err := ApplyImport(in.client, rep, in.passphrase, selectedTargetNodes, adminRole, s.log)
 	if err != nil {
 		s.fail("%v", err)
 		s.send(map[string]any{"type": "done", "result": res, "preflight": rep})

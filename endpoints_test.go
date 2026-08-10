@@ -279,7 +279,7 @@ func TestApplyCreatesOnlyWhatPreflightAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("ApplyImport: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestApplyCreatesOnlyWhatPreflightAllowed(t *testing.T) {
 	if rep2.Create != 0 {
 		t.Errorf("second run wants to create %d objects; everything already exists", rep2.Create)
 	}
-	res2, err := ApplyImport(c, rep2, "test-passphrase-1234567890", quiet)
+	res2, err := ApplyImport(c, rep2, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("ApplyImport (second run): %v", err)
 	}
@@ -347,7 +347,7 @@ func TestApplyReportsISEErrorText(t *testing.T) {
 	// Someone else created the group between the gate and the write.
 	tgt.addGroup("t9", "Printers")
 
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("ApplyImport: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestImportWithERSCSRFCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestImportStripsNullsFromERSCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -459,7 +459,7 @@ func TestImportStripsOpenAPIOnlyEndpointFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -34,6 +36,11 @@ type fakeISE struct {
 	certExports map[string][]byte           // cert id -> export body
 	policies    map[string][]map[string]any // policy path -> list of policy objects
 
+	systemCerts       map[string][]map[string]any // hostname -> list of system certs
+	systemCertExports map[string][]byte           // cert id -> export body
+	systemCertCreated map[string][]map[string]any // hostname -> created payloads
+	deploymentNodes   []map[string]any
+
 	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
 	csrfRequired bool   // ERS demands a CSRF nonce on writes, as a real 3.4 does
@@ -52,11 +59,27 @@ type fakeISE struct {
 func newFakeISE(t *testing.T) *fakeISE {
 	f := &fakeISE{
 		t: t, user: "ersadmin", pass: "s3cret", version: "3.3.0.430",
-		nodes:       []string{"ise-src-1"},
-		pagesServed: map[string]int{},
-		created:     map[string][]map[string]any{},
-		policies:    map[string][]map[string]any{},
+		nodes:             []string{"ise-src-1"},
+		pagesServed:       map[string]int{},
+		created:           map[string][]map[string]any{},
+		policies:          map[string][]map[string]any{},
+		systemCerts:       map[string][]map[string]any{},
+		systemCertExports: map[string][]byte{},
+		systemCertCreated: map[string][]map[string]any{},
+		deploymentNodes:   []map[string]any{},
 	}
+	// Initialize deployment nodes
+	f.deploymentNodes = []map[string]any{
+		{
+			"hostname":   "ise-src-1",
+			"ipAddress":  "10.0.0.1",
+			"nodeStatus": "Connected",
+			"roles":      []string{"Admin", "PAN", "MnT"},
+		},
+	}
+	f.systemCerts["ise-src-1"] = []map[string]any{}
+	f.systemCertCreated["ise-src-1"] = []map[string]any{}
+
 	f.ers = httptest.NewServer(http.HandlerFunc(f.serveERS))
 	f.api = httptest.NewServer(http.HandlerFunc(f.serveAPI))
 	t.Cleanup(f.ers.Close)
@@ -446,6 +469,120 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deployment node listing
+	if path == "/api/v1/deployment/node" && r.Method == http.MethodGet {
+		writeJSONRaw(w, map[string]any{"response": f.deploymentNodes})
+		return
+	}
+
+	// System certificate listing per node
+	if strings.HasPrefix(path, "/api/v1/certs/system-certificate/") && !strings.Contains(path[30:], "/") {
+		hostName := strings.TrimPrefix(path, "/api/v1/certs/system-certificate/")
+		if strings.Contains(hostName, "/") {
+			// It's not just a hostname, fall through
+		} else if r.Method == http.MethodGet {
+			f.pagesServed["system-cert-"+hostName]++
+			certs := f.systemCerts[hostName]
+			if certs == nil {
+				certs = []map[string]any{}
+			}
+			page := f.page(r, certs)
+			writeJSONRaw(w, map[string]any{"response": page})
+			return
+		}
+	}
+
+	// System certificate export and import
+	if path == "/api/v1/certs/system-certificate/export" && r.Method == http.MethodPost {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		id, _ := body["id"].(string)
+		hostName, _ := body["hostName"].(string)
+
+		if hostName == "" || id == "" {
+			iseError(w, http.StatusBadRequest, "missing hostName or id")
+			return
+		}
+
+		// Return cached export if available
+		if exportData, ok := f.systemCertExports[id]; ok {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write(exportData)
+			return
+		}
+
+		// Generate a fake ZIP with .pem and .pvk entries
+		buf := &bytes.Buffer{}
+		z := zip.NewWriter(buf)
+		z.Create("cert.pem")
+		z.Create("cert.pvk")
+		z.Close()
+
+		exportData := buf.Bytes()
+		f.systemCertExports[id] = exportData
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(exportData)
+		return
+	}
+
+	if path == "/api/v1/certs/system-certificate/import" && r.Method == http.MethodPost {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		name, _ := body["name"].(string)
+
+		if name == "" {
+			iseError(w, http.StatusBadRequest, "missing name")
+			return
+		}
+
+		// Record the created certificate (for testing)
+		for hostName := range f.systemCerts {
+			f.systemCertCreated[hostName] = append(f.systemCertCreated[hostName], body)
+		}
+
+		// Create a cert object
+		cert := map[string]any{
+			"id":                fmt.Sprintf("sys-cert-%d", len(f.systemCerts)+1),
+			"friendlyName":      name,
+			"sha256Fingerprint": "00112233445566778899aabbccddeeff",
+			"expirationDate":    "Mon Dec 31 23:59:59 UTC 2025",
+			"issuedTo":          name,
+			"issuedBy":          name,
+			"selfSigned":        true,
+			"keySize":           2048,
+			"usedBy":            "",
+			"portalGroupTag":    "",
+			"eap":               body["eap"],
+			"radius":            body["radius"],
+			"tacacs":            body["tacacs"],
+			"pxgrid":            body["pxgrid"],
+			"ims":               body["ims"],
+			"saml":              body["saml"],
+			"portal":            body["portal"],
+			"admin":             body["admin"],
+		}
+
+		// Add to the appropriate node's certs (use first selectable node for now)
+		if len(f.deploymentNodes) > 0 {
+			hostName := str(f.deploymentNodes[0], "hostname")
+			if hostName != "" {
+				f.systemCerts[hostName] = append(f.systemCerts[hostName], cert)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"response": map[string]any{
+				"status":  "Success",
+				"message": "System certificate was added successfully",
+				"id":      cert["id"],
+			},
+		})
+		return
+	}
+
 	iseError(w, http.StatusNotFound, "no such OpenAPI resource")
 }
 
@@ -555,6 +692,28 @@ func (f *fakeISE) addEndpoint(mac, groupID string, static bool, profileID string
 	}
 	f.endpoints = append(f.endpoints, e)
 	return e
+}
+
+func (f *fakeISE) addSystemCert(hostName, id, name, fingerprint string, roles []string) map[string]any {
+	cert := map[string]any{
+		"id":                fmt.Sprintf("sys-cert-%s", id),
+		"friendlyName":      name,
+		"sha256Fingerprint": fingerprint,
+		"expirationDate":    "Mon Dec 31 23:59:59 UTC 2099",
+		"issuedTo":          "CN=" + name,
+		"issuedBy":          "CN=" + name,
+		"selfSigned":        true,
+		"keySize":           2048,
+		"usedBy":            strings.Join(roles, ","),
+		"portalGroupTag":    "",
+		"nodeStatus":        "Connected",
+	}
+	if _, ok := f.systemCerts[hostName]; !ok {
+		f.systemCerts[hostName] = []map[string]any{}
+		f.systemCertCreated[hostName] = []map[string]any{}
+	}
+	f.systemCerts[hostName] = append(f.systemCerts[hostName], cert)
+	return cert
 }
 
 // addPolicySet registers a policy set, which on a real box carries almost no
