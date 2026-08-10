@@ -540,7 +540,95 @@ objects are by definition factory-fresh.
 
 This is **not yet implemented** — the endpoint slice had no factory objects worth
 updating, so building the mechanism early would have been speculative. It lands
-with the policy slice, which is where it matters.
+with the **policy set** slice, not the policy element slice below: the elements
+have factory objects, but none of them is the `Default` policy set, and nothing
+in them decides what happens to unmatched traffic. Until then a factory-named
+object is skipped and its **content drift is reported**, which gives the operator
+the same information without giving the tool a way to overwrite an object it did
+not create.
+
+### Policy elements, read off the box on 2026-08-10
+
+Slice 6. Interviewed and its read shapes pulled from the source deployment before
+any code, the way the system certificate slice was.
+
+Five families, imported in this order: **network device groups, dACLs,
+authorization profiles, identity source sequences, conditions.** Nothing in the
+list references anything else in it, so the order only has to put an
+authorization profile after the dACL it may name. Selection is a single family
+checkbox — no per-object pickers. Unlike certificates, nothing here is dangerous
+or meaningless to carry, the volumes are small, and what the target already has
+is skipped.
+
+**ERS cannot list authorization profiles on 3.4.** `GET
+/ers/config/authorizationprofile` answers **HTTP 500**, "Failed to convert to ERS
+object, attribute: cisco-av-pair, Error: could not extract ResultSet". The
+collection read is unusable, so stubs come from OpenAPI
+`/api/v1/policy/network-access/authorization-profiles` — which returns name and
+id and nothing else — and the detail comes per id from ERS.
+
+**And one profile cannot be read at all.** `ACME-Guest_Profile` answers 500 on
+its own id too: "Exception when converting from attribute value to WebRedirection
+object". 26 of the source's 27 profiles read fine; the guest one with a web
+redirect does not. ISE cannot deserialise its own object, so nothing can be done
+about it in this tool. The export names it, quotes ISE's error, says it must be
+recreated by hand, and carries the other 26. The same failure can hit the target
+at pre-flight, so dedupe falls back to the OpenAPI stubs and drift comparison
+reports that it could not compare, rather than failing the family.
+
+**Conditions travel from the network-access tree only**, all three types:
+`condition`, `time-condition` and `network-condition`. Device admin policy is
+never migrated, so its mirror of the condition tree has nothing to point at it.
+The source holds 23 library conditions and **zero** time or network conditions,
+so those two shapes go in unexercised and are marked as such.
+
+**A nested condition carries its children inline.** A `LibraryConditionAndBlock`
+holds `ConditionAttributes` children with no ids of their own, so there is no
+reference to remap — the UUID problem in the table above is about *rules*
+referencing the library, which is the policy set slice's problem, not this one.
+
+**A device group pulls in its ancestors.** Names are paths
+(`Device Type#All Device Types#Router`), and a selected child creates every
+missing ancestor whether or not it was selected, shallowest first. Each implicit
+parent is its own create item in the report, with the reason naming the child
+that required it, so nothing appears on the target unexplained. Custom roots
+(`DNAC#DNAC Devices` on the source) are ordinary objects; ISE's own roots are
+factory and skip.
+
+**Unresolvable references are decided per kind**, and the difference is whether
+waiting fixes anything:
+
+| Missing on the target | Verdict |
+|---|---|
+| Identity store (AD join point, certificate profile) | **Blocked**, naming the store — joining the domain and re-running fixes it |
+| Dictionary named by an `advancedAttributes` entry | **Blocked**, naming the dictionary — it appears with the domain join |
+| Portal named by a web redirection | **Created without the redirect**, reported |
+
+The portal case is the odd one out because the operator judged a guest profile
+without its redirect to be worth having, and because **ISE cannot enumerate
+portals either**: `GET /ers/config/portal` answers HTTP 500 on 3.4, "Operation
+search PORTAL failed". Pre-flight therefore cannot know whether the portal
+exists, so the profile is attempted **with** its redirect and, if ISE refuses it,
+retried once without — the same shape as the trusted certificate's comma-in-a
+-description retry. What was dropped goes in the report.
+
+Verified read shapes, all off the source on 2026-08-10: ERS root keys
+`NetworkDeviceGroup`, `DownloadableAcl`, `IdStoreSequence`,
+`AuthorizationProfile`; a dACL is `name`, `description`, `dacl` (the ACL text)
+and `daclType`; a device group is `name`, `description` and `othername` (its
+root); an identity source sequence names its stores **by name** in
+`idSeqItem[].idstore` with an `order`, plus `certificateAuthenticationProfile`
+and `breakOnStoreFail`, so no UUID remap is needed for this family either; an
+authorization profile's fields across all 26 readable ones are `accessType`,
+`advancedAttributes`, `agentlessPosture`, `authzProfileType`, `daclName`,
+`description`, `easywiredSessionCandidate`, `interfaceTemplate`, `name`,
+`profileName`, `serviceTemplate`, `trackMovement`, `vlan`,
+`voiceDomainPermission` and `webRedirection`.
+
+**The write shapes are not verified.** A create body here is the read body minus
+`id` and `link`, which is the pattern the endpoint slice already runs on, but no
+policy element has been posted to a real deployment. Proving it any earlier would
+mean writing throwaway objects onto a real box outside the pre-flight gate.
 
 ---
 
@@ -845,9 +933,15 @@ Ordered by dependency, not by size.
    mapping, the portal tag behaviour, the derived export password and the
    restart-mid-import path are proven against the specification and the fake
    deployment only.
-6. **Policy elements** — network device groups, condition library, dACLs,
-   authorization profiles, identity source sequences. Introduces the factory
-   allowlist update mechanism.
+6. ~~Policy elements~~ — network device groups, dACLs, authorization profiles,
+   identity source sequences, conditions. Built on 2026-08-10 with the read
+   shapes taken off the source box first; see the section above. **Awaiting
+   hardware**: no policy element has been created on a real target, so every
+   POST body is still the read shape minus `id` and `link` rather than a proven
+   payload. The
+   factory allowlist update mechanism is **not** part of it — factory objects are
+   skipped with their content drift reported, and the update mechanism waits for
+   the policy set slice, where `Default` makes it necessary.
 7. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
 8. **Policy sets and rules** — the two-pass UUID remap. Most dependent on lab
    iteration; deliberately last.

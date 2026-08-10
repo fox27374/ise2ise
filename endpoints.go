@@ -20,6 +20,7 @@ const (
 	familyEndpoints      = "endpoints"
 	familyTrustedCerts   = "trustedCertificates"
 	familySystemCerts    = "systemCertificates"
+	familyPolicyElements = "policyElements"
 )
 
 // ISE paths and their ERS root keys.
@@ -32,6 +33,23 @@ const (
 	pathEndpointsAPI   = "/api/v1/endpoint"
 	pathSystemCertsAPI = "/api/v1/certs/system-certificate"
 	pathDeploymentNode = "/api/v1/deployment/node"
+
+	// Policy elements paths
+	pathNetworkDeviceGroups = "/ers/config/networkdevicegroup"
+	rootNetworkDeviceGroup  = "NetworkDeviceGroup"
+	pathDownloadableACLs    = "/ers/config/downloadableacl"
+	rootDownloadableACL     = "DownloadableAcl"
+	pathAuthProfiles        = "/ers/config/authorizationprofile"
+	rootAuthProfile         = "AuthorizationProfile"
+	pathAuthProfilesAPI     = "/api/v1/policy/network-access/authorization-profiles"
+	pathIdStoreSequences    = "/ers/config/idstoresequence"
+	rootIdStoreSequence     = "IdStoreSequence"
+	pathConditions          = "/api/v1/policy/network-access/condition"
+	pathTimeConditions      = "/api/v1/policy/network-access/time-condition"
+	pathNetworkConditions   = "/api/v1/policy/network-access/network-condition"
+	pathDictionaries        = "/api/v1/policy/network-access/dictionaries"
+	pathActiveDirectory     = "/ers/config/activedirectory"
+	pathCertificateProfile  = "/ers/config/certificateprofile"
 )
 
 // openAPIOnlyEndpointFields are fields the OpenAPI endpoint resource returns and
@@ -589,6 +607,7 @@ func Preflight(c *Client, b *Bundle, selectedNodes []string) (*PreflightReport, 
 
 	preflightTrustedCerts(c, b, r)
 	preflightSystemCerts(c, b, r, selectedNodes)
+	preflightPolicyElements(c, b, r)
 
 	groupIDByName, err := stubsByName(c, pathEndpointGroups)
 	if err != nil {
@@ -1430,56 +1449,60 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 			endpoints++
 		}
 	}
-	if endpoints == 0 {
-		return res, nil
-	}
+	if endpoints > 0 {
+		// Groups just created have brand-new target UUIDs, so the name -> UUID map
+		// has to be read back after the group pass.
+		groupIDByName, err := stubsByName(c, pathEndpointGroups)
+		if err != nil {
+			return res, fmt.Errorf("re-reading the target's endpoint identity groups: %w", err)
+		}
+		profileIDByName, err := stubsByName(c, pathProfiles)
+		if err != nil {
+			return res, fmt.Errorf("re-reading the target's profiler profiles: %w", err)
+		}
 
-	// Groups just created have brand-new target UUIDs, so the name -> UUID map
-	// has to be read back after the group pass.
-	groupIDByName, err := stubsByName(c, pathEndpointGroups)
-	if err != nil {
-		return res, fmt.Errorf("re-reading the target's endpoint identity groups: %w", err)
-	}
-	profileIDByName, err := stubsByName(c, pathProfiles)
-	if err != nil {
-		return res, fmt.Errorf("re-reading the target's profiler profiles: %w", err)
-	}
-
-	done := 0
-	for _, it := range r.Items {
-		if it.Family != familyEndpoints || it.Action != actionCreate {
-			continue
-		}
-		done++
-		obj := maps.Clone(it.obj)
-		// Stripped here rather than on export so a bundle written before this
-		// was known imports too.
-		for _, f := range openAPIOnlyEndpointFields {
-			delete(obj, f)
-		}
-		if ok, why := nameToRef(obj, "groupName", "groupId", "endpoint identity group", groupIDByName); !ok {
-			res.Failed++
-			res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))
-			continue
-		}
-		if ok, why := nameToRef(obj, "profileName", "profileId", "profiler profile", profileIDByName); !ok {
-			res.Failed++
-			res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))
-			continue
-		}
-		if err := c.ersCreate(pathEndpoints, rootEndpoint, obj); err != nil {
-			if isDuplicate(err) {
-				res.Skipped++
+		done := 0
+		for _, it := range r.Items {
+			if it.Family != familyEndpoints || it.Action != actionCreate {
 				continue
 			}
-			res.Failed++
-			res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %v", it.Name, err))
-			continue
-		}
-		res.Created++
-		if done%25 == 0 || done == endpoints {
-			log("Endpoints: %d/%d processed.", done, endpoints)
+			done++
+			obj := maps.Clone(it.obj)
+			// Stripped here rather than on export so a bundle written before this
+			// was known imports too.
+			for _, f := range openAPIOnlyEndpointFields {
+				delete(obj, f)
+			}
+			if ok, why := nameToRef(obj, "groupName", "groupId", "endpoint identity group", groupIDByName); !ok {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))
+				continue
+			}
+			if ok, why := nameToRef(obj, "profileName", "profileId", "profiler profile", profileIDByName); !ok {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %s", it.Name, why))
+				continue
+			}
+			if err := c.ersCreate(pathEndpoints, rootEndpoint, obj); err != nil {
+				if isDuplicate(err) {
+					res.Skipped++
+					continue
+				}
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("endpoint %s: %v", it.Name, err))
+				continue
+			}
+			res.Created++
+			if done%25 == 0 || done == endpoints {
+				log("Endpoints: %d/%d processed.", done, endpoints)
+			}
 		}
 	}
+
+	// Policy elements
+	if err := applyPolicyElements(c, r, res, log); err != nil {
+		return res, err
+	}
+
 	return res, nil
 }

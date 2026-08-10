@@ -179,6 +179,8 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <span class="hint">Portable certificate authority, root and intermediate certificates.</span></label>
         <label><input type="checkbox" id="famSysCerts"> System certificates
           <span class="hint">Node identity certificates with private keys. Operator selects which nodes to import on.</span></label>
+        <label><input type="checkbox" id="famPolicyElements"> Policy elements
+          <span class="hint">Network device groups, dACLs, authorization profiles, identity source sequences, and conditions.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Migrate these endpoint identity groups
@@ -603,6 +605,9 @@ $("famSysCerts").addEventListener("change", () => {
   $("expSysCertsWrap").classList.toggle("hidden", !$("famSysCerts").checked);
   if ($("famSysCerts").checked) loadSystemCerts();
 });
+$("famPolicyElements").addEventListener("change", () => {
+  // Policy elements have no picker, they're all-or-nothing
+});
 
 $("expGo").addEventListener("click", async () => {
   hide($("expError"));
@@ -612,6 +617,7 @@ $("expGo").addEventListener("click", async () => {
   if ($("famEndpoints").checked) families.push("endpoints");
   if ($("famCerts").checked) families.push("trustedCertificates");
   if ($("famSysCerts").checked) families.push("systemCertificates");
+  if ($("famPolicyElements").checked) families.push("policyElements");
   if (!families.length) return showErr($("expError"), "Select at least one object family.");
   const phrase = $("expPhrase").value;
   if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");

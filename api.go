@@ -519,6 +519,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		s.fail("%v", err)
 		return
 	}
+	if err := ExportPolicyElements(c, b, in.Families, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
 
 	sealed, err := SealBundle(b, in.Passphrase)
 	if err != nil {

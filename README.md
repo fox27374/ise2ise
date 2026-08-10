@@ -153,6 +153,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | Static endpoints | Only in the groups you select, only static assignments, identified by MAC. |
 | Trusted certificates | The ones you select. Internal CA and per-node self-signed certificates are excluded for you. See below. |
 | System certificates | The ones you select, with their private keys, onto the target nodes you select. See below. |
+| Policy elements | Network device groups, dACLs, authorization profiles, identity source sequences and conditions, all of them. See below. |
 
 ### Trusted certificates
 
@@ -254,6 +255,44 @@ built, including the export ZIP's layout, but **no certificate has yet been
 imported onto a real node** — the role mapping, the portal tag behaviour and the
 restart path are proven against the specification and the fake deployment only.
 
+### Policy elements
+
+One checkbox carries five families: network device groups, dACLs, authorization
+profiles, identity source sequences and conditions. There is no per-object
+picker — unlike certificates, nothing here is dangerous or pointless to carry,
+and what the target already has is skipped.
+
+- **Nothing is ever overwritten, including ISE's own objects.** A name the target
+  already has is skipped. But the pre-flight compares the two copies and, when
+  they differ, names the fields: `already exists on the target and DIFFERS from
+  the source in dacl; not changed`. That is how a customised `PERMIT_ALL_IPV4_TRAFFIC`
+  or a reordered `All_User_ID_Stores` shows up instead of quietly staying at the
+  target's version.
+- **Device groups pull in their parents.** ISE stores the hierarchy in the name
+  (`Device Type#All Device Types#Router`), so a group you carry creates any
+  missing ancestor, each listed in the report with the child that required it.
+- **A missing reference blocks, except a portal.** An identity source sequence
+  naming a store the target lacks, or an authorization profile reading from a
+  dictionary it lacks, is blocked with the missing thing named — both usually
+  mean "join the domain on the target first, then re-run". A profile whose web
+  redirection names a portal the target lacks is **created without the redirect**
+  and the report says so; portals are not migrated by this tool.
+- **Two of ISE 3.4's own reads are broken, and you will see it.** Listing
+  authorization profiles answers HTTP 500 with a conversion exception on
+  `cisco-av-pair`, so the tool reads them one at a time instead. A profile
+  holding a web redirection can fail that read too — ISE cannot deserialise its
+  own object — and such a profile is **not exported**: it is named in the report,
+  with ISE's error, for you to recreate by hand. On the lab source that is one
+  profile out of 27.
+
+Conditions travel from the network-access tree only, all three kinds (library,
+time, network). Device admin policy is never migrated, so its conditions are not
+either.
+
+This slice has **not been run against real hardware**. Every read shape was taken
+off a real 3.4 deployment before it was written, but no policy element has been
+created on a real target yet.
+
 ## Running
 
 Prebuilt binaries are attached to each release —
@@ -333,11 +372,6 @@ git tag v0.3.0 && git push origin v0.3.0
 Everything below is a later slice. None of it exists in the binary today, not
 even as a stub:
 
-- Network device groups
-- Condition library
-- dACLs
-- Authorization profiles
-- Identity source sequences
 - Full TrustSec: SGTs, SGACLs, egress matrix
 - Policy sets and rules, with UUID remapping
 - AD join point configuration and `addGroups`
