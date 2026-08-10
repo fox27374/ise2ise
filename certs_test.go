@@ -672,3 +672,33 @@ func (f *fakeISE) addTrustedCert(id, friendlyName string, cert *x509.Certificate
 
 	return obj
 }
+
+func TestCertPassword(t *testing.T) {
+	// Test that certPassword produces alphanumeric, stable output of correct length
+	passphrase := "my-secret-passphrase-12345"
+	pwd := certPassword(passphrase)
+
+	// Must be alphanumeric
+	for _, c := range pwd {
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			t.Errorf("certPassword contains non-alphanumeric character: %c", c)
+		}
+	}
+
+	// Must be 32 characters
+	if len(pwd) != 32 {
+		t.Errorf("certPassword length = %d, want 32", len(pwd))
+	}
+
+	// Must be stable (same input -> same output)
+	pwd2 := certPassword(passphrase)
+	if pwd != pwd2 {
+		t.Errorf("certPassword not stable: got %q then %q", pwd, pwd2)
+	}
+
+	// Different passphrase -> different password
+	pwd3 := certPassword("different-passphrase")
+	if pwd == pwd3 {
+		t.Errorf("certPassword should differ for different passphrases, got %q for both", pwd)
+	}
+}

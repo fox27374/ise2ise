@@ -172,6 +172,8 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             regenerates them.</span></label>
         <label><input type="checkbox" id="famCerts"> Trusted certificates
           <span class="hint">Portable certificate authority, root and intermediate certificates.</span></label>
+        <label><input type="checkbox" id="famSysCerts"> System certificates
+          <span class="hint">Node identity certificates with private keys. Operator selects which nodes to import on.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Migrate these endpoint identity groups
@@ -192,6 +194,18 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <button type="button" class="link" id="expSelNoneCerts">select none</button>
         </div>
         <div class="picker" id="expCerts">Loading certificates…</div>
+      </div>
+      <div id="expSysCertsWrap" style="margin-top:1rem" class="hidden">
+        <label>Export these system certificates
+          <span class="hint">Disabled when expired. Ticked by default for wildcard or multi-SAN certificates.</span></label>
+        <div style="margin-bottom:.5rem">
+          <button type="button" class="link" id="expSelAllSysCerts">select all</button> ·
+          <button type="button" class="link" id="expSelNoneSysCerts">select none</button>
+        </div>
+        <table style="width:100%; font-size:.88rem">
+          <thead><tr><th></th><th>Name</th><th>Subject</th><th>SANs</th><th>Roles</th><th>Expires</th></tr></thead>
+          <tbody id="expSysCerts">Loading certificates…</tbody>
+        </table>
       </div>
     </section>
 
@@ -251,8 +265,28 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
     <div id="impError" class="err hidden"></div>
 
+    <section id="impSysCertsSec" class="hidden">
+      <h2>3. System certificate options</h2>
+      <div id="impNodePicker" style="margin-bottom:1rem">
+        <label>Target nodes to import on
+          <span class="hint">System certificates are per-node. Select which Admin nodes to create certificates on.</span></label>
+        <div style="margin-bottom:.5rem">
+          <button type="button" class="link" id="impSelAllNodes">select all</button> ·
+          <button type="button" class="link" id="impSelNoneNodes">select none</button>
+        </div>
+        <div class="picker" id="impNodes">Loading nodes…</div>
+      </div>
+      <label><input type="checkbox" id="impAdminRole"> Import with admin role
+        <span class="hint" style="color: var(--warn-fg)">WARNING: Taking over the admin certificate restarts the node's application and replaces the GUI certificate. Only check this after testing thoroughly.</span></label>
+      <div id="impZipPassSec" class="hidden" style="margin-top:1rem">
+        <div class="field"><label for="impZipPass">ZIP password
+          <span class="hint">Password used to encrypt the GUI-exported system certificate.</span></label>
+          <input type="password" id="impZipPass" autocomplete="off"></div>
+      </div>
+    </section>
+
     <section id="impPre" class="hidden">
-      <h2>3. Pre-flight</h2>
+      <h2>Pre-flight</h2>
       <div id="impPreBody"></div>
       <button id="impGo">Confirm and import</button>
       <button class="secondary" id="impCancel">Cancel</button>
@@ -501,13 +535,39 @@ async function loadCerts() {
   }
 }
 
+async function loadSystemCerts() {
+  $("expSysCerts").innerHTML = '<tr><td colspan="6">Loading certificates…</td></tr>';
+  try {
+    const data = await postJSON("/api/system-certs", expCreds);
+    const cs = data.certs || [];
+    if (!cs.length) { $("expSysCerts").innerHTML = '<tr><td colspan="6">This deployment has no system certificates.</td></tr>'; return; }
+    $("expSysCerts").innerHTML = cs.map(c => {
+      const sanStr = (c.sans || []).join(", ");
+      const roleStr = (c.roles || []).join(", ");
+      let expStr = c.expiresAt ? new Date(c.expiresAt).toLocaleDateString() : "";
+      if (c.disabled) expStr = '<span style="color: var(--danger-fg)">' + esc(c.reason) + '</span>';
+      return '<tr><td><input type="checkbox" class="syscert" value="' + esc(c.fingerprint) + '"' + (c.disabled ? ' disabled' : c.ticked ? ' checked' : '') + '></td>' +
+        '<td>' + esc(c.name) + '</td>' +
+        '<td class="mono" style="font-size:.8rem">' + esc(c.subject || '') + '</td>' +
+        '<td style="font-size:.85rem">' + esc(sanStr) + '</td>' +
+        '<td style="font-size:.85rem">' + esc(roleStr) + '</td>' +
+        '<td>' + expStr + '</td></tr>';
+    }).join("");
+  } catch (err) {
+    $("expSysCerts").innerHTML = '<tr><td colspan="6" style="color: var(--danger-fg)">Could not list certificates: ' + esc(err.message) + '</td></tr>';
+  }
+}
+
 const eachGroup = fn => document.querySelectorAll("#expGroups .grp").forEach(fn);
 const eachCert = fn => document.querySelectorAll("#expCerts .cert").forEach(fn);
+const eachSysCert = fn => document.querySelectorAll("#expSysCerts .syscert").forEach(fn);
 $("expSelAll").addEventListener("click", () => eachGroup(c => c.checked = true));
 $("expSelNone").addEventListener("click", () => eachGroup(c => c.checked = false));
 $("expSelUsed").addEventListener("click", () => eachGroup(c => c.checked = parseInt(c.dataset.used) > 0));
 $("expSelAllCerts").addEventListener("click", () => eachCert(c => { if (!c.disabled) c.checked = true; }));
 $("expSelNoneCerts").addEventListener("click", () => eachCert(c => c.checked = false));
+$("expSelAllSysCerts").addEventListener("click", () => eachSysCert(c => { if (!c.disabled) c.checked = true; }));
+$("expSelNoneSysCerts").addEventListener("click", () => eachSysCert(c => c.checked = false));
 
 function updateGroupsWrapVisibility() {
   $("expGroupsWrap").classList.toggle("hidden", !($("famGroups").checked || $("famEndpoints").checked));
@@ -519,37 +579,44 @@ $("famCerts").addEventListener("change", () => {
   $("expCertsWrap").classList.toggle("hidden", !$("famCerts").checked);
   if ($("famCerts").checked) loadCerts();
 });
+$("famSysCerts").addEventListener("change", () => {
+  $("expSysCertsWrap").classList.toggle("hidden", !$("famSysCerts").checked);
+  if ($("famSysCerts").checked) loadSystemCerts();
+});
 
 $("expGo").addEventListener("click", async () => {
   hide($("expError"));
   $("expResult").innerHTML = "";
   const families = [];
-  if ($("famGroups").checked) families.push("endpointGroups");
-  if ($("famEndpoints").checked) families.push("endpoints");
-  if ($("famCerts").checked) families.push("trustedCertificates");
-  if (!families.length) return showErr($("expError"), "Select at least one object family.");
-  const phrase = $("expPhrase").value;
-  if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");
-  if (phrase !== $("expPhrase2").value) return showErr($("expError"), "The two passphrases do not match.");
+  if ($(“famGroups”).checked) families.push(“endpointGroups”);
+  if ($(“famEndpoints”).checked) families.push(“endpoints”);
+  if ($(“famCerts”).checked) families.push(“trustedCertificates”);
+  if ($(“famSysCerts”).checked) families.push(“systemCertificates”);
+  if (!families.length) return showErr($(“expError”), “Select at least one object family.”);
+  const phrase = $(“expPhrase”).value;
+  if (phrase.length < 12) return showErr($(“expError”), “The bundle passphrase must be at least 12 characters.”);
+  if (phrase !== $(“expPhrase2”).value) return showErr($(“expError”), “The two passphrases do not match.”);
   const groups = [];
   eachGroup(c => { if (c.checked) groups.push(c.value); });
-  if (($("famGroups").checked || $("famEndpoints").checked) && !groups.length) {
-    return showErr($("expError"), "Select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints.");
+  if (($(“famGroups”).checked || $(“famEndpoints”).checked) && !groups.length) {
+    return showErr($(“expError”), “Select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints.”);
   }
   const certs = [];
   eachCert(c => { if (c.checked) certs.push(c.value); });
-  if ($("famCerts").checked && !certs.length) {
-    return showErr($("expError"), "Select at least one trusted certificate, or untick “Trusted certificates”.");
+  if ($(“famCerts”).checked && !certs.length) {
+    return showErr($(“expError”), “Select at least one trusted certificate, or untick “Trusted certificates”.”);
   }
+  const systemCerts = [];
+  eachSysCert(c => { if (c.checked) systemCerts.push(c.value); });
 
-  $("expGo").disabled = true;
-  $("expGo").textContent = "Exporting…";
-  $("expLog").textContent = "";
-  $("expProgress").classList.remove("hidden");
+  $(“expGo”).disabled = true;
+  $(“expGo”).textContent = “Exporting…”;
+  $(“expLog”).textContent = “”;
+  $(“expProgress”).classList.remove(“hidden”);
   try {
-    const res = await fetch("/api/export", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, certs, passphrase: phrase })),
+    const res = await fetch(“/api/export”, {
+      method: “POST”, headers: { “Content-Type”: “application/json” },
+      body: JSON.stringify(Object.assign({}, expCreds, { families, groups, certs, systemCerts, passphrase: phrase })),
     });
     await readStream(res, m => {
       if (m.type === "log") logLine($("expLog"), m.msg);
@@ -599,6 +666,11 @@ function importForm(confirm) {
   fd.append("bundle", $("impFile").files[0]);
   fd.append("passphrase", $("impPhrase").value);
   if (confirm) fd.append("confirm", "yes");
+  const nodes = [];
+  eachNode(c => { if (c.checked) nodes.push(c.value); });
+  if (nodes.length) fd.append("selectedNodes", JSON.stringify(nodes));
+  if ($("impAdminRole").checked) fd.append("adminRole", "yes");
+  if ($("impZipPass").value) fd.append("zipPassword", $("impZipPass").value);
   return fd;
 }
 
@@ -678,9 +750,28 @@ function renderPreflight(data) {
       p.notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul></details></div>";
   }
   $("impPreBody").innerHTML = h;
+
+  // Show system certificates section if bundle has system certs
+  const hasSysCerts = p.items.some(it => it.family === "systemCertificates");
+  $("impSysCertsSec").classList.toggle("hidden", !hasSysCerts);
+  if (hasSysCerts) {
+    renderTargetNodes(data.probe);
+    const hasZipSource = p.items.some(it => it.family === "systemCertificates" && it.obj && it.obj.keySource === "zip");
+    $("impZipPassSec").classList.toggle("hidden", !hasZipSource);
+  }
+
   $("impGo").disabled = p.create === 0;
   $("impGo").textContent = p.create === 0 ? "Nothing to create" : "Confirm and create " + p.create + " objects";
 }
+
+function renderTargetNodes(probe) {
+  const nodes = (probe.nodes || []).map(n => '<label><input type="checkbox" class="impnode" value="' + esc(n) + '" checked> ' + esc(n) + '</label>').join("");
+  $("impNodes").innerHTML = nodes || "No Admin nodes available";
+}
+
+const eachNode = fn => document.querySelectorAll("#impNodes .impnode").forEach(fn);
+$("impSelAllNodes").addEventListener("click", () => eachNode(c => c.checked = true));
+$("impSelNoneNodes").addEventListener("click", () => eachNode(c => c.checked = false));
 
 $("impCancel").addEventListener("click", () => { hide($("impPre")); });
 
