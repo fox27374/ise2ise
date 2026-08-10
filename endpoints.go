@@ -1358,25 +1358,31 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 			adminRoleValue := bundleAdminRole && adminRole
 
 			payload := map[string]any{
-				"data":                             pemData,
-				"privateKeyData":                   keyBlob,
-				"allowReplacementOfCertificates":   false,
-				"allowReplacementOfPortalGroupTag": false,
-				"allowRoleTransferForSameSubject":  false,
-				"allowOutOfDateCert":               false,
-				"allowSHA1Certificates":            false,
-				"validateCertificateExtensions":    false,
-				"allowExtendedValidity":            true,
-				"allowWildCardCertificates":        isWildcard,
-				"name":                             name,
-				"admin":                            adminRoleValue,
-				"eap":                              truthy(obj, "eap"),
-				"radius":                           truthy(obj, "radius"),
-				"tacacs":                           truthy(obj, "tacacs"),
-				"pxgrid":                           truthy(obj, "pxgrid"),
-				"ims":                              truthy(obj, "ims"),
-				"saml":                             truthy(obj, "saml"),
-				"portal":                           truthy(obj, "portal"),
+				"data":           pemData,
+				"privateKeyData": keyBlob,
+				// ISE's schema marks seven of these required and refuses the whole
+				// import with "…, must not be null" if one is absent — verified on
+				// 3.4, which rejected the write for a missing
+				// allowPortalTagTransferForSameSubject. The three that would
+				// overwrite something a node may be serving are always false.
+				"allowReplacementOfCertificates":       false,
+				"allowReplacementOfPortalGroupTag":     false,
+				"allowRoleTransferForSameSubject":      false,
+				"allowPortalTagTransferForSameSubject": false,
+				"allowOutOfDateCert":                   false,
+				"allowSHA1Certificates":                false,
+				"validateCertificateExtensions":        false,
+				"allowExtendedValidity":                true,
+				"allowWildCardCertificates":            isWildcard,
+				"name":                                 name,
+				"admin":                                adminRoleValue,
+				"eap":                                  truthy(obj, "eap"),
+				"radius":                               truthy(obj, "radius"),
+				"tacacs":                               truthy(obj, "tacacs"),
+				"pxgrid":                               truthy(obj, "pxgrid"),
+				"ims":                                  truthy(obj, "ims"),
+				"saml":                                 truthy(obj, "saml"),
+				"portal":                               truthy(obj, "portal"),
 			}
 
 			if password != "" {

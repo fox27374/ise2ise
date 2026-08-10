@@ -401,6 +401,12 @@ holding `<sanitised-name>.pem` (the certificate) and, with
 `-----BEGIN ENCRYPTED PRIVATE KEY-----` block. `CERTIFICATE` alone needs no
 password and yields the `.pem` only.
 
+**Every required boolean must be present, or nothing is written.** ISE's
+`SystemCert` schema marks seven of them required and refuses the whole import
+with `"allowPortalTagTransferForSameSubject, must not be null"` when one is
+absent — which is exactly how the first real import failed, on both nodes, after
+the trusted CA had already been created. Absent is not the same as false here.
+
 **The private key is never opened.** The `.pvk` text travels into the bundle as
 an opaque blob and goes back to ISE as `privateKeyData` with the derived
 password. The tool holds no plaintext key at any point, and the key is wrapped
@@ -955,13 +961,15 @@ Ordered by dependency, not by size.
    contents cannot exercise — a static *profile* assignment, an expired
    certificate, a comma in a description, OpenAPI switched off. Everything
    structural is now proven on hardware.
-5. ~~System certificates~~ — built on 2026-08-10, with its API surface read off
-   the source box before any code was written; see the section above.
-   **Awaiting hardware**: no certificate has been imported onto a real node, and
-   the lab holds no wildcard or multi-SAN certificate to try it with, so the role
-   mapping, the portal tag behaviour, the derived export password and the
-   restart-mid-import path are proven against the specification and the fake
-   deployment only.
+5. ~~System certificates~~ — built and then **proven against real hardware on
+   2026-08-10**. A multi-SAN certificate (`CN=ise.ntslab.loc`, five DNS SANs,
+   issued by NTSLAB Vault CA) was exported from `ise.ntslab.loc` with its private
+   key, its issuing CA travelled in the same bundle, and both were created on the
+   two-node target — `EAP Authentication, RADIUS DTLS` on ISE-178 and ISE-179,
+   the portal role dropped because the tag was held, admin off, and a re-run
+   creating nothing. Four defects only hardware could show are recorded above.
+   Still unexercised: the admin role actually being taken, the GUI-ZIP path, and
+   a node restarting mid-import.
 6. ~~Policy elements~~ — network device groups, dACLs, authorization profiles,
    identity source sequences, conditions. Built on 2026-08-10 with the read
    shapes taken off the source box first; see the section above. **Awaiting
