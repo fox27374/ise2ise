@@ -154,6 +154,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | Trusted certificates | The ones you select. Internal CA and per-node self-signed certificates are excluded for you. See below. |
 | System certificates | The ones you select, with their private keys, onto the target nodes you select. See below. |
 | Policy elements | Network device groups, dACLs, authorization profiles, identity source sequences and conditions, all of them. See below. |
+| Policy sets and rules | The sets with their authentication and authorization rules. They arrive **disabled**. See below. |
 
 ### Trusted certificates
 
@@ -304,6 +305,38 @@ This slice has **not been run against real hardware**. Every read shape was take
 off a real 3.4 deployment before it was written, but no policy element has been
 created on a real target yet.
 
+### Policy sets and rules
+
+Ticking this also ticks policy elements, and locks it: nearly every rule names an
+authorization profile or an identity source sequence, so a sets-only bundle is
+one whose rules cannot resolve.
+
+**Everything imported arrives disabled.** A migration cannot change how the
+target treats traffic until you enable it deliberately — and it means the sets
+that came from the migration are exactly the ones switched off. One checkbox on
+the import step carries the source's own state instead, for a live cutover.
+
+- **Rank is appended, never reused.** Imported sets land after everything the
+  target already has, in their source order, and always above the target's
+  `Default`. Rules do the same inside their set. Your existing evaluation order
+  is not rearranged.
+- **`Default` is the one set whose rules are merged.** It exists on every
+  deployment and cannot be created, so the set is skipped and its rules are added
+  beside the target's own — a rule name the target already has is left alone.
+- **Any other name clash is imported beside it** as `Guest (imported)`, then
+  `(imported 2)`. The target's set is never touched or merged into. Imported sets
+  carry the same `[ise2ise …]` description marker as policy elements, which is
+  how a re-run recognises its own work and writes nothing.
+- **A reference the target cannot resolve blocks the whole set**, nothing from it
+  written, with a note naming what is missing. A set that landed without one of
+  its rules would still match the traffic and then treat it differently than the
+  source did. In practice this means SGTs (TrustSec is not migrated yet),
+  certificate authentication profiles, and AD join points — join the domain on
+  the target and re-run.
+
+Per-set exceptions, global exceptions and MFA rules are not carried; a bundle
+whose source had them gets a note per set.
+
 ## Running
 
 Prebuilt binaries are attached to each release —
@@ -384,7 +417,6 @@ Everything below is a later slice. None of it exists in the binary today, not
 even as a stub:
 
 - Full TrustSec: SGTs, SGACLs, egress matrix
-- Policy sets and rules, with UUID remapping
 - AD join point configuration and `addGroups`
 - Network device CSV → API import
 
