@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"maps"
@@ -17,6 +19,7 @@ const (
 	familyEndpointGroups = "endpointGroups"
 	familyEndpoints      = "endpoints"
 	familyTrustedCerts   = "trustedCertificates"
+	familySystemCerts    = "systemCertificates"
 )
 
 // ISE paths and their ERS root keys.
@@ -27,6 +30,8 @@ const (
 	rootEndpoint       = "ERSEndPoint"
 	pathProfiles       = "/ers/config/profilerprofile"
 	pathEndpointsAPI   = "/api/v1/endpoint"
+	pathSystemCertsAPI = "/api/v1/certs/system-certificate"
+	pathDeploymentNode = "/api/v1/deployment/node"
 )
 
 // openAPIOnlyEndpointFields are fields the OpenAPI endpoint resource returns and
@@ -535,13 +540,30 @@ type PreflightItem struct {
 	obj map[string]any // the object to create; not serialised to the UI
 }
 
+// TargetNode is one node of the *target* deployment, as the import step offers
+// it. The import API carries no node field at all — a certificate lands on
+// whichever node's URL received the POST — so covering a deployment means
+// dialling each node in turn, and only an Admin-persona node serves the API.
+//
+// The bundle's own sourceNode records which node a certificate was read *from*
+// and has no bearing on where it is written.
+type TargetNode struct {
+	Hostname   string   `json:"hostname"`
+	Address    string   `json:"address"`
+	Roles      []string `json:"roles"`
+	Selectable bool     `json:"selectable"`
+	Selected   bool     `json:"selected"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
 type PreflightReport struct {
-	Source  BundleSource    `json:"source"`
-	Items   []PreflightItem `json:"items"`
-	Create  int             `json:"create"`
-	Skip    int             `json:"skip"`
-	Blocked int             `json:"blocked"`
-	Notes   []string        `json:"notes"`
+	Source      BundleSource    `json:"source"`
+	Items       []PreflightItem `json:"items"`
+	Create      int             `json:"create"`
+	Skip        int             `json:"skip"`
+	Blocked     int             `json:"blocked"`
+	Notes       []string        `json:"notes"`
+	TargetNodes []TargetNode    `json:"targetNodes"`
 }
 
 func (r *PreflightReport) add(it PreflightItem) {
@@ -559,10 +581,14 @@ func (r *PreflightReport) add(it PreflightItem) {
 // Preflight resolves every cross-reference in the bundle against the target and
 // reports what would happen. It writes nothing. Import is not allowed to touch
 // the target until an operator has seen this and confirmed.
-func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
+//
+// selectedNodes names the target nodes system certificates are to be written
+// to; empty means every eligible node, which is what the report offers first.
+func Preflight(c *Client, b *Bundle, selectedNodes []string) (*PreflightReport, error) {
 	r := &PreflightReport{Source: b.Source, Items: []PreflightItem{}, Notes: append([]string{}, b.Notes...)}
 
 	preflightTrustedCerts(c, b, r)
+	preflightSystemCerts(c, b, r, selectedNodes)
 
 	groupIDByName, err := stubsByName(c, pathEndpointGroups)
 	if err != nil {
@@ -625,6 +651,297 @@ func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
 	}
 
 	return r, nil
+}
+
+// normalizeDN normalizes an X.500 distinguished name for comparison.
+// Splits on comma, trims each key=value pair, lowercases, and sorts to handle different orderings.
+func normalizeDN(dn string) string {
+	if dn == "" {
+		return ""
+	}
+	parts := strings.Split(dn, ",")
+	var normalized []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			normalized = append(normalized, strings.ToLower(part))
+		}
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, ",")
+}
+
+// parseRolesFromArray extracts roles from a []any array as returned by the API.
+func parseRolesFromArray(v any) []string {
+	var result []string
+	if roleArray, ok := v.([]any); ok {
+		for _, roleItem := range roleArray {
+			if roleStr, ok := roleItem.(string); ok && roleStr != "" {
+				result = append(result, roleStr)
+			}
+		}
+	}
+	return result
+}
+
+// preflightSystemCerts resolves the system certificate family. selected names
+// the target nodes the operator ticked; empty means every eligible node, which
+// is the default the UI opens with.
+func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport, selected []string) {
+	sysCerts := b.Objects[familySystemCerts]
+	if len(sysCerts) == 0 {
+		return
+	}
+
+	// Read target's deployment nodes. Without them the tool can still write to
+	// the node this import is already connected to; it just cannot offer the
+	// others. Losing the family silently is the one thing that must not happen.
+	deploymentNodes, err := c.openAPIList(pathDeploymentNode)
+	if err != nil {
+		r.Notes = append(r.Notes, fmt.Sprintf("System certificates: the target's node list (%s) could not be read, so only %s is offered: %v", pathDeploymentNode, c.Host, err))
+		deploymentNodes = []map[string]any{{
+			"hostname": c.Host, "ipAddress": c.Host,
+			"roles": []any{"PrimaryAdmin"}, "nodeStatus": "Connected",
+		}}
+	}
+
+	want := map[string]bool{}
+	for _, s := range selected {
+		want[strings.ToLower(strings.TrimSpace(s))] = true
+	}
+
+	// Build list of target nodes eligible for system certificate import:
+	// Admin role and Connected status
+	targetByNode := map[string][]map[string]any{}
+	nodeReadable := map[string]bool{}
+	nodeUnreadable := map[string]error{}
+	var targetNodes []TargetNode
+	for _, node := range deploymentNodes {
+		hostname := str(node, "hostname")
+		address := str(node, "ipAddress")
+		if hostname == "" || address == "" {
+			continue
+		}
+
+		// Check for Admin role and Connected status
+		hasAdminRole := false
+		roles := node["roles"]
+		if roleArray, ok := roles.([]any); ok {
+			for _, roleItem := range roleArray {
+				if roleStr, ok := roleItem.(string); ok && strings.Contains(roleStr, "Admin") {
+					hasAdminRole = true
+					break
+				}
+			}
+		}
+
+		nodeStatus := str(node, "nodeStatus")
+		isConnected := nodeStatus == "Connected"
+
+		// Fetch this node's system certificates. A node with an empty store is
+		// perfectly normal and is not the same thing as a node that would not
+		// answer, so the two are tracked apart.
+		if certs, err := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, hostname)); err == nil {
+			targetByNode[hostname] = certs
+			nodeReadable[hostname] = true
+		} else {
+			nodeUnreadable[hostname] = err
+		}
+
+		tn := TargetNode{
+			Hostname:   hostname,
+			Address:    address,
+			Roles:      parseRolesFromArray(roles),
+			Selectable: hasAdminRole && isConnected,
+		}
+		if !tn.Selectable {
+			if !hasAdminRole {
+				tn.Reason = "no admin API on this node"
+			} else if !isConnected {
+				tn.Reason = "the deployment reports this node as " + nodeStatus
+			}
+		}
+		// An empty selection means the default: every eligible node.
+		tn.Selected = tn.Selectable && (len(want) == 0 || want[strings.ToLower(hostname)])
+		targetNodes = append(targetNodes, tn)
+	}
+	r.TargetNodes = targetNodes
+
+	if !slices.ContainsFunc(targetNodes, func(tn TargetNode) bool { return tn.Selected }) {
+		r.add(PreflightItem{Family: familySystemCerts, Name: "system certificates", Action: actionBlocked,
+			Reason: "no target node is selected; the import API carries no node field, so a certificate can only be written by dialling a node directly"})
+		return
+	}
+
+	// Fetch target's trusted certificates to validate issuer chains.
+	// Build a map of subject DNs that will exist (for issuer validation).
+	trustedCerts, _ := fetchTrustedCertsOpenAPI(c)
+	willExistTrusted := map[string]bool{}
+
+	// Add issuer subjects from the bundle's own trusted certs
+	for _, tc := range b.Objects[familyTrustedCerts] {
+		// Extract subject DN from the bundled certificate's PEM if available
+		if pemData := str(tc, "pem"); pemData != "" {
+			if block, _ := pem.Decode([]byte(pemData)); block != nil {
+				if parsedCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					willExistTrusted[normalizeDN(parsedCert.Subject.String())] = true
+				}
+			}
+		}
+		// Also use the subject field if present
+		if subject := str(tc, "subject"); subject != "" {
+			willExistTrusted[normalizeDN(subject)] = true
+		}
+	}
+
+	// Add subjects from the target's trusted certs
+	for _, tc := range trustedCerts {
+		if subject := str(tc, "subject"); subject != "" {
+			willExistTrusted[normalizeDN(subject)] = true
+		}
+	}
+
+	// Emit one pre-flight item per certificate per selectable target node.
+	// This makes counts honest: 3 certs × 2 nodes = 6 items.
+	for _, certObj := range sysCerts {
+		name := str(certObj, "name")
+		sourceNode := str(certObj, "sourceNode")
+		fp := str(certObj, "fingerprint")
+		pemData := str(certObj, "pem")
+		keyBlob := str(certObj, "keyBlob")
+		notAfter := str(certObj, "notAfter")
+		keySource := str(certObj, "keySource")
+
+		// First, do certificate-level checks that apply globally
+		var certBlockReason string
+
+		// Expired check
+		if notAfter != "" {
+			exp, err := time.Parse(time.RFC3339, notAfter)
+			if err != nil {
+				certBlockReason = fmt.Sprintf("certificate expiry %q is not a date this build understands", notAfter)
+			} else if exp.Before(time.Now()) {
+				certBlockReason = fmt.Sprintf("certificate expired on %s", exp.Format(time.RFC3339))
+			}
+		}
+
+		// Missing pem or keyBlob
+		if certBlockReason == "" && pemData == "" {
+			certBlockReason = "certificate has no PEM data"
+		}
+		if certBlockReason == "" && keyBlob == "" {
+			certBlockReason = "certificate has no private key"
+		}
+
+		// For API-exported certs, check issuer is on target (but skip for self-signed)
+		if certBlockReason == "" && keySource == "api" {
+			issuer := str(certObj, "issuer")
+			subject := str(certObj, "subject")
+			// Self-signed: issuer == subject, so no separate issuer needed
+			isSelfSigned := issuer != "" && issuer == subject
+			if issuer != "" && !isSelfSigned && !willExistTrusted[normalizeDN(issuer)] {
+				certBlockReason = fmt.Sprintf("issuer DN %q is not on the target; export the issuer certificate first", issuer)
+			}
+		}
+
+		// Now emit one item per selectable target node
+		fpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+
+		// If cert has a global block reason, emit one item with that reason (not per-node)
+		if certBlockReason != "" {
+			displayName := name
+			if sourceNode != "" {
+				displayName = name + " (from " + sourceNode + ")"
+			}
+			it := PreflightItem{
+				Family: familySystemCerts,
+				Name:   displayName,
+				Action: actionBlocked,
+				Reason: certBlockReason,
+				obj:    maps.Clone(certObj),
+			}
+			r.add(it)
+			continue
+		}
+
+		// Emit an item per selected target node. The node travels in the object,
+		// never in the display name: the name is a label for a human, and a
+		// certificate friendly name may contain anything at all.
+		for _, tn := range targetNodes {
+			if !tn.Selected {
+				continue
+			}
+
+			it := PreflightItem{
+				Family: familySystemCerts,
+				Name:   name + " -> " + tn.Hostname,
+				obj:    maps.Clone(certObj),
+			}
+			it.obj["targetNode"] = tn.Hostname
+			it.obj["targetAddress"] = tn.Address
+
+			if !nodeReadable[tn.Hostname] {
+				it.Action, it.Reason = actionBlocked, fmt.Sprintf("the system certificate store on %s could not be read: %v", tn.Hostname, nodeUnreadable[tn.Hostname])
+				r.add(it)
+				continue
+			}
+			targetCerts := targetByNode[tn.Hostname]
+
+			// Check for existing cert (by SHA-256)
+			var existing string
+			for _, target := range targetCerts {
+				if tfp := str(target, "sha256Fingerprint"); tfp != "" {
+					tfpNorm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(tfp, ":", ""), " ", ""))
+					if tfpNorm == fpNorm {
+						existing = str(target, "friendlyName")
+						break
+					}
+				}
+			}
+			if existing != "" {
+				it.Action, it.Reason = actionSkip, fmt.Sprintf("already exists on %s as %q", tn.Hostname, existing)
+				r.add(it)
+				continue
+			}
+
+			// Check for name collision
+			var nameCollision bool
+			for _, target := range targetCerts {
+				if str(target, "friendlyName") == name {
+					nameCollision = true
+					break
+				}
+			}
+			if nameCollision {
+				it.Action, it.Reason = actionBlocked, fmt.Sprintf("a different certificate on %s already uses this name; import never replaces", tn.Hostname)
+				r.add(it)
+				continue
+			}
+
+			// Check for portal group tag collision
+			portalTag := str(certObj, "portalGroupTag")
+			portalRoleSet := false
+			if portalTag != "" && truthy(certObj, "portal") {
+				for _, target := range targetCerts {
+					if tTag := str(target, "groupTag"); tTag == portalTag && str(target, "friendlyName") != name {
+						// Tag is held by another cert
+						it.Action = actionCreate
+						it.Reason = fmt.Sprintf("portal group tag %q is held by another certificate on %s; certificate will be created without portal role", portalTag, tn.Hostname)
+						// Remove portal role from the object before creation
+						delete(it.obj, "portal")
+						delete(it.obj, "portalGroupTag")
+						portalRoleSet = true
+						break
+					}
+				}
+			}
+
+			if !portalRoleSet {
+				it.Action = actionCreate
+			}
+			r.add(it)
+		}
+	}
 }
 
 // preflightTrustedCerts resolves the trusted certificate family. It runs before
@@ -763,9 +1080,11 @@ type ImportResult struct {
 }
 
 // ApplyImport writes the objects the pre-flight report marked as creatable, in
-// dependency order: trusted certificates first, then groups, then endpoints.
+// dependency order: trusted certificates first, then system certificates, then groups, then endpoints.
 // Nothing else is touched; existing objects are never overwritten.
-func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*ImportResult, error) {
+// selectedTargetNodes maps hostname -> selected (for system certificates only).
+// adminRole indicates whether to allow the admin certificate role.
+func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, selectedTargetNodes map[string]bool, adminRole bool, log func(string, ...any)) (*ImportResult, error) {
 	res := &ImportResult{Errors: []string{}}
 
 	// Trusted certificates.
@@ -935,6 +1254,148 @@ func ApplyImport(c *Client, r *PreflightReport, log func(string, ...any)) (*Impo
 		}
 		if certCount > 0 {
 			log("Completed %d trusted certificates.", certCount)
+		}
+	}
+
+	// System certificates: build clients for selected target nodes.
+	// Extract target hostnames from r.TargetNodes and selectedTargetNodes.
+	nodeClients := map[string]*Client{}
+	var sysCertCount int
+	for _, it := range r.Items {
+		if it.Family == familySystemCerts && it.Action == actionCreate {
+			sysCertCount++
+		}
+	}
+
+	if sysCertCount > 0 {
+		log("Creating %d system certificates…", sysCertCount)
+
+		// One client per selected node. The node this import is already
+		// connected to is reused rather than dialled a second time; the pre-flight
+		// report's own selection stands when the caller names none.
+		for _, tn := range r.TargetNodes {
+			switch {
+			case !tn.Selected && !selectedTargetNodes[tn.Hostname]:
+				continue
+			case len(selectedTargetNodes) > 0 && !selectedTargetNodes[tn.Hostname]:
+				continue
+			case nodeClients[tn.Hostname] != nil:
+				continue
+			case tn.Address == c.Host || tn.Hostname == c.Host:
+				nodeClients[tn.Hostname] = c
+			default:
+				nodeClients[tn.Hostname] = c.sibling(tn.Address)
+			}
+		}
+
+		for _, it := range r.Items {
+			if it.Family != familySystemCerts || it.Action != actionCreate {
+				continue
+			}
+
+			obj := maps.Clone(it.obj)
+			name := str(obj, "name")
+			pemData := str(obj, "pem")
+			keyBlob := str(obj, "keyBlob")
+			keySource := str(obj, "keySource")
+			isWildcard := strings.HasPrefix(extractCN(str(obj, "subject")), "*.")
+			bundleAdminRole := truthy(obj, "admin")
+
+			// The target node is carried in the object by pre-flight, not parsed
+			// back out of the item's display name.
+			targetNode := str(obj, "targetNode")
+			if targetNode == "" {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: the pre-flight report names no target node for it", name))
+				log("FAILED system certificate %q: no target node in the pre-flight report", name)
+				continue
+			}
+
+			// Get the client for this target node
+			nodeClient := nodeClients[targetNode]
+			if nodeClient == nil {
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: %s was not among the nodes selected for this import", name, targetNode))
+				log("FAILED system certificate %q: %s is not selected", name, targetNode)
+				continue
+			}
+
+			// An API export was encrypted with a password derived from the bundle
+			// passphrase; a ZIP the operator exported from the ISE GUI keeps the
+			// password they set there, which only they can supply.
+			password := certPassword(passphrase)
+			if keySource == "zip" {
+				password = zipPassword
+				if password == "" {
+					res.Failed++
+					res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q came from a GUI-exported ZIP and needs the password that ZIP was exported with; none was given", name))
+					log("FAILED system certificate %q: no password for the GUI-exported ZIP", name)
+					continue
+				}
+			}
+
+			// Build the create payload
+			// Admin role is only set true if BOTH the bundle says admin=true AND operator ticked adminRole
+			adminRoleValue := bundleAdminRole && adminRole
+
+			payload := map[string]any{
+				"data":                             pemData,
+				"privateKeyData":                   keyBlob,
+				"allowReplacementOfCertificates":   false,
+				"allowReplacementOfPortalGroupTag": false,
+				"allowRoleTransferForSameSubject":  false,
+				"allowOutOfDateCert":               false,
+				"allowSHA1Certificates":            false,
+				"validateCertificateExtensions":    false,
+				"allowExtendedValidity":            true,
+				"allowWildCardCertificates":        isWildcard,
+				"name":                             name,
+				"admin":                            adminRoleValue,
+				"eap":                              truthy(obj, "eap"),
+				"radius":                           truthy(obj, "radius"),
+				"tacacs":                           truthy(obj, "tacacs"),
+				"pxgrid":                           truthy(obj, "pxgrid"),
+				"ims":                              truthy(obj, "ims"),
+				"saml":                             truthy(obj, "saml"),
+				"portal":                           truthy(obj, "portal"),
+			}
+
+			if password != "" {
+				payload["password"] = password
+			}
+			if tag := str(obj, "portalGroupTag"); tag != "" && truthy(obj, "portal") {
+				payload["portalGroupTag"] = tag
+			}
+
+			// POST to the target node's import endpoint
+			if err := nodeClient.openAPICreate(pathSystemCertsAPI+"/import", payload); err != nil {
+				// Check if it's a connection error (node restarting after role change)
+				var ae *APIError
+				if !errors.As(err, &ae) {
+					// Network error
+					res.Failed++
+					res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v (the node may be restarting after a role change; do not retry)", name, targetNode, err))
+					log("FAILED system certificate %q on %s: %v (node may be restarting)", name, targetNode, err)
+					continue
+				}
+
+				if isDuplicate(err) {
+					res.Skipped++
+					log("System certificate %q on %s already exists; skipped.", name, targetNode)
+					continue
+				}
+
+				res.Failed++
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q on %s: %v", name, targetNode, err))
+				log("FAILED system certificate %q on %s: %v", name, targetNode, err)
+				continue
+			}
+
+			res.Created++
+			log("Created system certificate %q on %s.", name, targetNode)
+		}
+		if sysCertCount > 0 {
+			log("Completed %d system certificates.", sysCertCount)
 		}
 	}
 

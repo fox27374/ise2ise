@@ -315,7 +315,7 @@ func TestPreflightFingerprintDedup(t *testing.T) {
 	tgtC := tgtFake.client()
 
 	// Preflight should skip.
-	rep, err := Preflight(tgtC, b)
+	rep, err := Preflight(tgtC, b, nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestPreflightExpiredBlocked(t *testing.T) {
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
 
-	rep, err := Preflight(tgtC, b)
+	rep, err := Preflight(tgtC, b, nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestApplyCreatesTrustedCert(t *testing.T) {
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
 
-	rep, err := Preflight(tgtC, b)
+	rep, err := Preflight(tgtC, b, nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestApplyCreatesTrustedCert(t *testing.T) {
 		t.Fatalf("preflight added %d create items, want 1", createCount)
 	}
 
-	res, err := ApplyImport(tgtC, rep, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -521,11 +521,11 @@ func TestApplyCRLDependentFlagsWithDownloadOff(t *testing.T) {
 
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
-	rep, err := Preflight(tgtC, b)
+	rep, err := Preflight(tgtC, b, nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(tgtC, rep, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -566,11 +566,11 @@ func TestApplyCRLPutKeepsTrustFlags(t *testing.T) {
 
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
-	rep, err := Preflight(tgtC, b)
+	rep, err := Preflight(tgtC, b, nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	if _, err := ApplyImport(tgtC, rep, quiet); err != nil {
+	if _, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet); err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 
@@ -671,4 +671,348 @@ func (f *fakeISE) addTrustedCert(id, friendlyName string, cert *x509.Certificate
 	f.certs = append(f.certs, obj)
 
 	return obj
+}
+
+func TestCertPassword(t *testing.T) {
+	// Test that certPassword produces alphanumeric, stable output of correct length
+	passphrase := "my-secret-passphrase-12345"
+	pwd := certPassword(passphrase)
+
+	// Must be alphanumeric
+	for _, c := range pwd {
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			t.Errorf("certPassword contains non-alphanumeric character: %c", c)
+		}
+	}
+
+	// Must be 32 characters
+	if len(pwd) != 32 {
+		t.Errorf("certPassword length = %d, want 32", len(pwd))
+	}
+
+	// Must be stable (same input -> same output)
+	pwd2 := certPassword(passphrase)
+	if pwd != pwd2 {
+		t.Errorf("certPassword not stable: got %q then %q", pwd, pwd2)
+	}
+
+	// Different passphrase -> different password
+	pwd3 := certPassword("different-passphrase")
+	if pwd == pwd3 {
+		t.Errorf("certPassword should differ for different passphrases, got %q for both", pwd)
+	}
+}
+
+// sysCertBundle builds a bundle holding one system certificate, as an export
+// from a source node would have written it.
+func sysCertBundle(t *testing.T, cert *x509.Certificate, name string, extra map[string]any) *Bundle {
+	t.Helper()
+	b := NewBundle(&Probe{Nodes: []string{"ibk-sda-ise1"}})
+	obj := map[string]any{
+		"name":        name,
+		"pem":         string(pemEncode(cert.Raw)),
+		"keyBlob":     "-----BEGIN ENCRYPTED PRIVATE KEY-----\nopaque\n-----END ENCRYPTED PRIVATE KEY-----\n",
+		"keySource":   "api",
+		"fingerprint": fmt.Sprintf("%x", sha256.Sum256(cert.Raw)),
+		"notAfter":    cert.NotAfter.Format(time.RFC3339),
+		"subject":     cert.Subject.String(),
+		"issuer":      cert.Issuer.String(),
+		"selfSigned":  cert.Subject.String() == cert.Issuer.String(),
+		"sourceNode":  "ibk-sda-ise1",
+		"eap":         true,
+		"admin":       true,
+	}
+	for k, v := range extra {
+		obj[k] = v
+	}
+	b.Objects[familySystemCerts] = []map[string]any{obj}
+	return b
+}
+
+// twoNodeTarget is a target deployment with two Admin nodes, as the lab's is.
+func twoNodeTarget(t *testing.T) *fakeISE {
+	t.Helper()
+	f := newFakeISE(t)
+	f.mu.Lock()
+	f.deploymentNodes = []map[string]any{
+		{"hostname": "ISE-178", "fqdn": "ISE-178.ntslab.loc", "ipAddress": "172.24.89.178",
+			"roles": []any{"PrimaryAdmin", "PrimaryMonitoring"}, "nodeStatus": "Connected"},
+		{"hostname": "ISE-179", "fqdn": "ISE-179.ntslab.loc", "ipAddress": "172.24.89.179",
+			"roles": []any{"SecondaryAdmin"}, "nodeStatus": "Connected"},
+		{"hostname": "ISE-180", "fqdn": "ISE-180.ntslab.loc", "ipAddress": "172.24.89.180",
+			"roles": []any{"PolicyService"}, "nodeStatus": "Connected"},
+	}
+	f.systemCerts["ISE-178"] = []map[string]any{}
+	f.systemCerts["ISE-179"] = []map[string]any{}
+	f.mu.Unlock()
+	return f
+}
+
+// dialRecorder points every node client at the one fake deployment while
+// recording which host the import asked for.
+func dialRecorder(f *fakeISE, dialed *[]string) func(string) *Client {
+	return func(host string) *Client {
+		*dialed = append(*dialed, host)
+		c := f.client()
+		c.Host = host
+		return c
+	}
+}
+
+// The import API has no node field, so a certificate lands on whichever node's
+// URL received the POST. The bundle's sourceNode says where the certificate was
+// read from and must never decide where it is written: an import that dialled it
+// would write the target's certificates back onto the source deployment.
+func TestSystemCertImportDialsTargetNodesNotTheSource(t *testing.T) {
+	cert := genCert(t, "*.ntslab.loc", true, false, time.Now().Add(365*24*time.Hour))
+	b := sysCertBundle(t, cert, "wildcard.ntslab.loc", nil)
+
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+	var dialed []string
+	c.nodeDialer = dialRecorder(tgt, &dialed)
+
+	rep, err := Preflight(c, b, nil)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if rep.Create != 2 {
+		t.Fatalf("want one create per admin node (2), got %d: %+v", rep.Create, rep.Items)
+	}
+	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, host := range dialed {
+		if strings.Contains(host, "ibk-sda-ise1") {
+			t.Fatalf("import dialled the source node %q; target addresses only", host)
+		}
+	}
+	want := map[string]bool{"172.24.89.178": false, "172.24.89.179": false}
+	for _, host := range dialed {
+		if _, ok := want[host]; !ok {
+			t.Errorf("import dialled %q, which is not a selected target node", host)
+		}
+		want[host] = true
+	}
+	for host, seen := range want {
+		if !seen {
+			t.Errorf("target node %s never received the certificate", host)
+		}
+	}
+}
+
+// A node the operator unticked must not appear in the report at all: the counts
+// the operator confirms are the writes that happen.
+func TestSystemCertPreflightHonoursNodeSelection(t *testing.T) {
+	cert := genCert(t, "*.ntslab.loc", true, false, time.Now().Add(365*24*time.Hour))
+	b := sysCertBundle(t, cert, "wildcard.ntslab.loc", nil)
+
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+
+	rep, err := Preflight(c, b, []string{"ISE-179"})
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if rep.Create != 1 {
+		t.Fatalf("want 1 create for the one selected node, got %d", rep.Create)
+	}
+	for _, it := range rep.Items {
+		if it.Family == familySystemCerts && strings.Contains(it.Name, "ISE-178") {
+			t.Errorf("unselected node ISE-178 still produced an item: %q", it.Name)
+		}
+	}
+	var offered, selected int
+	for _, tn := range rep.TargetNodes {
+		if tn.Selectable {
+			offered++
+		}
+		if tn.Selected {
+			selected++
+		}
+	}
+	if offered != 2 || selected != 1 {
+		t.Errorf("want 2 selectable nodes and 1 selected, got %d and %d", offered, selected)
+	}
+	for _, tn := range rep.TargetNodes {
+		if tn.Hostname == "ISE-180" && tn.Selectable {
+			t.Error("a PolicyService node was offered; it serves no admin API")
+		}
+	}
+}
+
+// Taking over the admin certificate restarts the node's application and can
+// lock the operator out of the GUI mid-migration, so it happens only when asked.
+func TestSystemCertAdminRoleOffUnlessTicked(t *testing.T) {
+	cert := genCert(t, "*.ntslab.loc", true, false, time.Now().Add(365*24*time.Hour))
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+	c.nodeDialer = func(host string) *Client { return tgt.client() }
+
+	for _, tc := range []struct {
+		name      string
+		adminRole bool
+		want      bool
+	}{
+		{"not ticked", false, false},
+		{"ticked", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := sysCertBundle(t, cert, "wildcard-"+tc.name, nil)
+			rep, err := Preflight(c, b, []string{"ISE-178"})
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, tc.adminRole, quiet); err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			tgt.mu.Lock()
+			defer tgt.mu.Unlock()
+			last := tgt.systemCertImports[len(tgt.systemCertImports)-1]
+			if got, _ := last["admin"].(bool); got != tc.want {
+				t.Errorf("admin role = %v, want %v", got, tc.want)
+			}
+			for _, flag := range []string{"allowReplacementOfCertificates", "allowReplacementOfPortalGroupTag", "allowRoleTransferForSameSubject"} {
+				if v, _ := last[flag].(bool); v {
+					t.Errorf("%s was true; import never overwrites what a node may be serving", flag)
+				}
+			}
+		})
+	}
+}
+
+// A key exported from the ISE GUI is encrypted with the password set there,
+// which only the operator can supply. Writing it with an empty password would
+// fail on the box with ISE's own wording; failing here says what to do instead.
+func TestSystemCertZipSourceNeedsItsOwnPassword(t *testing.T) {
+	cert := genCert(t, "*.ntslab.loc", true, false, time.Now().Add(365*24*time.Hour))
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+	c.nodeDialer = func(host string) *Client { return tgt.client() }
+
+	b := sysCertBundle(t, cert, "from-the-gui", map[string]any{"keySource": "zip"})
+	rep, err := Preflight(c, b, []string{"ISE-178"})
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Failed != 1 || res.Created != 0 {
+		t.Fatalf("want the certificate refused for want of its ZIP password, got %+v", res)
+	}
+	if len(res.Errors) == 0 || !strings.Contains(res.Errors[0], "password") {
+		t.Errorf("the error should name the missing password, got %v", res.Errors)
+	}
+
+	res2, err := ApplyImport(c, rep, "test-passphrase-1234567890", "the-gui-password", nil, false, quiet)
+	if err != nil {
+		t.Fatalf("apply with password: %v", err)
+	}
+	if res2.Created != 1 {
+		t.Fatalf("want the certificate created once the password is given, got %+v", res2)
+	}
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	last := tgt.systemCertImports[len(tgt.systemCertImports)-1]
+	if last["password"] != "the-gui-password" {
+		t.Errorf("the ZIP password did not reach ISE, got %v", last["password"])
+	}
+}
+
+// ISE refuses a system certificate whose chain it cannot build, so the tool says
+// so up front rather than letting the write fail - and a CA arriving in the same
+// bundle counts as present, the way an endpoint group created in the same run
+// does.
+func TestSystemCertIssuerMustBeTrustedOnTarget(t *testing.T) {
+	ca := genCert(t, "NTSLAB-RootCA", true, false, time.Now().Add(365*24*time.Hour))
+	leaf := genCert(t, "*.ntslab.loc", false, false, time.Now().Add(365*24*time.Hour))
+	leafObj := map[string]any{"issuer": ca.Subject.String(), "selfSigned": false}
+
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+
+	b := sysCertBundle(t, leaf, "wildcard.ntslab.loc", leafObj)
+	rep, err := Preflight(c, b, []string{"ISE-178"})
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if rep.Blocked != 1 || rep.Create != 0 {
+		t.Fatalf("want the certificate blocked for a missing issuer, got %d blocked %d create", rep.Blocked, rep.Create)
+	}
+	if !strings.Contains(rep.Items[0].Reason, "NTSLAB-RootCA") {
+		t.Errorf("the reason should name the issuer, got %q", rep.Items[0].Reason)
+	}
+
+	// Now the same bundle also carries the CA, in the trusted family.
+	b2 := sysCertBundle(t, leaf, "wildcard.ntslab.loc", leafObj)
+	b2.Objects[familyTrustedCerts] = []map[string]any{{
+		"name": "NTSLAB-RootCA", "pem": string(pemEncode(ca.Raw)),
+		"subject":     ca.Subject.String(),
+		"fingerprint": fmt.Sprintf("%x", sha256.Sum256(ca.Raw)),
+		"notAfter":    ca.NotAfter.Format(time.RFC3339),
+	}}
+	rep2, err := Preflight(c, b2, []string{"ISE-178"})
+	if err != nil {
+		t.Fatalf("preflight with the CA in the bundle: %v", err)
+	}
+	var sysCreate int
+	for _, it := range rep2.Items {
+		if it.Family == familySystemCerts && it.Action == actionCreate {
+			sysCreate++
+		}
+	}
+	if sysCreate != 1 {
+		t.Fatalf("the CA travels in the same bundle, so the certificate should be creatable; items: %+v", rep2.Items)
+	}
+}
+
+// A GUI-exported ZIP is the 3.2 route, and everything the target needs beyond
+// the two files in it comes from the operator: the name and the roles. Dropping
+// either leaves a certificate that either cannot be created or does nothing.
+func TestExportCarriesUploadedZipWithItsNameAndRoles(t *testing.T) {
+	cert := genCert(t, "*.ntslab.loc", true, false, time.Now().Add(365*24*time.Hour))
+	src := newFakeISE(t)
+	b := NewBundle(&Probe{Nodes: []string{"ibk-sda-ise1"}})
+
+	// Shaped as handleExport builds it from the attachment plus the request.
+	zips := []map[string]any{{
+		"filename":    "ise-wildcard.zip",
+		"name":        "wildcard.ntslab.loc",
+		"pem":         string(pemEncode(cert.Raw)),
+		"keyBlob":     "-----BEGIN ENCRYPTED PRIVATE KEY-----\nopaque\n-----END ENCRYPTED PRIVATE KEY-----\n",
+		"fingerprint": fmt.Sprintf("%x", sha256.Sum256(cert.Raw)),
+		"expiresAt":   cert.NotAfter.Format(time.RFC3339),
+		"subject":     cert.Subject.String(),
+		"eap":         true,
+		"portal":      true,
+	}}
+
+	if err := ExportSystemCerts(src.client(), b, []string{familySystemCerts}, nil, "test-passphrase-1234567890", zips, "gui-password", quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	objs := b.Objects[familySystemCerts]
+	if len(objs) != 1 {
+		t.Fatalf("want the attached ZIP in the bundle, got %d objects", len(objs))
+	}
+	got := objs[0]
+	if str(got, "name") != "wildcard.ntslab.loc" {
+		t.Errorf("name = %q, want the operator's choice", str(got, "name"))
+	}
+	if str(got, "keySource") != "zip" {
+		t.Errorf("keySource = %q, want zip", str(got, "keySource"))
+	}
+	if str(got, "pem") == "" {
+		t.Error("the certificate itself did not travel; the import has nothing to send as data")
+	}
+	if str(got, "keyBlob") == "" {
+		t.Error("the private key did not travel")
+	}
+	if !truthy(got, "eap") || !truthy(got, "portal") {
+		t.Errorf("the roles the operator ticked did not travel: %+v", got)
+	}
+	if truthy(got, "admin") {
+		t.Error("an attached ZIP must not arrive with the admin role")
+	}
 }

@@ -354,6 +354,133 @@ by hand go into the report.
 The OCSP service reference is dropped with a note naming the service. OCSP
 service objects are out of scope, so the name resolves to nothing on the target.
 
+### The system certificate store, read off the box before it was built
+
+Slice 5, interviewed 2026-08-10. Every shape below was read from the source
+deployment's own OpenAPI document and its real objects **before** any code was
+written, because the trusted store was built from Cisco's documentation and the
+first implementation read zero of the 33 certificates on the box.
+
+The specification is served at `GET /api/v3/api-docs?group=Certificates`.
+There is no `/api/swagger.json` — that path answers 404, and
+`/api/swagger-resources` lists the 26 groups a 3.4 deployment publishes.
+
+| Path | What it is |
+|---|---|
+| `GET /api/v1/certs/system-certificate/{hostName}` | The store, **per node**, paged (`page`, `size`, `sort`, `sortBy`, `filter`, `filterType`) |
+| `POST /api/v1/certs/system-certificate/export` | Body `{id, hostName, export, password}`; answers a ZIP |
+| `POST /api/v1/certs/system-certificate/import` | Body `SystemCert`; **no node field at all** |
+| `GET /api/v1/deployment/node` | `hostname`, `fqdn`, `ipAddress`, `roles`, `nodeStatus` |
+
+**The import has no node parameter.** Cisco's own note on the endpoint: "To
+import a certificate on a secondary node, execute this RESTApi directly on a
+secondary node by specifying the server name of the secondary node in the URL."
+A certificate lands on whichever node's URL received the POST, so covering a
+deployment means one client per node, dialled at that node's own address with
+the credentials already given. `/api/v1/deployment/node` supplies the addresses
+and the personas, and only an Admin-persona node serves this API — the target's
+`ISE-179` is `SecondaryAdmin`, so it qualifies.
+
+This is the first family that cares about node collapse, and the answer is that
+ISE does not collapse anything: the operator picks the target nodes and the
+certificate is written to each one separately.
+
+**The export password is constrained where the bundle passphrase is not:**
+alphanumeric, minimum 8, maximum 100. The passphrase rule is 12 characters of
+anything, so it cannot be handed to ISE verbatim. The certificate password is
+therefore **derived** from the bundle passphrase — base32 of a SHA-256 over a
+fixed label and the passphrase, truncated — which is alphanumeric by
+construction, in range by construction, and identical on both sides because both
+sides start from the same passphrase the operator already types. No extra field,
+nothing stored, and no rule imposed on what a passphrase may contain.
+
+**What the export actually returns**, confirmed by running it: an
+`application/octet-stream` ZIP, `Content-Disposition: attachment; filename=…`,
+holding `<sanitised-name>.pem` (the certificate) and, with
+`CERTIFICATE_WITH_PRIVATE_KEY`, `<sanitised-name>.pvk` — a PKCS#8
+`-----BEGIN ENCRYPTED PRIVATE KEY-----` block. `CERTIFICATE` alone needs no
+password and yields the `.pem` only.
+
+**The private key is never opened.** The `.pvk` text travels into the bundle as
+an opaque blob and goes back to ISE as `privateKeyData` with the derived
+password. The tool holds no plaintext key at any point, and the key is wrapped
+twice on disk: by ISE's password and by the bundle's own AES-GCM.
+
+The list carries `id`, `friendlyName`, `issuedTo`, `issuedBy`, `validFrom`,
+`expirationDate`, `usedBy`, `keySize`, `groupTag`, `portalsUsingTheTag`,
+`selfSigned`, `serialNumberDecimalFormat`, `signatureAlgorithm` and
+`sha256Fingerprint`. Two differences from the trusted store: `selfSigned` really
+exists here, and dates are the same Java `Date.toString()`.
+
+**It carries no SANs and no certificate**, which is why the picker fetches
+`export: CERTIFICATE` per certificate — no password, no private key, about 2 KB
+each — and parses subject, SANs, key size and validity locally. A wildcard or
+multi-SAN default-tick guessed from `issuedTo` would be a guess; parsed from the
+certificate it is a fact.
+
+**Roles read back as one string and write as booleans**, the same read/write
+split the trusted store's `trustedFor` has. Observed on the source: `Admin, EAP
+Authentication, RADIUS DTLS`, `Portal`, `pxGrid`, `SAML`, `ISE Messaging
+Service`, `Not in use`. The write side is `admin`, `eap`, `radius` (RADSec and
+RADIUS DTLS), `tacacs`, `pxgrid`, `ims` (the messaging service), `saml`,
+`portal`. The mapping is a table, and an unrecognised token is reported rather
+than dropped.
+
+`SystemCert` demands seven booleans on every create:
+`allowExtendedValidity`, `allowOutOfDateCert`,
+`allowPortalTagTransferForSameSubject`, `allowReplacementOfCertificates`,
+`allowReplacementOfPortalGroupTag`, `allowRoleTransferForSameSubject`,
+`allowSHA1Certificates`. **The three that would overwrite something are always
+false**: replacement of certificates, replacement of the portal group tag, and
+role transfer for a matching subject. Create-only is not a preference here — a
+node may be serving the certificate that would be replaced.
+
+**Roles travel verbatim except admin**, which is forced off unless the operator
+ticks one run-level box, warned that it restarts the node's application and
+replaces the certificate the GUI is served with. The rule from the original
+interview stands; what is new is that the operator can overrule it deliberately.
+
+**A held portal group tag drops the portal role rather than moving the tag.**
+Pre-flight reads the target's own store, sees which tags are taken and by what,
+and says up front that the certificate will be created without `portal` and
+without `portalGroupTag`. The source box shows why this matters: its self-signed
+portal certificate holds `Default Portal Certificate Group` with twelve portals
+on it, and moving that tag would take every one of them with it.
+
+**Per node, a matching SHA-256 is a skip and a taken name is blocked.** Nothing
+is renamed and nothing is replaced. The skip names what the target calls the
+certificate, as the trusted store does.
+
+**A missing issuer blocks the certificate**, with the issuer DN in the reason
+and trusted certificates created in the same run counted as present — the
+`willExist` rule the endpoint groups already use. ISE refuses a system
+certificate whose chain it cannot build, and a blocked item explains that better
+than a 400 does.
+
+**The picker hard-excludes only expired certificates.** Everything else is
+listed with a reason and stays selectable: the lab already produced one filter
+that was correct by its rule and wrong in effect, so judgement belongs to the
+operator. Ticked by default: a wildcard CN or SAN, or more than one DNS SAN.
+Listed unticked with the reason: single-name certificates, self-signed ones, and
+anything signed by this deployment's internal CA — six of the source's nine
+certificates are exactly that, ISE Messaging Service and Certificate Services
+artifacts the target regenerates for itself.
+
+**A node that stops answering mid-import is reported and skipped, never
+retried.** A role change restarts the application on that node, so a failed
+write is expected rather than exceptional; retrying it could create a second
+copy of a certificate the first write already landed, and this tool issues no
+DELETE.
+
+**The 3.2 fallback is built, not deferred.** The API export is 3.3+, so a 3.2
+source is covered by the operator exporting the ZIP from the GUI and attaching
+it. Those keys keep the password set in the GUI, which cannot be re-wrapped
+without opening the key, so the bundle records `keySource: api | zip` and a
+second password field appears — at export when a ZIP is attached, at import only
+when the bundle actually holds a ZIP-sourced key. An attached ZIP has no roles
+and no friendly name, so its name defaults to the certificate's CN and is
+editable, and its roles are ticked by hand.
+
 ---
 
 ## Policy
@@ -500,14 +627,20 @@ ever lands in the repository.
 Known-uncertain shapes, in rough order of risk:
 
 1. `/ers/config/profilerprofile` — used for the profile-name remap.
-2. System certificate export body and the 3.3 export endpoint (not yet built).
-3. Egress matrix cell shape (not yet built).
+2. Egress matrix cell shape (not yet built).
 4. Condition library payloads (not yet built).
 
 Verified on 3.4 and no longer guesses: `/api/v1/endpoint` (bare JSON array, with
 `mac`, `groupId`, `profileId`, `staticGroupAssignment` and
-`staticProfileAssignment` all as assumed), `/ers/config/node`, and the whole
-trusted certificate surface described above.
+`staticProfileAssignment` all as assumed), `/ers/config/node`, the whole
+trusted certificate surface described above, and — read off the box on
+2026-08-10, ahead of the code — the system certificate list, export and import
+schemas, the export ZIP's `.pem`/`.pvk` entries, and `/api/v1/deployment/node`.
+
+What system certificates still cannot claim is a **write**: no certificate has
+been imported onto a target node yet, so the role mapping, the portal tag
+behaviour and the restart-mid-import path are proven only as far as the
+specification and the source's own objects go.
 
 The code reports what it actually received when a shape does not match, rather
 than panicking or returning empty. Read those messages literally.
@@ -706,8 +839,9 @@ Ordered by dependency, not by size.
    certificate, a comma in a description, OpenAPI switched off. Everything
    structural is now proven on hardware.
 5. **System certificates** — operator-selected, the 3.3 export-with-private-key
-   API and the 3.2 GUI-ZIP fallback, admin role off. Held back deliberately: four
-   unverified shapes and a private key, none of it testable without the lab.
+   API and the 3.2 GUI-ZIP fallback, admin role off. Interviewed and its API
+   surface read off the source box on 2026-08-10, before any code; see the
+   section above. In build.
 6. **Policy elements** — network device groups, condition library, dACLs,
    authorization profiles, identity source sequences. Introduces the factory
    allowlist update mechanism.
