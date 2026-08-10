@@ -89,7 +89,7 @@ func TestPreflightPolicyElements(t *testing.T) {
 
 	// Run pre-flight against the target (empty)
 	ct := t2.client()
-	r, err := Preflight(ct, b, []string{})
+	r, err := Preflight(ct, b, []string{}, false)
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestPreflightReportsContentDriftOnSkip(t *testing.T) {
 	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	r, err := Preflight(tgt.client(), b, nil)
+	r, err := Preflight(tgt.client(), b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPreflightReportsContentDriftOnSkip(t *testing.T) {
 	// Identical content on both sides is a plain skip with nothing alarming said.
 	tgt2 := newFakeISE(t)
 	tgt2.addDACL("dacl9", "PERMIT_ALL_IPV4_TRAFFIC", "permit ip any any")
-	r2, err := Preflight(tgt2.client(), b, nil)
+	r2, err := Preflight(tgt2.client(), b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestAuthProfileDACLReference(t *testing.T) {
 	b.Objects[familyPolicyElements] = append(b.Objects[familyPolicyElements], prof)
 
 	// Pre-flight should block this profile
-	r, err := Preflight(c, b, []string{})
+	r, err := Preflight(c, b, []string{}, false)
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestNetworkDeviceGroupAncestors(t *testing.T) {
 	}
 
 	// Pre-flight should create ancestors
-	r, err := Preflight(c, b, []string{})
+	r, err := Preflight(c, b, []string{}, false)
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestIdStoreSequenceReferences(t *testing.T) {
 	b.Objects[familyPolicyElements] = []map[string]any{iss}
 
 	// Pre-flight should block this
-	r, err := Preflight(c, b, []string{})
+	r, err := Preflight(c, b, []string{}, false)
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestPreflightReportsUncomparableProfile(t *testing.T) {
 	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	r, err := Preflight(tgt.client(), b, nil)
+	r, err := Preflight(tgt.client(), b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -450,11 +450,11 @@ func TestWebRedirectionRetriedWithoutTheRedirect(t *testing.T) {
 	tgt := newFakeISE(t)
 	tgt.rejectWebRedirection = true
 	ct := tgt.client()
-	rep, err := Preflight(ct, b, nil)
+	rep, err := Preflight(ct, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	res, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, quiet)
+	res, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -503,11 +503,11 @@ func TestPolicyElementsReRunCreatesNothing(t *testing.T) {
 
 	tgt := newFakeISE(t)
 	ct := tgt.client()
-	rep, err := Preflight(ct, b, nil)
+	rep, err := Preflight(ct, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	first, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, quiet)
+	first, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -515,11 +515,11 @@ func TestPolicyElementsReRunCreatesNothing(t *testing.T) {
 		t.Fatalf("first run should create everything and fail nothing, got %+v", first)
 	}
 
-	rep2, err := Preflight(ct, b, nil)
+	rep2, err := Preflight(ct, b, nil, false)
 	if err != nil {
 		t.Fatalf("second preflight: %v", err)
 	}
-	second, err := ApplyImport(ct, rep2, "test-passphrase-1234567890", "", nil, false, quiet)
+	second, err := ApplyImport(ct, rep2, "test-passphrase-1234567890", "", nil, false, false, quiet)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -546,11 +546,11 @@ func TestImportMarksWhatItCreated(t *testing.T) {
 
 	tgt := newFakeISE(t)
 	ct := tgt.client()
-	rep, err := Preflight(ct, b, nil)
+	rep, err := Preflight(ct, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	if _, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+	if _, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, false, quiet); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 

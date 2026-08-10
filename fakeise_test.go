@@ -59,6 +59,13 @@ type fakeISE struct {
 
 	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
+	// Policy sets
+	policySets     []map[string]any
+	policySetRules map[string][]map[string]any // policy set id -> rules
+	serviceNames   []map[string]any
+	securityGroups []map[string]any
+	identityStores []map[string]any
+
 	csrfRequired bool   // ERS demands a CSRF nonce on writes, as a real 3.4 does
 	csrfToken    string // the nonce currently issued
 	csrfIssued   int    // how many nonces were handed out
@@ -84,6 +91,7 @@ func newFakeISE(t *testing.T) *fakeISE {
 		systemCertExports: map[string][]byte{},
 		systemCertCreated: map[string][]map[string]any{},
 		deploymentNodes:   []map[string]any{},
+		policySetRules:    map[string][]map[string]any{},
 	}
 	// Initialize deployment nodes
 	f.deploymentNodes = []map[string]any{

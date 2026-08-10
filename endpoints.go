@@ -21,6 +21,7 @@ const (
 	familyTrustedCerts   = "trustedCertificates"
 	familySystemCerts    = "systemCertificates"
 	familyPolicyElements = "policyElements"
+	familyPolicySets     = "policySets"
 )
 
 // ISE paths and their ERS root keys.
@@ -50,6 +51,13 @@ const (
 	pathDictionaries        = "/api/v1/policy/network-access/dictionaries"
 	pathActiveDirectory     = "/ers/config/activedirectory"
 	pathCertificateProfile  = "/ers/config/certificateprofile"
+
+	// Policy sets paths
+	pathPolicySets            = "/api/v1/policy/network-access/policy-set"
+	pathServiceNames          = "/api/v1/policy/network-access/service-names"
+	pathSecurityGroups        = "/api/v1/policy/network-access/security-groups"
+	pathIdentityStores        = "/api/v1/policy/network-access/identity-stores"
+	pathAuthorizationProfiles = "/api/v1/policy/network-access/authorization-profiles"
 )
 
 // openAPIOnlyEndpointFields are fields the OpenAPI endpoint resource returns and
@@ -602,12 +610,13 @@ func (r *PreflightReport) add(it PreflightItem) {
 //
 // selectedNodes names the target nodes system certificates are to be written
 // to; empty means every eligible node, which is what the report offers first.
-func Preflight(c *Client, b *Bundle, selectedNodes []string) (*PreflightReport, error) {
+func Preflight(c *Client, b *Bundle, selectedNodes []string, keepState bool) (*PreflightReport, error) {
 	r := &PreflightReport{Source: b.Source, Items: []PreflightItem{}, Notes: append([]string{}, b.Notes...)}
 
 	preflightTrustedCerts(c, b, r)
 	preflightSystemCerts(c, b, r, selectedNodes)
 	preflightPolicyElements(c, b, r)
+	preflightPolicySets(c, b, r, keepState)
 
 	groupIDByName, err := stubsByName(c, pathEndpointGroups)
 	if err != nil {
@@ -1103,7 +1112,7 @@ type ImportResult struct {
 // Nothing else is touched; existing objects are never overwritten.
 // selectedTargetNodes maps hostname -> selected (for system certificates only).
 // adminRole indicates whether to allow the admin certificate role.
-func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, selectedTargetNodes map[string]bool, adminRole bool, log func(string, ...any)) (*ImportResult, error) {
+func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, selectedTargetNodes map[string]bool, adminRole, keepState bool, log func(string, ...any)) (*ImportResult, error) {
 	res := &ImportResult{Errors: []string{}}
 
 	// Trusted certificates.
@@ -1507,6 +1516,11 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 
 	// Policy elements
 	if err := applyPolicyElements(c, r, res, log); err != nil {
+		return res, err
+	}
+
+	// Policy sets
+	if err := applyPolicySets(c, r, res, keepState, log); err != nil {
 		return res, err
 	}
 

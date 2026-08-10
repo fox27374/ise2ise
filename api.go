@@ -496,6 +496,11 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ticking policy sets forces policy elements into the same export
+	if slices.Contains(in.Families, familyPolicySets) && !slices.Contains(in.Families, familyPolicyElements) {
+		in.Families = append(in.Families, familyPolicyElements)
+	}
+
 	s := newStream(w)
 	s.log("Connecting to %s…", c.Host)
 	probe := c.ProbeDeployment()
@@ -520,6 +525,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ExportPolicyElements(c, b, in.Families, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
+	if err := ExportPolicySets(c, b, in.Families, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}
@@ -566,6 +575,10 @@ type importInput struct {
 	nodes       []string
 	adminRole   bool
 	zipPassword string
+
+	// Policy sets only: whether to import sets and rules in their source state
+	// or force them disabled.
+	keepState bool
 }
 
 func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
@@ -601,6 +614,7 @@ func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
 		client: c, bundle: b, passphrase: pass,
 		adminRole:   yes(r.FormValue("adminRole")),
 		zipPassword: r.FormValue("zipPassword"),
+		keepState:   yes(r.FormValue("keepState")),
 	}
 	// The node picker posts a JSON array of hostnames; absent means the
 	// pre-flight default, which is every eligible node.
@@ -633,7 +647,7 @@ func handlePreflight(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "The ERS API is required for an import and is not usable: "+firstNote(probe))
 		return
 	}
-	rep, err := Preflight(in.client, in.bundle, in.nodes)
+	rep, err := Preflight(in.client, in.bundle, in.nodes, in.keepState)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -666,7 +680,7 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 
 	s := newStream(w)
 	s.log("Re-checking the target before writing…")
-	rep, err := Preflight(in.client, in.bundle, in.nodes)
+	rep, err := Preflight(in.client, in.bundle, in.nodes, in.keepState)
 	if err != nil {
 		s.fail("%v", err)
 		return
@@ -690,7 +704,7 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := ApplyImport(in.client, rep, in.passphrase, in.zipPassword, selectedTargetNodes, in.adminRole, s.log)
+	res, err := ApplyImport(in.client, rep, in.passphrase, in.zipPassword, selectedTargetNodes, in.adminRole, in.keepState, s.log)
 	if err != nil {
 		s.fail("%v", err)
 		s.send(map[string]any{"type": "done", "result": res, "preflight": rep})
