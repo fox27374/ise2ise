@@ -39,6 +39,7 @@ type fakeISE struct {
 
 	systemCerts       map[string][]map[string]any // hostname -> list of system certs
 	systemCertImports []map[string]any            // import payloads, in arrival order
+	systemCertPEM     map[string][]byte           // cert id -> the PEM its export ZIP carries
 	systemCertExports map[string][]byte           // cert id -> export body
 	systemCertCreated map[string][]map[string]any // hostname -> created payloads
 	deploymentNodes   []map[string]any
@@ -79,6 +80,7 @@ func newFakeISE(t *testing.T) *fakeISE {
 		created:           map[string][]map[string]any{},
 		policies:          map[string][]map[string]any{},
 		systemCerts:       map[string][]map[string]any{},
+		systemCertPEM:     map[string][]byte{},
 		systemCertExports: map[string][]byte{},
 		systemCertCreated: map[string][]map[string]any{},
 		deploymentNodes:   []map[string]any{},
@@ -580,21 +582,33 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Return cached export if available
-		if exportData, ok := f.systemCertExports[id]; ok {
+		// Keyed by mode as well as id: a keyless export and a with-key export of
+		// the same certificate are different bodies, and caching them together
+		// handed the tool a ZIP with no key in it.
+		mode, _ := body["export"].(string)
+		if exportData, ok := f.systemCertExports[id+"|"+mode]; ok {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(exportData)
 			return
 		}
 
-		// Generate a fake ZIP with .pem and .pvk entries
+		// A real export answers a ZIP holding the certificate and, with a private
+		// key requested, the encrypted key beside it. The entries must carry real
+		// content: an empty .pem let a bug through where the picker parsed the
+		// body as bare PEM, found nothing, and reported every certificate as
+		// single-name — which quietly unticked the only one worth migrating.
 		buf := &bytes.Buffer{}
 		z := zip.NewWriter(buf)
-		z.Create("cert.pem")
-		z.Create("cert.pvk")
+		w1, _ := z.Create("cert.pem")
+		w1.Write(f.systemCertPEM[id])
+		if export, _ := body["export"].(string); export == "CERTIFICATE_WITH_PRIVATE_KEY" {
+			w2, _ := z.Create("cert.pvk")
+			w2.Write([]byte("-----BEGIN ENCRYPTED PRIVATE KEY-----\nopaque\n-----END ENCRYPTED PRIVATE KEY-----\n"))
+		}
 		z.Close()
 
 		exportData := buf.Bytes()
-		f.systemCertExports[id] = exportData
+		f.systemCertExports[id+"|"+mode] = exportData
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(exportData)

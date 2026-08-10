@@ -601,15 +601,14 @@ func ListSystemCerts(c *Client) ([]SystemCertInfo, error) {
 					continue
 				}
 
-				// Parse certificate to extract subject, SANs, key size
+				// The export answers a ZIP holding one .pem, not bare PEM — the
+				// same shape the with-key export uses. Sniffing covers all three
+				// forms, and reading this wrong is invisible: the row simply
+				// loses its SANs and reads as single-name, which is how a
+				// multi-SAN certificate ends up unticked.
 				var parsedCert *x509.Certificate
-				if bytes.HasPrefix(body, []byte("-----BEGIN")) {
-					block, _ := pem.Decode(body)
-					if block != nil && block.Type == "CERTIFICATE" {
-						if c, _ := x509.ParseCertificate(block.Bytes); c != nil {
-							parsedCert = c
-						}
-					}
+				if found, _ := extractCertificates(body, ""); len(found) > 0 {
+					parsedCert = found[0]
 				}
 
 				// Build the info object
@@ -874,6 +873,18 @@ func ExportSystemCerts(c *Client, b *Bundle, families []string, fingerprints []s
 			continue
 		}
 
+		// The issuer is read from the certificate itself, not from ISE's listing,
+		// which does not carry a distinguished name. Pre-flight blocks a
+		// certificate whose issuer the target does not trust, and it can only do
+		// that if the issuer actually travels: an empty string here silently
+		// disables the whole chain check.
+		issuer, subject := cert.Subject, cert.Subject
+		if block, _ := pem.Decode([]byte(pemData)); block != nil {
+			if parsed, err := x509.ParseCertificate(block.Bytes); err == nil {
+				issuer, subject = parsed.Issuer.String(), parsed.Subject.String()
+			}
+		}
+
 		bundleObj := map[string]any{
 			"name":           cert.Name,
 			"pem":            pemData,
@@ -881,21 +892,24 @@ func ExportSystemCerts(c *Client, b *Bundle, families []string, fingerprints []s
 			"keySource":      "api",
 			"fingerprint":    cert.Fingerprint,
 			"notAfter":       cert.ExpiresAt,
-			"subject":        cert.Subject,
-			"issuer":         "",
+			"subject":        subject,
+			"issuer":         issuer,
 			"selfSigned":     cert.SelfSigned,
 			"keySize":        cert.KeySize,
 			"sans":           cert.SANs,
 			"portalGroupTag": cert.GroupTag,
 			"sourceNode":     cert.Node,
-			"admin":          false,
-			"eap":            slices.Contains(cert.Roles, "EAP Authentication"),
-			"radius":         slices.Contains(cert.Roles, "RADIUS DTLS") || slices.Contains(cert.Roles, "RADSec"),
-			"tacacs":         slices.Contains(cert.Roles, "TACACS"),
-			"pxgrid":         slices.Contains(cert.Roles, "pxGrid"),
-			"ims":            slices.Contains(cert.Roles, "ISE Messaging Service"),
-			"saml":           slices.Contains(cert.Roles, "SAML"),
-			"portal":         slices.Contains(cert.Roles, "Portal"),
+			// The source's own roles travel as they are. Admin is dropped at
+			// import unless the operator ticks the run-level box — recording it
+			// false here instead would make that box do nothing at all.
+			"admin":  slices.Contains(cert.Roles, "Admin"),
+			"eap":    slices.Contains(cert.Roles, "EAP Authentication"),
+			"radius": slices.Contains(cert.Roles, "RADIUS DTLS") || slices.Contains(cert.Roles, "RADSec"),
+			"tacacs": slices.Contains(cert.Roles, "TACACS"),
+			"pxgrid": slices.Contains(cert.Roles, "pxGrid"),
+			"ims":    slices.Contains(cert.Roles, "ISE Messaging Service"),
+			"saml":   slices.Contains(cert.Roles, "SAML"),
+			"portal": slices.Contains(cert.Roles, "Portal"),
 		}
 
 		out = append(out, bundleObj)

@@ -1016,3 +1016,126 @@ func TestExportCarriesUploadedZipWithItsNameAndRoles(t *testing.T) {
 		t.Error("an attached ZIP must not arrive with the admin role")
 	}
 }
+
+// The keyless export the picker uses answers a ZIP, not bare PEM. Parsing it as
+// PEM fails silently: the row keeps its name and loses its SANs, so a multi-SAN
+// certificate — the only kind worth migrating — reads as single-name and arrives
+// unticked. Found against a real 3.4 box on 2026-08-10.
+func TestPickerReadsSANsFromTheExportZip(t *testing.T) {
+	multi := genCertWithSANs(t, "ise.ntslab.loc", []string{"ise.ntslab.loc", "ise01.ntslab.loc", "ise02.ntslab.loc"})
+	single := genCertWithSANs(t, "ISE01.ntslab.loc", []string{"ISE01.ntslab.loc"})
+
+	f := newFakeISE(t)
+	f.mu.Lock()
+	f.deploymentNodes = []map[string]any{{
+		"hostname": "ISE01", "ipAddress": "10.0.0.1", "nodeStatus": "Connected",
+		"roles": []any{"PrimaryAdmin"},
+	}}
+	f.systemCerts["ISE01"] = []map[string]any{}
+	f.mu.Unlock()
+	f.addSystemCert("ISE01", "multi", "wildcard-ish", "aa11", []string{"Admin"})
+	f.addSystemCert("ISE01", "single", "node cert", "bb22", []string{"EAP Authentication"})
+	f.mu.Lock()
+	f.systemCertPEM["sys-cert-multi"] = pemEncode(multi.Raw)
+	f.systemCertPEM["sys-cert-single"] = pemEncode(single.Raw)
+	// CA-issued, as the real multi-SAN certificate on the lab source is: a
+	// self-signed one is unticked on its own merits, which is a different rule.
+	for _, c := range f.systemCerts["ISE01"] {
+		c["selfSigned"] = false
+		c["issuedBy"] = "NTSLAB Vault CA"
+	}
+	f.mu.Unlock()
+
+	rows, err := ListSystemCerts(f.client())
+	if err != nil {
+		t.Fatalf("ListSystemCerts: %v", err)
+	}
+
+	byName := map[string]SystemCertInfo{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	m, ok := byName["wildcard-ish"]
+	if !ok {
+		t.Fatalf("the multi-SAN certificate is missing from the picker: %+v", rows)
+	}
+	if len(m.SANs) != 3 {
+		t.Errorf("SANs = %v, want the three in the certificate; an empty list means the ZIP was not read", m.SANs)
+	}
+	if !m.Ticked {
+		t.Errorf("a multi-SAN certificate must be ticked by default, reason given was %q", m.Reason)
+	}
+	if s := byName["node cert"]; s.Ticked {
+		t.Error("a single-name certificate must not be ticked by default")
+	}
+}
+
+// genCertWithSANs is genCert with subject alternative names, which is what the
+// picker's default-tick rule actually reads.
+func genCertWithSANs(t *testing.T, cn string, dns []string) *x509.Certificate {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     dns,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return cert
+}
+
+// The bundle has to carry the issuer and the source's own admin role, or two
+// designed behaviours quietly stop working: pre-flight cannot block a
+// certificate whose issuer the target does not trust, and the admin checkbox on
+// the import step has nothing to act on. Both were empty against a real box.
+func TestExportRecordsIssuerAndAdminRole(t *testing.T) {
+	cert := genCertWithSANs(t, "ise.ntslab.loc", []string{"ise.ntslab.loc", "ise01.ntslab.loc"})
+
+	f := newFakeISE(t)
+	f.mu.Lock()
+	f.deploymentNodes = []map[string]any{{
+		"hostname": "ISE01", "ipAddress": "10.0.0.1", "nodeStatus": "Connected",
+		"roles": []any{"PrimaryAdmin"},
+	}}
+	f.systemCerts["ISE01"] = []map[string]any{}
+	f.mu.Unlock()
+	f.addSystemCert("ISE01", "multi", "the wildcard", "aa11", []string{"Admin", "EAP Authentication"})
+	f.mu.Lock()
+	f.systemCertPEM["sys-cert-multi"] = pemEncode(cert.Raw)
+	for _, c := range f.systemCerts["ISE01"] {
+		c["selfSigned"] = false
+	}
+	f.mu.Unlock()
+
+	rows, err := ListSystemCerts(f.client())
+	if err != nil {
+		t.Fatalf("picker: %v", err)
+	}
+	b := NewBundle(&Probe{Nodes: []string{"ISE01"}})
+	if err := ExportSystemCerts(f.client(), b, []string{familySystemCerts}, []string{rows[0].Fingerprint}, "test-passphrase-1234567890", nil, "", quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	objs := b.Objects[familySystemCerts]
+	if len(objs) != 1 {
+		t.Fatalf("exported %d objects, want 1", len(objs))
+	}
+	if got := str(objs[0], "issuer"); got != cert.Issuer.String() {
+		t.Errorf("issuer = %q, want %q; an empty issuer disables the chain check", got, cert.Issuer.String())
+	}
+	if !truthy(objs[0], "admin") {
+		t.Error("the source's admin role did not travel, so the import's admin checkbox can never take effect")
+	}
+}
