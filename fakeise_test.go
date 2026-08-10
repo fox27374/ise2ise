@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/cookiejar"
@@ -41,6 +42,19 @@ type fakeISE struct {
 	systemCertExports map[string][]byte           // cert id -> export body
 	systemCertCreated map[string][]map[string]any // hostname -> created payloads
 	deploymentNodes   []map[string]any
+
+	// Policy elements
+	rejectWebRedirection   bool            // an authorization profile naming a portal is refused, as a target without it does
+	authProfileListFails   bool            // GET /ers/config/authorizationprofile answers 500, as 3.4 does
+	authProfileDetailFails map[string]bool // profile id -> its own detail read answers 500 too
+	networkDeviceGroups    []map[string]any
+	dacls                  []map[string]any
+	authProfiles           []map[string]any
+	idStoreSequences       []map[string]any
+	conditions             []map[string]any
+	dictionaries           []map[string]any
+	adJoinPoints           []map[string]any
+	certProfiles           []map[string]any
 
 	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
@@ -179,6 +193,40 @@ func (f *fakeISE) serveERS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	coll, id := splitERSPath(path)
+
+	// A profile carrying a web redirection is refused when the portal it names is
+	// not on this deployment. Portals cannot be listed at all on 3.4, so the tool
+	// finds out by being told no, and this is where it gets told.
+	if coll == "authorizationprofile" && r.Method == http.MethodPost && f.rejectWebRedirection {
+		var body map[string]map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if obj := body[rootAuthProfile]; obj != nil && obj["webRedirection"] != nil {
+			iseError(w, http.StatusBadRequest, "Portal not found for the given web redirection")
+			return
+		}
+		// Not a redirect profile, or the retry without one: fall through by
+		// re-reading the body the generic path expects.
+		raw, _ := json.Marshal(body)
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+	}
+
+	// Real 3.4 cannot serialise some of its own authorization profiles. Listing
+	// the collection answers 500 on every box seen so far, and an individual
+	// profile holding a web redirection answers 500 on its own id. Both are
+	// reproduced here because both change what the tool is allowed to assume.
+	if coll == "authorizationprofile" && r.Method == http.MethodGet {
+		if id == "" && f.authProfileListFails {
+			iseError(w, http.StatusInternalServerError,
+				"Failed to convert to ERS object, attribute: cisco-av-pair, Error: could not extract ResultSet")
+			return
+		}
+		if id != "" && f.authProfileDetailFails[id] {
+			iseError(w, http.StatusInternalServerError,
+				"Failed to convert to ERS object, attribute: cisco-av-pair, Error: Exception when converting from attribute value to WebRedirection object")
+			return
+		}
+	}
+
 	objs, root, ok := f.collection(coll)
 	if !ok {
 		iseError(w, http.StatusNotFound, "Resource not found: "+path)
@@ -264,6 +312,32 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		if f.policyForbidden {
 			// What a deployment with the policy API locked down answers.
 			http.Error(w, `{"message":"insufficient privileges"}`, http.StatusForbidden)
+			return
+		}
+		// Authorization profiles stub list
+		if path == "/api/v1/policy/network-access/authorization-profiles" {
+			page := f.page(r, f.authProfiles)
+			writeJSONRaw(w, map[string]any{"response": page})
+			return
+		}
+		// Conditions. The library lives in two places in this fake: f.conditions,
+		// which the policy element tests populate, and f.policies, which the
+		// policy usage scan's tests populate. Both are the same collection on a
+		// real box, so both are served — serving only one made a scan test see an
+		// empty library.
+		if path == pathConditions || path == pathTimeConditions || path == pathNetworkConditions {
+			items := append(append([]map[string]any{}, f.policies[path]...), f.conditions...)
+			if path != pathConditions {
+				items = f.policies[path] // time and network conditions are empty on the source
+			}
+			page := f.page(r, items)
+			writeJSONRaw(w, map[string]any{"response": page})
+			return
+		}
+		// Dictionaries
+		if path == "/api/v1/policy/network-access/dictionaries" {
+			page := f.page(r, f.dictionaries)
+			writeJSONRaw(w, map[string]any{"response": page})
 			return
 		}
 		items := f.policies[path] // nil is a legitimate empty rule set
@@ -587,6 +661,31 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Condition create (OpenAPI POST)
+	if (path == "/api/v1/policy/network-access/condition" || path == "/api/v1/policy/network-access/time-condition" || path == "/api/v1/policy/network-access/network-condition") && r.Method == http.MethodPost {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body == nil {
+			iseError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		// Create the condition
+		cond := maps.Clone(body)
+		cond["id"] = fmt.Sprintf("tgt-cond-%d", len(f.conditions)+1)
+		f.conditions = append(f.conditions, cond)
+		f.created["condition"] = append(f.created["condition"], body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{
+			"response": map[string]any{
+				"status":  "Success",
+				"message": "Condition was added successfully",
+				"id":      cond["id"],
+			},
+		})
+		return
+	}
+
 	iseError(w, http.StatusNotFound, "no such OpenAPI resource")
 }
 
@@ -635,6 +734,18 @@ func (f *fakeISE) collection(coll string) ([]map[string]any, string, bool) {
 			nodes = append(nodes, map[string]any{"id": fmt.Sprint("node", i), "name": n})
 		}
 		return nodes, "Node", true
+	case "networkdevicegroup":
+		return f.networkDeviceGroups, rootNetworkDeviceGroup, true
+	case "downloadableacl":
+		return f.dacls, rootDownloadableACL, true
+	case "authorizationprofile":
+		return f.authProfiles, rootAuthProfile, true
+	case "idstoresequence":
+		return f.idStoreSequences, rootIdStoreSequence, true
+	case "activedirectory":
+		return f.adJoinPoints, "ActiveDirectory", true
+	case "certificateprofile":
+		return f.certProfiles, "CertificateProfile", true
 	}
 	return nil, "", false
 }
@@ -647,6 +758,18 @@ func (f *fakeISE) append(coll string, o map[string]any) {
 		f.endpoints = append(f.endpoints, o)
 	case "profilerprofile":
 		f.profiles = append(f.profiles, o)
+	case "networkdevicegroup":
+		f.networkDeviceGroups = append(f.networkDeviceGroups, o)
+	case "downloadableacl":
+		f.dacls = append(f.dacls, o)
+	case "authorizationprofile":
+		f.authProfiles = append(f.authProfiles, o)
+	case "idstoresequence":
+		f.idStoreSequences = append(f.idStoreSequences, o)
+	case "activedirectory":
+		f.adJoinPoints = append(f.adJoinPoints, o)
+	case "certificateprofile":
+		f.certProfiles = append(f.certProfiles, o)
 	}
 }
 
