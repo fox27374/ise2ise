@@ -277,9 +277,18 @@ and what the target already has is skipped.
   mean "join the domain on the target first, then re-run". A profile whose web
   redirection names a portal the target lacks is **created without the redirect**
   and the report says so; portals are not migrated by this tool.
-- **Two of ISE 3.4's own reads are broken, and you will see it.** Listing
-  authorization profiles answers HTTP 500 with a conversion exception on
-  `cisco-av-pair`, so the tool reads them one at a time instead. A profile
+- **What the import created is marked.** Every object the tool creates gets
+  `[ise2ise 2026-08-10]` appended to its description, so the ISE list views show
+  at a glance what came from a migration. ISE has no enabled/disabled state on
+  any of these object types — only policy sets and rules have one — so the
+  description is the only place to put it. The marker is ignored when comparing
+  content, so a re-run still reports "already exists, identical", and marking
+  never stacks.
+- **Two of ISE 3.4's own reads can fail, and you will see it.** Listing
+  authorization profiles can answer HTTP 500 with a conversion exception on
+  `cisco-av-pair` — one profile ISE cannot serialise takes the whole listing
+  with it, and which ones differ per deployment — so the tool reads them one at
+  a time instead. A profile
   holding a web redirection can fail that read too — ISE cannot deserialise its
   own object — and such a profile is **not exported**: it is named in the report,
   with ISE's error, for you to recreate by hand. On the lab source that is one

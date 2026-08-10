@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ExportPolicyElements fills the bundle with policy elements: network device
@@ -365,6 +366,60 @@ func extractAncestors(name string) []string {
 	return ancestors
 }
 
+// Policy elements have no enabled/disabled state — ISE offers one on policy sets
+// and rules, and on nothing this family carries — so an object created by this
+// tool is marked in its description instead. That is the only field every one of
+// the five families has, and it is visible in the ISE list views without opening
+// anything.
+const importMarkerPrefix = "[ise2ise "
+
+// ISE truncates or refuses an over-long description; 256 is the shortest limit
+// seen across these resources, and losing the tail of a description is better
+// than losing the object.
+const maxDescription = 256
+
+// importMarker is regenerated per call so a run started before midnight and
+// finishing after it stays self-consistent within one object.
+func importMarker(when time.Time) string {
+	return importMarkerPrefix + when.Format("2006-01-02") + "]"
+}
+
+// tagDescription appends the marker, leaving an already-marked description
+// alone so a re-created object does not collect two of them.
+func tagDescription(desc string) string {
+	marker := importMarker(time.Now())
+	if strings.Contains(desc, importMarkerPrefix) {
+		return desc
+	}
+	out := marker
+	if desc != "" {
+		out = desc + " " + marker
+	}
+	if len(out) > maxDescription {
+		cut := maxDescription - len(marker) - 1
+		if cut < 0 {
+			return marker
+		}
+		out = strings.TrimSpace(desc[:cut]) + " " + marker
+	}
+	return out
+}
+
+// stripImportMarker removes the marker for comparison. Without this every object
+// the tool created would report as drifted against its own source on the next
+// run, which would make the drift report worthless exactly where it matters.
+func stripImportMarker(desc string) string {
+	i := strings.Index(desc, importMarkerPrefix)
+	if i < 0 {
+		return desc
+	}
+	end := strings.Index(desc[i:], "]")
+	if end < 0 {
+		return strings.TrimSpace(desc[:i])
+	}
+	return strings.TrimSpace(desc[:i] + desc[i+end+1:])
+}
+
 // driftFields names the fields in which the bundle's object and the target's own
 // copy disagree. Deployment-local bookkeeping is ignored: an id and a link differ
 // between any two deployments and say nothing, and kind is this tool's own.
@@ -383,7 +438,12 @@ func driftFields(mine, theirs map[string]any) []string {
 				continue
 			}
 			seen[k] = true
-			if !reflect.DeepEqual(mine[k], theirs[k]) {
+			a, bb := mine[k], theirs[k]
+			if k == "description" {
+				// The marker this tool adds is not drift.
+				a, bb = stripImportMarker(str(mine, k)), stripImportMarker(str(theirs, k))
+			}
+			if !reflect.DeepEqual(a, bb) {
 				fields = append(fields, k)
 			}
 		}
@@ -481,6 +541,7 @@ func applyPolicyElements(c *Client, r *PreflightReport, res *ImportResult, log f
 
 			obj := maps.Clone(it.obj)
 			delete(obj, "kind") // Remove synthetic kind field
+			obj["description"] = tagDescription(str(obj, "description"))
 
 			var err error
 			switch kind {
