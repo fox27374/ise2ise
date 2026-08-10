@@ -80,9 +80,9 @@ tool issues no DELETE under any circumstances.
 That expectation is a design assumption, not a requirement the tool enforces.
 A migration has been run into a two-node target that was not fresh, and the
 create-only rule is what made it uneventful: everything already present was
-skipped by name. Nothing today carries a node reference, so the single-node
-assumption has not been exercised yet — system certificates will be the first
-family that cares.
+skipped by name. System certificates are the one family that cares which node it
+is writing to, and they ask: you pick the target nodes, and each one is written
+separately.
 
 ### Export
 
@@ -152,6 +152,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | Endpoint identity groups | The ones you select, and only those. Group nesting is not carried and is reported. |
 | Static endpoints | Only in the groups you select, only static assignments, identified by MAC. |
 | Trusted certificates | The ones you select. Internal CA and per-node self-signed certificates are excluded for you. See below. |
+| System certificates | The ones you select, with their private keys, onto the target nodes you select. See below. |
 
 ### Trusted certificates
 
@@ -199,7 +200,59 @@ This path has been run against a real ISE 3.4 deployment: 33 certificates listed
 fingerprint, and a confirmed import creating a certificate with its trust
 purposes intact.
 
-System certificates — the ones with a private key — are a later slice.
+### System certificates
+
+These are the ones with a private key: the certificate a node presents for EAP,
+RADIUS, portals, pxGrid or the admin GUI. Only a **wildcard or multi-SAN**
+certificate really makes sense to move — a per-node identity certificate names a
+source FQDN that will never exist on the target — so those are the ones the
+picker ticks for you. Everything else is listed unticked with the reason, and
+stays selectable, because the judgement is yours. Expired certificates are the
+only ones you cannot tick.
+
+The private key never lies open. ISE encrypts it on export, the encrypted block
+goes into the bundle untouched, and it goes back to ISE the same way; the tool
+does not open it at any point. The password ISE uses is derived from your bundle
+passphrase, so there is nothing extra to type or to remember, and no password is
+stored anywhere.
+
+**Choose which target nodes get the certificate.** ISE's import API has no node
+field at all — a certificate lands on whichever node received the request — so
+the pre-flight lists the target's Admin-persona nodes, ticked, and the import
+writes to each one you leave ticked. Nodes that serve no admin API are shown
+disabled. The report has one line per certificate per node, so what you confirm
+is what gets written.
+
+What to expect:
+
+- **The admin role is off unless you ask for it.** One checkbox on the import
+  step turns it on. It restarts the application on that node and replaces the
+  certificate the GUI is served with, so if your browser does not trust the new
+  chain you lose the UI until it does. Every other role travels as it was.
+- **A held portal group tag is not taken.** If a certificate on the target
+  already holds the tag, yours is created without the portal role rather than
+  moving the tag — which would take every portal on it away from a certificate
+  the node is serving. The pre-flight says so before you confirm, and names the
+  holder.
+- **Nothing is ever replaced or renamed.** A certificate already on the node with
+  the same SHA-256 is skipped; a *different* certificate already using the same
+  name blocks that one, and is reported.
+- **The issuing CA has to be on the target**, or the certificate is blocked with
+  the issuer named. A CA travelling in the same bundle counts, so exporting the
+  trusted certificate family alongside usually resolves it in one run.
+- **A node that stops answering is reported, not retried.** A role change can
+  restart the node's application; the run moves on to the next node and tells you
+  to re-run once it answers. Re-running is safe — what landed is skipped.
+- **From an ISE 3.2 source**, where the export API does not exist, export the ZIP
+  from the ISE GUI and attach it in the export step. The tool reads the
+  certificate out of it so you can name it and tick its roles. That key keeps the
+  password you set in the GUI, so you are asked for it once on export and once on
+  import; certificates taken through the API are not affected.
+
+This family's API shapes were read off a real ISE 3.4 deployment before it was
+built, including the export ZIP's layout, but **no certificate has yet been
+imported onto a real node** — the role mapping, the portal tag behaviour and the
+restart path are proven against the specification and the fake deployment only.
 
 ## Running
 
@@ -288,7 +341,6 @@ even as a stub:
 - Full TrustSec: SGTs, SGACLs, egress matrix
 - Policy sets and rules, with UUID remapping
 - AD join point configuration and `addGroups`
-- System certificates (the ones with a private key)
 - Network device CSV → API import
 
 The probe, both endpoint families and the whole trusted certificate path have
