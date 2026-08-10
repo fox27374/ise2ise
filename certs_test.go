@@ -315,7 +315,7 @@ func TestPreflightFingerprintDedup(t *testing.T) {
 	tgtC := tgtFake.client()
 
 	// Preflight should skip.
-	rep, err := Preflight(tgtC, b, nil)
+	rep, err := Preflight(tgtC, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestPreflightExpiredBlocked(t *testing.T) {
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
 
-	rep, err := Preflight(tgtC, b, nil)
+	rep, err := Preflight(tgtC, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestApplyCreatesTrustedCert(t *testing.T) {
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
 
-	rep, err := Preflight(tgtC, b, nil)
+	rep, err := Preflight(tgtC, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestApplyCreatesTrustedCert(t *testing.T) {
 		t.Fatalf("preflight added %d create items, want 1", createCount)
 	}
 
-	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -521,11 +521,11 @@ func TestApplyCRLDependentFlagsWithDownloadOff(t *testing.T) {
 
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
-	rep, err := Preflight(tgtC, b, nil)
+	rep, err := Preflight(tgtC, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -566,11 +566,11 @@ func TestApplyCRLPutKeepsTrustFlags(t *testing.T) {
 
 	tgtFake := newFakeISE(t)
 	tgtC := tgtFake.client()
-	rep, err := Preflight(tgtC, b, nil)
+	rep, err := Preflight(tgtC, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	if _, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, quiet); err != nil {
+	if _, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", "", map[string]bool{}, false, false, quiet); err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 
@@ -772,14 +772,14 @@ func TestSystemCertImportDialsTargetNodesNotTheSource(t *testing.T) {
 	var dialed []string
 	c.nodeDialer = dialRecorder(tgt, &dialed)
 
-	rep, err := Preflight(c, b, nil)
+	rep, err := Preflight(c, b, nil, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
 	if rep.Create != 2 {
 		t.Fatalf("want one create per admin node (2), got %d: %+v", rep.Create, rep.Items)
 	}
-	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, false, quiet); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	for _, host := range dialed {
@@ -810,7 +810,7 @@ func TestSystemCertPreflightHonoursNodeSelection(t *testing.T) {
 	tgt := twoNodeTarget(t)
 	c := tgt.client()
 
-	rep, err := Preflight(c, b, []string{"ISE-179"})
+	rep, err := Preflight(c, b, []string{"ISE-179"}, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -859,11 +859,11 @@ func TestSystemCertAdminRoleOffUnlessTicked(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := sysCertBundle(t, cert, "wildcard-"+tc.name, nil)
-			rep, err := Preflight(c, b, []string{"ISE-178"})
+			rep, err := Preflight(c, b, []string{"ISE-178"}, false)
 			if err != nil {
 				t.Fatalf("preflight: %v", err)
 			}
-			if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, tc.adminRole, quiet); err != nil {
+			if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, tc.adminRole, false, quiet); err != nil {
 				t.Fatalf("apply: %v", err)
 			}
 			tgt.mu.Lock()
@@ -891,11 +891,11 @@ func TestSystemCertZipSourceNeedsItsOwnPassword(t *testing.T) {
 	c.nodeDialer = func(host string) *Client { return tgt.client() }
 
 	b := sysCertBundle(t, cert, "from-the-gui", map[string]any{"keySource": "zip"})
-	rep, err := Preflight(c, b, []string{"ISE-178"})
+	rep, err := Preflight(c, b, []string{"ISE-178"}, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet)
+	res, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -906,7 +906,7 @@ func TestSystemCertZipSourceNeedsItsOwnPassword(t *testing.T) {
 		t.Errorf("the error should name the missing password, got %v", res.Errors)
 	}
 
-	res2, err := ApplyImport(c, rep, "test-passphrase-1234567890", "the-gui-password", nil, false, quiet)
+	res2, err := ApplyImport(c, rep, "test-passphrase-1234567890", "the-gui-password", nil, false, false, quiet)
 	if err != nil {
 		t.Fatalf("apply with password: %v", err)
 	}
@@ -934,7 +934,7 @@ func TestSystemCertIssuerMustBeTrustedOnTarget(t *testing.T) {
 	c := tgt.client()
 
 	b := sysCertBundle(t, leaf, "wildcard.ntslab.loc", leafObj)
-	rep, err := Preflight(c, b, []string{"ISE-178"})
+	rep, err := Preflight(c, b, []string{"ISE-178"}, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -953,7 +953,7 @@ func TestSystemCertIssuerMustBeTrustedOnTarget(t *testing.T) {
 		"fingerprint": fmt.Sprintf("%x", sha256.Sum256(ca.Raw)),
 		"notAfter":    ca.NotAfter.Format(time.RFC3339),
 	}}
-	rep2, err := Preflight(c, b2, []string{"ISE-178"})
+	rep2, err := Preflight(c, b2, []string{"ISE-178"}, false)
 	if err != nil {
 		t.Fatalf("preflight with the CA in the bundle: %v", err)
 	}
@@ -1152,11 +1152,11 @@ func TestSystemCertImportSendsEveryRequiredFlag(t *testing.T) {
 	c := tgt.client()
 	c.nodeDialer = func(host string) *Client { return tgt.client() }
 
-	rep, err := Preflight(c, b, []string{"ISE-178"})
+	rep, err := Preflight(c, b, []string{"ISE-178"}, false)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, false, quiet); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 

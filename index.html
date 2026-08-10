@@ -181,6 +181,8 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <span class="hint">Node identity certificates with private keys. Operator selects which nodes to import on.</span></label>
         <label><input type="checkbox" id="famPolicyElements"> Policy elements
           <span class="hint">Network device groups, dACLs, authorization profiles, identity source sequences, and conditions.</span></label>
+        <label><input type="checkbox" id="famPolicySets"> Policy sets and rules
+          <span class="hint">Network access policy sets with their authentication and authorization rules. Selecting this also includes policy elements.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Migrate these endpoint identity groups
@@ -305,6 +307,12 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             <input type="password" id="impZipPass" autocomplete="off"></div>
         </div>
       </div>
+    </section>
+
+    <section id="impPolicySec" class="hidden" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line)">
+      <h2>3. Policy set options</h2>
+      <label><input type="checkbox" id="impKeepState"> Import policy sets in the state they had on the source
+        <span class="hint">Off: policy sets and rules arrive disabled and must be enabled manually. On: an enabled set starts matching traffic immediately.</span></label>
     </section>
 
     <section id="impPre" class="hidden">
@@ -608,6 +616,12 @@ $("famSysCerts").addEventListener("change", () => {
 $("famPolicyElements").addEventListener("change", () => {
   // Policy elements have no picker, they're all-or-nothing
 });
+$("famPolicySets").addEventListener("change", () => {
+  // Ticking policy sets forces policy elements to be ticked
+  if ($("famPolicySets").checked && !$("famPolicyElements").checked) {
+    $("famPolicyElements").checked = true;
+  }
+});
 
 $("expGo").addEventListener("click", async () => {
   hide($("expError"));
@@ -618,6 +632,7 @@ $("expGo").addEventListener("click", async () => {
   if ($("famCerts").checked) families.push("trustedCertificates");
   if ($("famSysCerts").checked) families.push("systemCertificates");
   if ($("famPolicyElements").checked) families.push("policyElements");
+  if ($("famPolicySets").checked) families.push("policySets");
   if (!families.length) return showErr($("expError"), "Select at least one object family.");
   const phrase = $("expPhrase").value;
   if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");
@@ -779,6 +794,7 @@ function importForm(confirm) {
   if (nodes.length) fd.append("selectedNodes", JSON.stringify(nodes));
   if ($("impAdminRole").checked) fd.append("adminRole", "yes");
   if ($("impZipPass").value) fd.append("zipPassword", $("impZipPass").value);
+  if ($("impKeepState").checked) fd.append("keepState", "yes");
   return fd;
 }
 
@@ -867,6 +883,10 @@ function renderPreflight(data) {
     const hasZipSource = p.items.some(it => it.family === "systemCertificates" && it.obj && it.obj.keySource === "zip");
     $("impZipPassSec").classList.toggle("hidden", !hasZipSource);
   }
+
+  // Show policy set options if bundle has policy sets
+  const hasPolicySets = p.items.some(it => it.family === "policySets");
+  $("impPolicySec").classList.toggle("hidden", !hasPolicySets);
 
   $("impGo").disabled = p.create === 0;
   $("impGo").textContent = p.create === 0 ? "Nothing to create" : "Confirm and create " + p.create + " objects";
