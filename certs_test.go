@@ -412,7 +412,7 @@ func TestApplyCreatesTrustedCert(t *testing.T) {
 		t.Fatalf("preflight added %d create items, want 1", createCount)
 	}
 
-	res, err := ApplyImport(tgtC, rep, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestApplyCRLDependentFlagsWithDownloadOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	res, err := ApplyImport(tgtC, rep, quiet)
+	res, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", quiet)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestApplyCRLPutKeepsTrustFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
-	if _, err := ApplyImport(tgtC, rep, quiet); err != nil {
+	if _, err := ApplyImport(tgtC, rep, "test-passphrase-1234567890", quiet); err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 

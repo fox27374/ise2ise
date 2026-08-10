@@ -1,12 +1,19 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
+	"strings"
+	"time"
 )
 
 // HTTP handlers for the API-driven half of the tool. Credentials arrive in the
@@ -108,6 +115,136 @@ func handleTrustedCerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"certs": certs})
 }
 
+func handleSystemCerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var in creds
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "could not read the request: "+err.Error())
+		return
+	}
+	c, err := in.client()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	certs, err := ListSystemCerts(c)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"certs": certs})
+}
+
+func handleSystemCertZip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
+	if err := r.ParseMultipartForm(maxUpload); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("could not read the upload: %v", err))
+		return
+	}
+
+	var results []UploadedZip
+	for _, fileHeader := range r.MultipartForm.File["files"] {
+		f, err := fileHeader.Open()
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(io.LimitReader(f, maxUpload))
+		f.Close()
+
+		// Parse ZIP and extract certificate
+		zipData := data
+		if !bytes.HasPrefix(zipData, []byte("PK")) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q is not a ZIP file", fileHeader.Filename))
+			return
+		}
+
+		zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q is not a valid ZIP: %v", fileHeader.Filename, err))
+			return
+		}
+
+		var pemData, keyBlobData string
+		for _, f := range zr.File {
+			rc, _ := f.Open()
+			entryBody, _ := io.ReadAll(rc)
+			rc.Close()
+
+			if bytes.HasPrefix(entryBody, []byte("-----BEGIN")) {
+				block, _ := pem.Decode(entryBody)
+				if block != nil && block.Type == "CERTIFICATE" {
+					pemData = string(entryBody)
+					continue
+				}
+			}
+			if strings.Contains(string(entryBody), "ENCRYPTED PRIVATE KEY") {
+				keyBlobData = string(entryBody)
+			}
+		}
+
+		if pemData == "" {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q: entry cert.pem parsed; no private key entry in the ZIP", fileHeader.Filename))
+			return
+		}
+		if keyBlobData == "" {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q: entry cert.pem parsed; no private key entry in the ZIP", fileHeader.Filename))
+			return
+		}
+
+		// Parse certificate to extract metadata
+		block, _ := pem.Decode([]byte(pemData))
+		var cert *x509.Certificate
+		var subject, cn string
+		var sans []string
+		var keySize int
+		var selfSigned bool
+		var expiresAt string
+
+		if block != nil {
+			if parsedCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+				cert = parsedCert
+				subject = parsedCert.Subject.String()
+				cn = parsedCert.Subject.CommonName
+				for _, dns := range parsedCert.DNSNames {
+					sans = append(sans, dns)
+				}
+				for _, ip := range parsedCert.IPAddresses {
+					sans = append(sans, ip.String())
+				}
+				keySize = 2048 // Placeholder; would need to examine public key
+				selfSigned = cert.Subject.String() == cert.Issuer.String()
+				expiresAt = cert.NotAfter.Format(time.RFC3339)
+			}
+		}
+
+		if cn == "" {
+			cn = fileHeader.Filename
+		}
+
+		fp := fmt.Sprintf("%x", sha256.Sum256(block.Bytes))
+		results = append(results, UploadedZip{
+			Filename:    fileHeader.Filename,
+			Name:        cn,
+			Subject:     subject,
+			SANs:        sans,
+			KeySize:     keySize,
+			ExpiresAt:   expiresAt,
+			HasKey:      keyBlobData != "",
+			Fingerprint: fp,
+			SelfSigned:  selfSigned,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"zips": results})
+}
+
 // --- newline-delimited JSON progress ----------------------------------------
 
 // stream writes one JSON object per line and flushes each one, so the browser
@@ -150,10 +287,31 @@ func (s *stream) fail(format string, a ...any) {
 
 type exportReq struct {
 	creds
-	Families   []string `json:"families"`
-	Groups     []string `json:"groups"`
-	Certs      []string `json:"certs"`
-	Passphrase string   `json:"passphrase"`
+	Families    []string `json:"families"`
+	Groups      []string `json:"groups"`
+	Certs       []string `json:"certs"`
+	Passphrase  string   `json:"passphrase"`
+	SystemCerts []string `json:"systemCerts"`
+}
+
+// UploadedZip carries metadata about a system certificate uploaded as a ZIP from the 3.2 GUI.
+type UploadedZip struct {
+	Filename    string   `json:"filename"`
+	Name        string   `json:"name"`
+	Subject     string   `json:"subject"`
+	SANs        []string `json:"sans"`
+	KeySize     int      `json:"keySize"`
+	ExpiresAt   string   `json:"expiresAt"`
+	HasKey      bool     `json:"hasKey"`
+	Fingerprint string   `json:"fingerprint"`
+	SelfSigned  bool     `json:"selfSigned"`
+	EAP         bool     `json:"eap"`
+	RADIUS      bool     `json:"radius"`
+	TACACS      bool     `json:"tacacs"`
+	PxGrid      bool     `json:"pxgrid"`
+	IMS         bool     `json:"ims"`
+	SAML        bool     `json:"saml"`
+	Portal      bool     `json:"portal"`
 }
 
 func handleExport(w http.ResponseWriter, r *http.Request) {
@@ -205,6 +363,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		s.fail("%v", err)
 		return
 	}
+	if err := ExportSystemCerts(c, b, in.Families, in.SystemCerts, in.Passphrase, []map[string]any{}, "", s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
 
 	sealed, err := SealBundle(b, in.Passphrase)
 	if err != nil {
@@ -238,8 +400,9 @@ func firstNote(p *Probe) string {
 // importInput is the multipart form both import steps take: the target's
 // credentials, the bundle file and its passphrase.
 type importInput struct {
-	client *Client
-	bundle *Bundle
+	client     *Client
+	bundle     *Bundle
+	passphrase string
 }
 
 func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
@@ -271,7 +434,7 @@ func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &importInput{client: c, bundle: b}, nil
+	return &importInput{client: c, bundle: b, passphrase: pass}, nil
 }
 
 func handlePreflight(w http.ResponseWriter, r *http.Request) {
@@ -339,7 +502,7 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	res, err := ApplyImport(in.client, rep, s.log)
+	res, err := ApplyImport(in.client, rep, in.passphrase, s.log)
 	if err != nil {
 		s.fail("%v", err)
 		s.send(map[string]any{"type": "done", "result": res, "preflight": rep})

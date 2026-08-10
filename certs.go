@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -492,6 +493,449 @@ func ListTrustedCerts(c *Client) ([]TrustedCertInfo, error) {
 
 	sort.Slice(result, func(i, j int) bool { return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name) })
 	return result, nil
+}
+
+// certPassword derives the password ISE encrypts an exported private key with.
+// ISE requires alphanumeric, 8–100 characters; the bundle passphrase rule is 12
+// characters of anything, so it cannot be handed over verbatim. base32 of a
+// SHA-256 over a fixed label and the passphrase is alphanumeric by construction
+// and identical on both sides.
+func certPassword(passphrase string) string {
+	const label = "ise2ise system certificate v1"
+	hash := sha256.Sum256([]byte(label + passphrase))
+	// base32.StdEncoding with padding stripped, truncated to 32 chars
+	b32 := base32.StdEncoding.EncodeToString(hash[:])
+	b32 = strings.TrimRight(b32, "=")
+	if len(b32) > 32 {
+		return b32[:32]
+	}
+	return b32
+}
+
+// SystemCertInfo is what the picker endpoint returns for system certificates.
+type SystemCertInfo struct {
+	Fingerprint        string   `json:"fingerprint"`
+	Name               string   `json:"name"`
+	Node               string   `json:"node"`
+	Nodes              []string `json:"nodes"`
+	Subject            string   `json:"subject"`
+	SANs               []string `json:"sans"`
+	KeySize            int      `json:"keySize"`
+	UsedBy             string   `json:"usedBy"`
+	Roles              []string `json:"roles"`
+	GroupTag           string   `json:"groupTag"`
+	PortalsUsingTheTag []string `json:"portalsUsingTheTag"`
+	ExpiresAt          string   `json:"expiresAt"`
+	SelfSigned         bool     `json:"selfSigned"`
+	Ticked             bool     `json:"ticked"`
+	Disabled           bool     `json:"disabled"`
+	Reason             string   `json:"reason,omitempty"`
+}
+
+// ListSystemCerts lists all system certificates from the source, grouped by fingerprint.
+// It fetches from /api/v1/certs/system-certificate/{hostName} per node.
+func ListSystemCerts(c *Client) ([]SystemCertInfo, error) {
+	// Fetch all Admin-persona nodes from /api/v1/deployment/node
+	nodes, err := c.openAPIList(pathDeploymentNode)
+	if err != nil {
+		return nil, fmt.Errorf("could not read deployment nodes: %w", err)
+	}
+
+	adminNodes := []string{}
+	for _, node := range nodes {
+		roles, _ := node["roles"].([]any)
+		for _, role := range roles {
+			if rs, _ := role.(string); strings.Contains(rs, "Admin") {
+				if hostName := str(node, "hostname"); hostName != "" {
+					adminNodes = append(adminNodes, hostName)
+				}
+				break
+			}
+		}
+	}
+
+	// If no Admin nodes found, try to use node names from earlier reads
+	if len(adminNodes) == 0 {
+		// Fallback: use ERS node names, but mark this as incomplete
+		if stubs, err := c.ersList("/ers/config/node"); err == nil {
+			for _, stub := range stubs {
+				adminNodes = append(adminNodes, stub.Name)
+			}
+		}
+	}
+
+	// Deduplicate by fingerprint, collecting which nodes hold each cert
+	byFingerprint := map[string]*SystemCertInfo{}
+	firstNodeByFP := map[string]string{}
+
+	for _, hostName := range adminNodes {
+		certs, err := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, hostName))
+		if err != nil {
+			// One node's failure does not stop reading others
+			continue
+		}
+
+		for _, cert := range certs {
+			fp := str(cert, "sha256Fingerprint")
+			// Normalize fingerprint: lowercase, strip whitespace and colons
+			fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+			if fp == "" {
+				continue
+			}
+
+			if _, seen := byFingerprint[fp]; !seen {
+				// First sighting: fetch the certificate body to parse details
+				id := str(cert, "id")
+				if id == "" {
+					continue
+				}
+
+				// Export with CERTIFICATE only (no private key, no password)
+				// POST to /api/v1/certs/system-certificate/export with {id, hostName, export}
+				body, err := c.do(http.MethodPost, c.apiBase+pathSystemCertsAPI+"/export", map[string]any{
+					"id":       id,
+					"hostName": hostName,
+					"export":   "CERTIFICATE",
+				})
+				if err != nil {
+					continue
+				}
+
+				// Parse certificate to extract subject, SANs, key size
+				var parsedCert *x509.Certificate
+				if bytes.HasPrefix(body, []byte("-----BEGIN")) {
+					block, _ := pem.Decode(body)
+					if block != nil && block.Type == "CERTIFICATE" {
+						if c, _ := x509.ParseCertificate(block.Bytes); c != nil {
+							parsedCert = c
+						}
+					}
+				}
+
+				// Build the info object
+				info := &SystemCertInfo{
+					Fingerprint:        fp,
+					Name:               str(cert, "friendlyName"),
+					Node:               hostName,
+					Nodes:              []string{hostName},
+					Subject:            str(cert, "issuedTo"),
+					KeySize:            int(numField(cert, "keySize")),
+					GroupTag:           str(cert, "groupTag"),
+					PortalsUsingTheTag: parseStringArray(cert, "portalsUsingTheTag"),
+					ExpiresAt:          formatJavaDate(str(cert, "expirationDate")),
+					SelfSigned:         truthy(cert, "selfSigned"),
+					Ticked:             false, // Set below based on rules
+					Disabled:           false, // Set below based on expiry
+					Roles:              parseRoles(str(cert, "usedBy")),
+				}
+
+				// Extract SANs and full subject from certificate if parsed
+				if parsedCert != nil {
+					info.Subject = parsedCert.Subject.String()
+					for _, san := range parsedCert.DNSNames {
+						info.SANs = append(info.SANs, san)
+					}
+					for _, ip := range parsedCert.IPAddresses {
+						info.SANs = append(info.SANs, ip.String())
+					}
+				}
+
+				// Apply ticking rules
+				if info.SelfSigned {
+					info.Ticked = false
+					info.Reason = "Self-signed"
+				} else if isWildcardOrMultiSAN(info) {
+					info.Ticked = true
+				} else if info.KeySize == 0 {
+					info.Ticked = false
+					info.Reason = "Unknown key size"
+				} else {
+					info.Ticked = false
+					info.Reason = "Single-name certificate"
+				}
+
+				// Check expiry
+				if info.ExpiresAt != "" {
+					if exp, err := time.Parse(time.RFC3339, info.ExpiresAt); err == nil && exp.Before(time.Now()) {
+						info.Disabled = true
+						info.Reason = fmt.Sprintf("Expired on %s", exp.Format("2006-01-02"))
+					}
+				}
+
+				byFingerprint[fp] = info
+				firstNodeByFP[fp] = hostName
+			} else {
+				// Additional node with same fingerprint: record it
+				if info := byFingerprint[fp]; hostName != firstNodeByFP[fp] {
+					info.Nodes = append(info.Nodes, hostName)
+				}
+			}
+		}
+	}
+
+	result := make([]SystemCertInfo, 0, len(byFingerprint))
+	for _, info := range byFingerprint {
+		result = append(result, *info)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
+	return result, nil
+}
+
+func numField(obj map[string]any, key string) float64 {
+	switch v := obj[key].(type) {
+	case float64:
+		return v
+	case string:
+		if f, _ := strconv.ParseFloat(v, 64); f > 0 {
+			return f
+		}
+	}
+	return 0
+}
+
+func parseStringArray(obj map[string]any, key string) []string {
+	switch v := obj[key].(type) {
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, _ := item.(string); s != "" {
+				result = append(result, s)
+			}
+		}
+		return result
+	case []string:
+		return v
+	}
+	return nil
+}
+
+func formatJavaDate(javaDate string) string {
+	if javaDate == "" {
+		return ""
+	}
+	// Try parsing Java Date.toString() format: "Mon Aug 04 09:14:23 CEST 2036"
+	if parsed, err := time.Parse("Mon Jan 02 15:04:05 MST 2006", javaDate); err == nil {
+		return parsed.Format(time.RFC3339)
+	}
+	// Return raw if parsing fails
+	return javaDate
+}
+
+func parseRoles(usedBy string) []string {
+	if usedBy == "" {
+		return nil
+	}
+	roles := []string{}
+	for _, part := range strings.Split(usedBy, ",") {
+		role := strings.TrimSpace(part)
+		if role != "" {
+			roles = append(roles, role)
+		}
+	}
+	return roles
+}
+
+func isWildcardOrMultiSAN(info *SystemCertInfo) bool {
+	cn := extractCN(info.Subject)
+	if strings.HasPrefix(cn, "*.") {
+		return true
+	}
+	dnsCount := 0
+	for _, san := range info.SANs {
+		if !strings.Contains(san, ".") || strings.Contains(san, ":") {
+			continue // Skip IPs
+		}
+		dnsCount++
+	}
+	return dnsCount > 1
+}
+
+func extractCN(dn string) string {
+	for _, part := range strings.Split(dn, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "CN=") {
+			return strings.TrimPrefix(part, "CN=")
+		}
+	}
+	return ""
+}
+
+// ExportSystemCerts fills the bundle with system certificates selected by fingerprint.
+// It reads from the OpenAPI and handles both API exports (with password) and ZIP imports.
+func ExportSystemCerts(c *Client, b *Bundle, families []string, fingerprints []string, passphrase string, zips []map[string]any, zipPassword string, log func(string, ...any)) error {
+	if !slices.Contains(families, familySystemCerts) {
+		return nil
+	}
+
+	// Map fingerprints to retrieve: normalize them
+	wantFP := map[string]bool{}
+	for _, fp := range fingerprints {
+		normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""))
+		wantFP[normalized] = true
+	}
+
+	log("Listing system certificates…")
+	certs, err := ListSystemCerts(c)
+	if err != nil {
+		return fmt.Errorf("could not read system certificates: %w", err)
+	}
+
+	log("Found %d system certificates; filtering selected…", len(certs))
+	b.Note("System certificates were read from OpenAPI %s.", pathSystemCertsAPI)
+
+	// Fetch full cert objects from each node for lookup by fingerprint
+	certsByNode := map[string][]map[string]any{}
+	for _, cert := range certs {
+		for _, node := range cert.Nodes {
+			if _, ok := certsByNode[node]; !ok {
+				if nodeList, _ := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, node)); nodeList != nil {
+					certsByNode[node] = nodeList
+				}
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(certs))
+	for _, cert := range certs {
+		if !wantFP[cert.Fingerprint] {
+			continue
+		}
+
+		// Find the full cert object on the primary node
+		var certObj map[string]any
+		nodeList := certsByNode[cert.Node]
+		for _, obj := range nodeList {
+			if str(obj, "sha256Fingerprint") == cert.Fingerprint {
+				certObj = obj
+				break
+			}
+		}
+
+		if certObj == nil {
+			b.Note("System certificate %q not found on node %s; skipped.", cert.Name, cert.Node)
+			continue
+		}
+
+		id := str(certObj, "id")
+		if id == "" {
+			b.Note("System certificate %q has no id; skipped.", cert.Name)
+			continue
+		}
+
+		// Export with CERTIFICATE_WITH_PRIVATE_KEY and the derived password
+		body, err := c.do(http.MethodPost, c.apiBase+pathSystemCertsAPI+"/export", map[string]any{
+			"id":       id,
+			"hostName": cert.Node,
+			"export":   "CERTIFICATE_WITH_PRIVATE_KEY",
+			"password": certPassword(passphrase),
+		})
+		if err != nil {
+			b.Note("Could not export system certificate %q: %v", cert.Name, err)
+			continue
+		}
+
+		// Walk the ZIP: parse entry as certificate = pem, entry that doesn't parse = .pvk
+		zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		if err != nil {
+			b.Note("System certificate %q export is not a valid ZIP: %v", cert.Name, err)
+			continue
+		}
+
+		var pemData, keyBlob string
+		for _, f := range zr.File {
+			rc, _ := f.Open()
+			entryBody, _ := io.ReadAll(rc)
+			rc.Close()
+
+			// Try to parse as certificate
+			if bytes.HasPrefix(entryBody, []byte("-----BEGIN")) {
+				block, _ := pem.Decode(entryBody)
+				if block != nil && block.Type == "CERTIFICATE" {
+					pemData = string(entryBody)
+					continue
+				}
+			}
+
+			// If not certificate, treat as private key
+			if strings.Contains(string(entryBody), "ENCRYPTED PRIVATE KEY") {
+				keyBlob = string(entryBody)
+			}
+		}
+
+		if pemData == "" {
+			b.Note("System certificate %q export has no .pem entry; skipped.", cert.Name)
+			continue
+		}
+		if keyBlob == "" {
+			b.Note("System certificate %q export has no .pvk entry; skipped.", cert.Name)
+			continue
+		}
+
+		bundleObj := map[string]any{
+			"name":           cert.Name,
+			"pem":            pemData,
+			"keyBlob":        keyBlob,
+			"keySource":      "api",
+			"fingerprint":    cert.Fingerprint,
+			"notAfter":       cert.ExpiresAt,
+			"subject":        cert.Subject,
+			"issuer":         "",
+			"selfSigned":     cert.SelfSigned,
+			"keySize":        cert.KeySize,
+			"sans":           cert.SANs,
+			"portalGroupTag": cert.GroupTag,
+			"sourceNode":     cert.Node,
+			"admin":          false,
+			"eap":            slices.Contains(cert.Roles, "EAP Authentication"),
+			"radius":         slices.Contains(cert.Roles, "RADIUS DTLS") || slices.Contains(cert.Roles, "RADSec"),
+			"tacacs":         slices.Contains(cert.Roles, "TACACS"),
+			"pxgrid":         slices.Contains(cert.Roles, "pxGrid"),
+			"ims":            slices.Contains(cert.Roles, "ISE Messaging Service"),
+			"saml":           slices.Contains(cert.Roles, "SAML"),
+			"portal":         slices.Contains(cert.Roles, "Portal"),
+		}
+
+		out = append(out, bundleObj)
+	}
+
+	// Handle ZIP imports from 3.2 GUI path
+	for _, zipInfo := range zips {
+		// User selected roles from UI; keep name as-is
+		// keySource: "zip", no re-encryption
+		bundleObj := map[string]any{
+			"name":           str(zipInfo, "name"),
+			"keyBlob":        str(zipInfo, "keyBlob"),
+			"keySource":      "zip",
+			"fingerprint":    str(zipInfo, "fingerprint"),
+			"notAfter":       str(zipInfo, "expiresAt"),
+			"subject":        str(zipInfo, "subject"),
+			"issuer":         "",
+			"selfSigned":     zipInfo["selfSigned"],
+			"keySize":        zipInfo["keySize"],
+			"sans":           zipInfo["sans"],
+			"portalGroupTag": "",
+			"sourceNode":     "",
+			"admin":          false,
+			"eap":            truthy(zipInfo, "eap"),
+			"radius":         truthy(zipInfo, "radius"),
+			"tacacs":         truthy(zipInfo, "tacacs"),
+			"pxgrid":         truthy(zipInfo, "pxgrid"),
+			"ims":            truthy(zipInfo, "ims"),
+			"saml":           truthy(zipInfo, "saml"),
+			"portal":         truthy(zipInfo, "portal"),
+		}
+		out = append(out, bundleObj)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(str(out[i], "name")) < strings.ToLower(str(out[j], "name"))
+	})
+	b.Objects[familySystemCerts] = out
+	log("Captured %d system certificates.", len(out))
+	return nil
 }
 
 // --- pre-flight and import ---------------------------------------------------
