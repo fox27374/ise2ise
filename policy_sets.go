@@ -243,14 +243,31 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 		}
 	}
 
-	// Also count authorization profiles created in this bundle
-	willExistAuthProfiles := map[string]string{}
-	if elemItems := b.Objects[familyPolicyElements]; len(elemItems) > 0 {
-		for _, item := range elemItems {
-			if str(item, "kind") == "authorizationProfile" {
-				willExistAuthProfiles[str(item, "name")] = "will-be-created"
-			}
+	// What the policy element half of this same run will actually create. Taken
+	// from the report rather than from the bundle: an element the bundle carries
+	// but pre-flight blocked is never going to exist, and counting it would let
+	// a policy set through that references something that never arrives.
+	// preflightPolicyElements runs before this function, so its verdicts are in.
+	willExist := map[string]map[string]string{}
+	for _, it := range r.Items {
+		if it.Family != familyPolicyElements || it.Action != actionCreate {
+			continue
 		}
+		kind := str(it.obj, "kind")
+		if willExist[kind] == nil {
+			willExist[kind] = map[string]string{}
+		}
+		willExist[kind][str(it.obj, "name")] = "will-be-created"
+	}
+	willExistAuthProfiles := willExist["authorizationProfile"]
+	if willExistAuthProfiles == nil {
+		willExistAuthProfiles = map[string]string{}
+	}
+	// An identity source sequence this run creates counts as an identity store,
+	// which is what a rule names. Leaving it out blocked a policy set for a
+	// sequence sitting in its own bundle.
+	for name := range willExist["idStoreSequence"] {
+		idStoreByName[name] = "will-be-created"
 	}
 
 	// Conditions (by name)
@@ -263,13 +280,10 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 		}
 	}
 
-	// Also count conditions created in this bundle
-	if elemItems := b.Objects[familyPolicyElements]; len(elemItems) > 0 {
-		for _, item := range elemItems {
-			if str(item, "kind") == "condition" {
-				conditionByName[str(item, "name")] = "will-be-created"
-			}
-		}
+	// Library conditions this run creates, again from the report rather than
+	// from the bundle.
+	for name := range willExist["condition"] {
+		conditionByName[name] = "will-be-created"
 	}
 
 	// Target's existing policy sets by name

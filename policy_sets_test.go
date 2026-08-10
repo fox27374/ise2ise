@@ -358,3 +358,64 @@ func TestPolicySetsReRunCreatesNothing(t *testing.T) {
 		t.Fatalf("a re-run must write nothing, got %+v", second)
 	}
 }
+
+// A policy set must not be blocked for an object the same run is about to
+// create — and must still be blocked when that object is itself blocked. The
+// distinction is what the report says, not what the bundle happens to contain.
+func TestSetCountsOnlyElementsThatWillReallyBeCreated(t *testing.T) {
+	src := srcWithPolicySets(t)
+	// The rule names an identity source sequence the bundle also carries.
+	src.addIdStoreSequence("iss-corp", "Corp_Sequence", "")
+	src.addRule("src-set-1", "authentication", "Corp", false,
+		map[string]any{"identitySourceName": "Corp_Sequence", "ifAuthFail": "REJECT"}, nil)
+
+	b := exportSets(t, src)
+	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
+		t.Fatalf("export elements: %v", err)
+	}
+
+	tgt := tgtForPolicySets(t)
+	rep, err := Preflight(tgt.client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	for _, it := range rep.Items {
+		if it.Family == familyPolicySets && strings.Contains(it.Name, "KOF") {
+			if it.Action == actionBlocked && strings.Contains(it.Reason, "Corp_Sequence") {
+				t.Fatalf("blocked for a sequence this same run creates: %q", it.Reason)
+			}
+		}
+	}
+
+	// Now make that sequence unresolvable, so the element half blocks it. The
+	// set must block too: what is never created cannot be referenced.
+	src2 := srcWithPolicySets(t)
+	src2.addIdStoreSequence("iss-ad", "AD_Sequence", "")
+	src2.mu.Lock()
+	for _, s := range src2.idStoreSequences {
+		if str(s, "name") == "AD_Sequence" {
+			s["idSeqItem"] = []any{map[string]any{"idstore": "some.domain.example", "order": 1}}
+		}
+	}
+	src2.mu.Unlock()
+	src2.addRule("src-set-1", "authentication", "AD", false,
+		map[string]any{"identitySourceName": "AD_Sequence", "ifAuthFail": "REJECT"}, nil)
+
+	b2 := exportSets(t, src2)
+	if err := ExportPolicyElements(src2.client(), b2, []string{familyPolicyElements}, quiet); err != nil {
+		t.Fatalf("export elements: %v", err)
+	}
+	rep2, err := Preflight(tgtForPolicySets(t).client(), b2, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	var blocked bool
+	for _, it := range rep2.Items {
+		if it.Family == familyPolicySets && strings.Contains(it.Name, "KOF") && it.Action == actionBlocked {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Error("the set was allowed through on a sequence whose own creation is blocked")
+	}
+}
