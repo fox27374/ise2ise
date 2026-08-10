@@ -641,6 +641,82 @@ authorization profile's fields across all 26 readable ones are `accessType`,
 policy element has been posted to a real deployment. Proving it any earlier would
 mean writing throwaway objects onto a real box outside the pre-flight gate.
 
+### Policy sets, read off the box on 2026-08-10
+
+Slice 8. Interviewed with the read shapes taken from `ise.ntslab.loc` first, and
+they contradict what this file predicted twice over.
+
+**Rules reference by name, not by UUID.** An authentication rule carries
+`identitySourceName: "EntraID_Sequence"`; an authorization rule carries
+`profile: ["CLIENTS-88"]` and `securityGroup`; a set carries
+`serviceName: "Default Network Access"`. The table at the top of this section
+predicted an `identitySourceId` UUID. It does not exist. The only UUID a rule
+carries is inside a `ConditionReference` — and that object carries the condition's
+**name alongside its id**, so even there the remap is a name lookup rather than a
+two-pass reconciliation.
+
+What travels: the set, its `/authentication` rules and its `/authorization`
+rules. Per-set exceptions, `global-exception` and `/mfa` are all **empty on the
+source** and are not built; a bundle that holds any of them gets a note per set
+rather than a silent drop.
+
+**Ticking policy sets forces policy elements into the same bundle.** Nearly every
+rule names an authorization profile or an identity source sequence, so a
+sets-only export is one whose rules mostly cannot resolve. Elements alone stay
+available for a target that already has the sets.
+
+**Imported sets and rules arrive disabled.** `state` is the one field ISE really
+does offer here — policy elements have nothing like it — and disabled means the
+import cannot change how the target treats traffic until a human looks at it. It
+also answers "which ones came from the migration" directly. One unticked checkbox
+carries the source's own state instead, for an operator doing a live cutover.
+
+**Rank is appended, never reused.** Imported sets go after everything the target
+has, in their source order, always above the target's `Default`, which ISE keeps
+last. Rules do the same inside their set. Reproducing the source's rank exactly
+would push the target's own sets down and silently change which rules match
+first, which is a traffic-affecting change nobody asked for.
+
+**The `Default` set is the one merge case.** It cannot be created and cannot be
+deleted, and on the source it holds 4 authentication and **32 authorization**
+rules — for most deployments the bulk of the policy. So the set is skipped and
+its rules are treated as ordinary objects against the target's own `Default`:
+a name the target lacks is created, a name it has is skipped, its factory rules
+are untouched. This is the whole of the "factory defaults get updated" idea that
+earlier sections deferred, and it is deliberately narrower: rules are added
+beside the target's, never over them.
+
+**Any other name clash is imported beside the target's**, as `Guest (imported)`,
+then `Guest (imported 2)`. Deterministic, so a re-run skips instead of making a
+third copy; a date in the suffix would break that the next day. The target's own
+set is never touched and never merged into, because two sets sharing a name are
+not the same set — and the imported one is disabled, so both can exist without
+both matching traffic.
+
+**An unresolvable reference blocks the entire set**, nothing from it written,
+with a note naming each missing object and what to do about it. A set that lands
+without one of its rules still matches the traffic and then treats it differently
+than the source did, which looks like a successful migration and is not. On this
+source the references that no bundle can supply today are the **7 security
+groups** (TrustSec is slice 7), `EntraID_Cert_Profile` (certificate
+authentication profiles are not migrated) and the `ntslab.loc` AD join point
+(slice 9, and it needs a manual domain join first). Everything else — 28
+authorization profiles, `EntraID_Sequence`, the built-in stores, the factory
+service name — travels or is already there.
+
+Verified read shapes: a set is `default`, `id`, `name`, `description`,
+`hitCounts`, `rank`, `state`, `condition`, `serviceName`; an authentication rule
+is `{rule: {default, id, name, hitCounts, rank, state, condition},
+identitySourceName, ifAuthFail, ifUserNotFound, ifProcessFail}`; an authorization
+rule is `{rule: {...}, profile: [names], securityGroup}`. A condition tree nests
+`ConditionAndBlock` / `ConditionOrBlock` over `ConditionAttributes` and
+`ConditionReference` children.
+
+**Unproven until the first real run**: the POST bodies for a set and a rule,
+whether ISE honours `rank` on create or assigns its own, and whether a
+`ConditionReference` needs the target's id or resolves by name. All three are
+safe to find out, because everything lands disabled.
+
 ### What the tool created is marked in the description
 
 Asked for on 2026-08-10: a way to see at a glance which objects on the target
@@ -980,7 +1056,12 @@ Ordered by dependency, not by size.
    skipped with their content drift reported, and the update mechanism waits for
    the policy set slice, where `Default` makes it necessary.
 7. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
-8. **Policy sets and rules** — the two-pass UUID remap. Most dependent on lab
-   iteration; deliberately last.
+8. **Policy sets and rules** — interviewed on 2026-08-10 with the read shapes
+   taken off `ise.ntslab.loc` first; see the section above. In build. The
+   "two-pass UUID remap" this entry used to promise turned out not to be needed:
+   rules reference by name, and the one reference that carries a UUID carries the
+   name beside it. Imported sets arrive **disabled**, which is what makes
+   building it before TrustSec acceptable — a set referencing an SGT the target
+   lacks is blocked, not half-written.
 9. **AD join point** config export, creation, and `addGroups`.
 10. **Network device CSV → API import.**
