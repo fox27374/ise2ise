@@ -1096,3 +1096,46 @@ func genCertWithSANs(t *testing.T, cn string, dns []string) *x509.Certificate {
 	}
 	return cert
 }
+
+// The bundle has to carry the issuer and the source's own admin role, or two
+// designed behaviours quietly stop working: pre-flight cannot block a
+// certificate whose issuer the target does not trust, and the admin checkbox on
+// the import step has nothing to act on. Both were empty against a real box.
+func TestExportRecordsIssuerAndAdminRole(t *testing.T) {
+	cert := genCertWithSANs(t, "ise.ntslab.loc", []string{"ise.ntslab.loc", "ise01.ntslab.loc"})
+
+	f := newFakeISE(t)
+	f.mu.Lock()
+	f.deploymentNodes = []map[string]any{{
+		"hostname": "ISE01", "ipAddress": "10.0.0.1", "nodeStatus": "Connected",
+		"roles": []any{"PrimaryAdmin"},
+	}}
+	f.systemCerts["ISE01"] = []map[string]any{}
+	f.mu.Unlock()
+	f.addSystemCert("ISE01", "multi", "the wildcard", "aa11", []string{"Admin", "EAP Authentication"})
+	f.mu.Lock()
+	f.systemCertPEM["sys-cert-multi"] = pemEncode(cert.Raw)
+	for _, c := range f.systemCerts["ISE01"] {
+		c["selfSigned"] = false
+	}
+	f.mu.Unlock()
+
+	rows, err := ListSystemCerts(f.client())
+	if err != nil {
+		t.Fatalf("picker: %v", err)
+	}
+	b := NewBundle(&Probe{Nodes: []string{"ISE01"}})
+	if err := ExportSystemCerts(f.client(), b, []string{familySystemCerts}, []string{rows[0].Fingerprint}, "test-passphrase-1234567890", nil, "", quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	objs := b.Objects[familySystemCerts]
+	if len(objs) != 1 {
+		t.Fatalf("exported %d objects, want 1", len(objs))
+	}
+	if got := str(objs[0], "issuer"); got != cert.Issuer.String() {
+		t.Errorf("issuer = %q, want %q; an empty issuer disables the chain check", got, cert.Issuer.String())
+	}
+	if !truthy(objs[0], "admin") {
+		t.Error("the source's admin role did not travel, so the import's admin checkbox can never take effect")
+	}
+}

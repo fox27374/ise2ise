@@ -582,7 +582,11 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Return cached export if available
-		if exportData, ok := f.systemCertExports[id]; ok {
+		// Keyed by mode as well as id: a keyless export and a with-key export of
+		// the same certificate are different bodies, and caching them together
+		// handed the tool a ZIP with no key in it.
+		mode, _ := body["export"].(string)
+		if exportData, ok := f.systemCertExports[id+"|"+mode]; ok {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(exportData)
 			return
@@ -604,7 +608,7 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 		z.Close()
 
 		exportData := buf.Bytes()
-		f.systemCertExports[id] = exportData
+		f.systemCertExports[id+"|"+mode] = exportData
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(exportData)
