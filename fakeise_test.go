@@ -37,6 +37,7 @@ type fakeISE struct {
 	policies    map[string][]map[string]any // policy path -> list of policy objects
 
 	systemCerts       map[string][]map[string]any // hostname -> list of system certs
+	systemCertImports []map[string]any            // import payloads, in arrival order
 	systemCertExports map[string][]byte           // cert id -> export body
 	systemCertCreated map[string][]map[string]any // hostname -> created payloads
 	deploymentNodes   []map[string]any
@@ -476,10 +477,10 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// System certificate listing per node
-	if strings.HasPrefix(path, "/api/v1/certs/system-certificate/") && !strings.Contains(path[30:], "/") {
+	if strings.HasPrefix(path, "/api/v1/certs/system-certificate/") {
 		hostName := strings.TrimPrefix(path, "/api/v1/certs/system-certificate/")
-		if strings.Contains(hostName, "/") {
-			// It's not just a hostname, fall through
+		if strings.Contains(hostName, "/") || hostName == "export" || hostName == "import" {
+			// A sub-path or one of the action endpoints; handled below.
 		} else if r.Method == http.MethodGet {
 			f.pagesServed["system-cert-"+hostName]++
 			certs := f.systemCerts[hostName]
@@ -536,7 +537,10 @@ func (f *fakeISE) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Record the created certificate (for testing)
+		// Record the created certificate (for testing). systemCertImports keeps
+		// them in the order they arrived, which is what the per-node tests read.
+		// serveAPI already holds f.mu.
+		f.systemCertImports = append(f.systemCertImports, body)
 		for hostName := range f.systemCerts {
 			f.systemCertCreated[hostName] = append(f.systemCertCreated[hostName], body)
 		}

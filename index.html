@@ -93,6 +93,11 @@ nav.crumbs { margin-bottom: 1rem; }
 .kv { margin: 0 0 .6rem; color: var(--muted); font-size: .9rem; }
 .kv b { color: var(--fg); }
 .picker { max-height: 16rem; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; background: var(--bg); }
+.zipcard { border: 1px solid var(--line); border-radius: 6px; padding: .7rem .9rem; margin-bottom: .8rem; background: var(--bg); }
+.zipcard .zipname { font-weight: 600; }
+.zipcard .zipname-field { display: block; margin: .5rem 0 .4rem; font-weight: 400; }
+.zipcard .zipname-input { width: 100%; }
+.zipcard .ziproles label { display: inline-block; margin-right: 1rem; font-size: .85rem; font-weight: 400; }
 .picker label, .families label { display: flex; gap: .5rem; align-items: baseline; font-weight: 400; margin-bottom: .25rem; }
 .families label { font-weight: 600; }
 .families .hint { display: block; font-weight: 400; color: var(--muted); font-size: .87rem; }
@@ -599,101 +604,131 @@ $("famSysCerts").addEventListener("change", () => {
   if ($("famSysCerts").checked) loadSystemCerts();
 });
 
-$(“expGo”).addEventListener(“click”, async () => {
-  hide($(“expError”));
-  $(“expResult”).innerHTML = “”;
+$("expGo").addEventListener("click", async () => {
+  hide($("expError"));
+  $("expResult").innerHTML = "";
   const families = [];
-  if ($(“famGroups”).checked) families.push(“endpointGroups”);
-  if ($(“famEndpoints”).checked) families.push(“endpoints”);
-  if ($(“famCerts”).checked) families.push(“trustedCertificates”);
-  if ($(“famSysCerts”).checked) families.push(“systemCertificates”);
-  if (!families.length) return showErr($(“expError”), “Select at least one object family.”);
-  const phrase = $(“expPhrase”).value;
-  if (phrase.length < 12) return showErr($(“expError”), “The bundle passphrase must be at least 12 characters.”);
-  if (phrase !== $(“expPhrase2”).value) return showErr($(“expError”), “The two passphrases do not match.”);
+  if ($("famGroups").checked) families.push("endpointGroups");
+  if ($("famEndpoints").checked) families.push("endpoints");
+  if ($("famCerts").checked) families.push("trustedCertificates");
+  if ($("famSysCerts").checked) families.push("systemCertificates");
+  if (!families.length) return showErr($("expError"), "Select at least one object family.");
+  const phrase = $("expPhrase").value;
+  if (phrase.length < 12) return showErr($("expError"), "The bundle passphrase must be at least 12 characters.");
+  if (phrase !== $("expPhrase2").value) return showErr($("expError"), "The two passphrases do not match.");
   const groups = [];
   eachGroup(c => { if (c.checked) groups.push(c.value); });
-  if (($(“famGroups”).checked || $(“famEndpoints”).checked) && !groups.length) {
-    return showErr($(“expError”), “Select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints.”);
+  if (($("famGroups").checked || $("famEndpoints").checked) && !groups.length) {
+    return showErr($("expError"), "Select at least one endpoint identity group, or untick both Endpoint identity groups and Static endpoints.");
   }
   const certs = [];
   eachCert(c => { if (c.checked) certs.push(c.value); });
-  if ($(“famCerts”).checked && !certs.length) {
-    return showErr($(“expError”), “Select at least one trusted certificate, or untick “Trusted certificates”.”);
+  if ($("famCerts").checked && !certs.length) {
+    return showErr($("expError"), "Select at least one trusted certificate, or untick “Trusted certificates”.");
   }
   const systemCerts = [];
   eachSysCert(c => { if (c.checked) systemCerts.push(c.value); });
 
-  $(“expGo”).disabled = true;
-  $(“expGo”).textContent = “Exporting…”;
-  $(“expLog”).textContent = “”;
-  $(“expProgress”).classList.remove(“hidden”);
+  $("expGo").disabled = true;
+  $("expGo").textContent = "Exporting…";
+  $("expLog").textContent = "";
+  $("expProgress").classList.remove("hidden");
   try {
-    // Collect ZIP files with role selections
+    // An attached ZIP travels with the name and roles the operator gave it;
+    // the file itself carries neither.
     const fd = new FormData();
-    const req = Object.assign({}, expCreds, { families, groups, certs, systemCerts, passphrase: phrase });
-    fd.append(“req”, JSON.stringify(req));
-
-    // Add ZIP files if any
-    const zipFiles = $(“expZipFiles”).files;
+    const zipFiles = $("expZipFiles").files;
+    const systemCertZips = [];
     for (let i = 0; i < zipFiles.length; i++) {
-      const f = zipFiles[i];
-      const roleContainer = $(“expZipRole_” + i);
-      if (roleContainer) {
-        // Extract selected roles for this ZIP
-        const roles = {};
-        [“eap”, “radius”, “tacacs”, “pxgrid”, “ims”, “saml”, “portal”].forEach(r => {
-          const cb = roleContainer.querySelector('input[value=”' + r + '”]');
-          if (cb) roles[r] = cb.checked;
-        });
-        f.systemCertRoles = roles; // Store roles in file object for POST
+      const card = $("expZipRole_" + i);
+      const roles = [];
+      let name = "";
+      if (card) {
+        card.querySelectorAll(".ziproles input:checked").forEach(cb => roles.push(cb.value));
+        const nameField = card.querySelector(".zipname-input");
+        if (nameField) name = nameField.value.trim();
       }
-      fd.append(“zips”, f);
+      systemCertZips.push({ filename: zipFiles[i].name, name, roles });
+      fd.append("zips", zipFiles[i]);
     }
 
-    if ($(“expZipPassword”).value) {
-      fd.append(“zipPassword”, $(“expZipPassword”).value);
+    const req = Object.assign({}, expCreds, { families, groups, certs, systemCerts, systemCertZips, passphrase: phrase });
+    fd.append("req", JSON.stringify(req));
+
+    if ($("expZipPassword").value) {
+      fd.append("zipPassword", $("expZipPassword").value);
     }
 
     // Use multipart if we have ZIP files, else use JSON
     const isMultipart = zipFiles.length > 0;
-    const res = await fetch(“/api/export”, {
-      method: “POST”,
+    const res = await fetch("/api/export", {
+      method: "POST",
       body: isMultipart ? fd : JSON.stringify(req),
-      headers: isMultipart ? {} : { “Content-Type”: “application/json” },
+      headers: isMultipart ? {} : { "Content-Type": "application/json" },
     });
     await readStream(res, m => {
-      if (m.type === “log”) logLine($(“expLog”), m.msg);
-      else if (m.type === “error”) { logLine($(“expLog”), “ERROR: “ + m.msg); showErr($(“expError”), m.msg); }
-      else if (m.type === “done”) renderExportDone(m);
+      if (m.type === "log") logLine($("expLog"), m.msg);
+      else if (m.type === "error") { logLine($("expLog"), "ERROR: " + m.msg); showErr($("expError"), m.msg); }
+      else if (m.type === "done") renderExportDone(m);
     });
   } catch (err) {
-    showErr($(“expError”), err.message);
+    showErr($("expError"), err.message);
   } finally {
-    $(“expGo”).disabled = false;
-    $(“expGo”).textContent = “Export”;
+    $("expGo").disabled = false;
+    $("expGo").textContent = "Export";
   }
 });
 
-// Handle ZIP file uploads
-$(“expZipFiles”).addEventListener(“change”, async () => {
-  const files = $(“expZipFiles”).files;
-  const container = $(“expZipList”);
-  container.innerHTML = “”;
+// A GUI-exported ZIP carries a certificate and a key and nothing else: no
+// friendly name, no roles. The server reads the certificate out of it so the
+// operator can see what they attached before naming it and choosing roles. The
+// private key is never returned here — only the browser's own File object is
+// kept, and it is re-uploaded with the export request.
+$("expZipFiles").addEventListener("change", async () => {
+  const files = $("expZipFiles").files;
+  const container = $("expZipList");
+  container.innerHTML = "";
   if (!files.length) return;
+  container.textContent = "Reading the attached files…";
 
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    const roleBox = document.createElement(“div”);
-    roleBox.id = “expZipRole_” + i;
-    roleBox.style.cssText = “border:1px solid var(--line); border-radius:6px; padding:.7rem .9rem; margin-bottom:.8rem; background:var(--bg)”;
-    roleBox.innerHTML = '<div style=”font-weight:600; margin-bottom:.5rem”>' + esc(f.name) + '</div>';
-    const rolesHtml = ['eap', 'radius', 'tacacs', 'pxgrid', 'ims', 'saml', 'portal']
-      .map(r => '<label style=”display:inline-block; margin-right:1rem”><input type=”checkbox” value=”' + r + '” checked> ' + r.toUpperCase() + '</label>')
-      .join(“”);
-    roleBox.innerHTML += '<div style=”font-size:.85rem”>' + rolesHtml + '</div>';
-    container.appendChild(roleBox);
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  let info = [];
+  try {
+    const res = await fetch("/api/system-cert-zip", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "could not read the attachments");
+    info = data.zips || [];
+  } catch (err) {
+    container.innerHTML = "";
+    showErr($("expError"), err.message);
+    return;
   }
+
+  container.innerHTML = "";
+  info.forEach((z, i) => {
+    const box = document.createElement("div");
+    box.id = "expZipRole_" + i;
+    box.className = "zipcard";
+    box.dataset.filename = z.filename || "";
+    if (z.error) {
+      box.innerHTML = '<div class="zipname">' + esc(z.filename || "") + "</div>" +
+        '<div class="hint">' + esc(z.error) + "</div>";
+      container.appendChild(box);
+      return;
+    }
+    const sans = (z.sans || []).join(", ");
+    box.innerHTML = '<div class="zipname">' + esc(z.filename || "") + "</div>" +
+      '<div class="hint">' + esc(z.subject || "") + (sans ? " — SAN: " + esc(sans) : "") +
+      (z.keySize ? " — " + esc(String(z.keySize)) + " bit" : "") +
+      (z.expiresAt ? " — expires " + esc(z.expiresAt.slice(0, 10)) : "") + "</div>" +
+      '<label class="zipname-field">Name on the target ' +
+      '<input type="text" class="zipname-input" value="' + esc(z.name || z.commonName || "") + '"></label>' +
+      '<div class="ziproles">' + ["eap", "radius", "tacacs", "pxgrid", "ims", "saml", "portal"]
+        .map(r => '<label><input type="checkbox" value="' + r + '"> ' + r.toUpperCase() + "</label>").join("") +
+      "</div>";
+    container.appendChild(box);
+  });
 });
 
 function renderExportDone(m) {
@@ -731,12 +766,12 @@ function importForm(confirm) {
   fd.append("bundle", $("impFile").files[0]);
   fd.append("passphrase", $("impPhrase").value);
   if (confirm) fd.append("confirm", "yes");
-  const nodes = {};
-  eachNode(c => { nodes[c.value] = c.checked; });
-  for (const [hostname, selected] of Object.entries(nodes)) {
-    fd.append("targetNodes:" + hostname, selected ? "true" : "false");
-  }
-  if ($("impAdminRole").checked) fd.append("adminRole", "true");
+  // The node picker only exists once a pre-flight has named the target's nodes;
+  // sending nothing means the default, which is every eligible node.
+  const nodes = [];
+  eachNode(c => { if (c.checked) nodes.push(c.value); });
+  if (nodes.length) fd.append("selectedNodes", JSON.stringify(nodes));
+  if ($("impAdminRole").checked) fd.append("adminRole", "yes");
   if ($("impZipPass").value) fd.append("zipPassword", $("impZipPass").value);
   return fd;
 }

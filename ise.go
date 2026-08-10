@@ -60,6 +60,13 @@ type Client struct {
 	apiBase string // https://host
 	hc      *http.Client
 
+	verifyTLS bool
+	// nodeDialer builds the client for another node of the same deployment.
+	// Only the system certificate import needs one, because its API has no node
+	// field and a certificate lands on whichever node's URL received the POST.
+	// Tests set this to point every node at one fake deployment.
+	nodeDialer func(host string) *Client
+
 	mu        sync.Mutex
 	csrfToken string // ERS CSRF nonce, fetched on demand; never persisted
 }
@@ -86,11 +93,12 @@ func normalizeHost(h string) string {
 func NewClient(host, user, pass string, verifyTLS bool) *Client {
 	host = normalizeHost(host)
 	c := &Client{
-		Host:    host,
-		User:    user,
-		Pass:    pass,
-		ersBase: fmt.Sprintf("https://%s:%d", host, ersPort),
-		apiBase: "https://" + host,
+		Host:      host,
+		User:      user,
+		Pass:      pass,
+		ersBase:   fmt.Sprintf("https://%s:%d", host, ersPort),
+		apiBase:   "https://" + host,
+		verifyTLS: verifyTLS,
 	}
 	// The CSRF nonce is only accepted alongside the session cookies ISE hands
 	// out with it, so the client needs a jar. It lives for the life of this
@@ -111,6 +119,15 @@ func NewClient(host, user, pass string, verifyTLS bool) *Client {
 		},
 	}
 	return c
+}
+
+// sibling builds a client for another node of the same deployment: the same
+// credentials and TLS policy, its own cookie jar and its own CSRF nonce.
+func (c *Client) sibling(host string) *Client {
+	if c.nodeDialer != nil {
+		return c.nodeDialer(host)
+	}
+	return NewClient(host, c.User, c.Pass, c.verifyTLS)
 }
 
 // APIError carries ISE's own error text. ISE's diagnostics are the only useful

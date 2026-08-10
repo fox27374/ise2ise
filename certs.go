@@ -907,6 +907,7 @@ func ExportSystemCerts(c *Client, b *Bundle, families []string, fingerprints []s
 		// keySource: "zip", no re-encryption
 		bundleObj := map[string]any{
 			"name":           str(zipInfo, "name"),
+			"pem":            str(zipInfo, "pem"),
 			"keyBlob":        str(zipInfo, "keyBlob"),
 			"keySource":      "zip",
 			"fingerprint":    str(zipInfo, "fingerprint"),

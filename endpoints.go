@@ -540,12 +540,19 @@ type PreflightItem struct {
 	obj map[string]any // the object to create; not serialised to the UI
 }
 
-// TargetNode represents an eligible node on the target deployment for system certificate import.
+// TargetNode is one node of the *target* deployment, as the import step offers
+// it. The import API carries no node field at all — a certificate lands on
+// whichever node's URL received the POST — so covering a deployment means
+// dialling each node in turn, and only an Admin-persona node serves the API.
+//
+// The bundle's own sourceNode records which node a certificate was read *from*
+// and has no bearing on where it is written.
 type TargetNode struct {
 	Hostname   string   `json:"hostname"`
 	Address    string   `json:"address"`
 	Roles      []string `json:"roles"`
 	Selectable bool     `json:"selectable"`
+	Selected   bool     `json:"selected"`
 	Reason     string   `json:"reason,omitempty"`
 }
 
@@ -574,11 +581,14 @@ func (r *PreflightReport) add(it PreflightItem) {
 // Preflight resolves every cross-reference in the bundle against the target and
 // reports what would happen. It writes nothing. Import is not allowed to touch
 // the target until an operator has seen this and confirmed.
-func Preflight(c *Client, b *Bundle) (*PreflightReport, error) {
+//
+// selectedNodes names the target nodes system certificates are to be written
+// to; empty means every eligible node, which is what the report offers first.
+func Preflight(c *Client, b *Bundle, selectedNodes []string) (*PreflightReport, error) {
 	r := &PreflightReport{Source: b.Source, Items: []PreflightItem{}, Notes: append([]string{}, b.Notes...)}
 
 	preflightTrustedCerts(c, b, r)
-	preflightSystemCerts(c, b, r)
+	preflightSystemCerts(c, b, r, selectedNodes)
 
 	groupIDByName, err := stubsByName(c, pathEndpointGroups)
 	if err != nil {
@@ -674,22 +684,37 @@ func parseRolesFromArray(v any) []string {
 	return result
 }
 
-// preflightSystemCerts resolves the system certificate family.
-func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
+// preflightSystemCerts resolves the system certificate family. selected names
+// the target nodes the operator ticked; empty means every eligible node, which
+// is the default the UI opens with.
+func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport, selected []string) {
 	sysCerts := b.Objects[familySystemCerts]
 	if len(sysCerts) == 0 {
 		return
 	}
 
-	// Read target's deployment nodes
+	// Read target's deployment nodes. Without them the tool can still write to
+	// the node this import is already connected to; it just cannot offer the
+	// others. Losing the family silently is the one thing that must not happen.
 	deploymentNodes, err := c.openAPIList(pathDeploymentNode)
 	if err != nil {
-		return
+		r.Notes = append(r.Notes, fmt.Sprintf("System certificates: the target's node list (%s) could not be read, so only %s is offered: %v", pathDeploymentNode, c.Host, err))
+		deploymentNodes = []map[string]any{{
+			"hostname": c.Host, "ipAddress": c.Host,
+			"roles": []any{"PrimaryAdmin"}, "nodeStatus": "Connected",
+		}}
+	}
+
+	want := map[string]bool{}
+	for _, s := range selected {
+		want[strings.ToLower(strings.TrimSpace(s))] = true
 	}
 
 	// Build list of target nodes eligible for system certificate import:
 	// Admin role and Connected status
 	targetByNode := map[string][]map[string]any{}
+	nodeReadable := map[string]bool{}
+	nodeUnreadable := map[string]error{}
 	var targetNodes []TargetNode
 	for _, node := range deploymentNodes {
 		hostname := str(node, "hostname")
@@ -713,9 +738,15 @@ func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 		nodeStatus := str(node, "nodeStatus")
 		isConnected := nodeStatus == "Connected"
 
-		// Fetch this node's system certificates
-		certs, _ := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, hostname))
-		targetByNode[hostname] = certs
+		// Fetch this node's system certificates. A node with an empty store is
+		// perfectly normal and is not the same thing as a node that would not
+		// answer, so the two are tracked apart.
+		if certs, err := c.openAPIList(fmt.Sprintf("%s/%s", pathSystemCertsAPI, hostname)); err == nil {
+			targetByNode[hostname] = certs
+			nodeReadable[hostname] = true
+		} else {
+			nodeUnreadable[hostname] = err
+		}
 
 		tn := TargetNode{
 			Hostname:   hostname,
@@ -725,14 +756,22 @@ func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 		}
 		if !tn.Selectable {
 			if !hasAdminRole {
-				tn.Reason = "node does not have Admin role"
+				tn.Reason = "no admin API on this node"
 			} else if !isConnected {
-				tn.Reason = "node status is not Connected"
+				tn.Reason = "the deployment reports this node as " + nodeStatus
 			}
 		}
+		// An empty selection means the default: every eligible node.
+		tn.Selected = tn.Selectable && (len(want) == 0 || want[strings.ToLower(hostname)])
 		targetNodes = append(targetNodes, tn)
 	}
 	r.TargetNodes = targetNodes
+
+	if !slices.ContainsFunc(targetNodes, func(tn TargetNode) bool { return tn.Selected }) {
+		r.add(PreflightItem{Family: familySystemCerts, Name: "system certificates", Action: actionBlocked,
+			Reason: "no target node is selected; the import API carries no node field, so a certificate can only be written by dialling a node directly"})
+		return
+	}
 
 	// Fetch target's trusted certificates to validate issuer chains.
 	// Build a map of subject DNs that will exist (for issuer validation).
@@ -825,30 +864,28 @@ func preflightSystemCerts(c *Client, b *Bundle, r *PreflightReport) {
 			continue
 		}
 
-		// Emit an item per selectable target node
+		// Emit an item per selected target node. The node travels in the object,
+		// never in the display name: the name is a label for a human, and a
+		// certificate friendly name may contain anything at all.
 		for _, tn := range targetNodes {
-			if !tn.Selectable {
+			if !tn.Selected {
 				continue
 			}
-
-			displayName := name
-			if sourceNode != "" {
-				displayName = name + " -> " + sourceNode
-			}
-			displayName = displayName + " to " + tn.Hostname
 
 			it := PreflightItem{
 				Family: familySystemCerts,
-				Name:   displayName,
+				Name:   name + " -> " + tn.Hostname,
 				obj:    maps.Clone(certObj),
 			}
+			it.obj["targetNode"] = tn.Hostname
+			it.obj["targetAddress"] = tn.Address
 
-			targetCerts := targetByNode[tn.Hostname]
-			if targetCerts == nil {
-				it.Action, it.Reason = actionBlocked, fmt.Sprintf("target node %q is not available", tn.Hostname)
+			if !nodeReadable[tn.Hostname] {
+				it.Action, it.Reason = actionBlocked, fmt.Sprintf("the system certificate store on %s could not be read: %v", tn.Hostname, nodeUnreadable[tn.Hostname])
 				r.add(it)
 				continue
 			}
+			targetCerts := targetByNode[tn.Hostname]
 
 			// Check for existing cert (by SHA-256)
 			var existing string
@@ -1047,7 +1084,7 @@ type ImportResult struct {
 // Nothing else is touched; existing objects are never overwritten.
 // selectedTargetNodes maps hostname -> selected (for system certificates only).
 // adminRole indicates whether to allow the admin certificate role.
-func ApplyImport(c *Client, r *PreflightReport, passphrase string, selectedTargetNodes map[string]bool, adminRole bool, log func(string, ...any)) (*ImportResult, error) {
+func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, selectedTargetNodes map[string]bool, adminRole bool, log func(string, ...any)) (*ImportResult, error) {
 	res := &ImportResult{Errors: []string{}}
 
 	// Trusted certificates.
@@ -1233,12 +1270,21 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, selectedTarge
 	if sysCertCount > 0 {
 		log("Creating %d system certificates…", sysCertCount)
 
-		// Build clients for selected target nodes
+		// One client per selected node. The node this import is already
+		// connected to is reused rather than dialled a second time; the pre-flight
+		// report's own selection stands when the caller names none.
 		for _, tn := range r.TargetNodes {
-			if selectedTargetNodes[tn.Hostname] {
-				if nodeClients[tn.Hostname] == nil {
-					nodeClients[tn.Hostname] = NewClient(tn.Address, c.User, c.Pass, c.hc.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify)
-				}
+			switch {
+			case !tn.Selected && !selectedTargetNodes[tn.Hostname]:
+				continue
+			case len(selectedTargetNodes) > 0 && !selectedTargetNodes[tn.Hostname]:
+				continue
+			case nodeClients[tn.Hostname] != nil:
+				continue
+			case tn.Address == c.Host || tn.Hostname == c.Host:
+				nodeClients[tn.Hostname] = c
+			default:
+				nodeClients[tn.Hostname] = c.sibling(tn.Address)
 			}
 		}
 
@@ -1255,18 +1301,13 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, selectedTarge
 			isWildcard := strings.HasPrefix(extractCN(str(obj, "subject")), "*.")
 			bundleAdminRole := truthy(obj, "admin")
 
-			// Extract target node from the pre-flight item name
-			// Name format is "certname -> sourcenode to targetnode"
-			// We need to extract the targetnode
-			var targetNode string
-			parts := strings.Split(it.Name, " to ")
-			if len(parts) > 1 {
-				targetNode = strings.TrimSpace(parts[1])
-			}
+			// The target node is carried in the object by pre-flight, not parsed
+			// back out of the item's display name.
+			targetNode := str(obj, "targetNode")
 			if targetNode == "" {
 				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: could not determine target node from pre-flight item", name))
-				log("FAILED system certificate %q: no target node specified", name)
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: the pre-flight report names no target node for it", name))
+				log("FAILED system certificate %q: no target node in the pre-flight report", name)
 				continue
 			}
 
@@ -1274,17 +1315,23 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase string, selectedTarge
 			nodeClient := nodeClients[targetNode]
 			if nodeClient == nil {
 				res.Failed++
-				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: no client available for target node %s", name, targetNode))
-				log("FAILED system certificate %q on %s: no client available", name, targetNode)
+				res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q: %s was not among the nodes selected for this import", name, targetNode))
+				log("FAILED system certificate %q: %s is not selected", name, targetNode)
 				continue
 			}
 
-			// Determine password: derived for API exports, provided for ZIP imports
-			var password string
-			if keySource == "api" {
-				password = certPassword(passphrase)
-			} else if keySource == "zip" {
-				password = ""
+			// An API export was encrypted with a password derived from the bundle
+			// passphrase; a ZIP the operator exported from the ISE GUI keeps the
+			// password they set there, which only they can supply.
+			password := certPassword(passphrase)
+			if keySource == "zip" {
+				password = zipPassword
+				if password == "" {
+					res.Failed++
+					res.Errors = append(res.Errors, fmt.Sprintf("system certificate %q came from a GUI-exported ZIP and needs the password that ZIP was exported with; none was given", name))
+					log("FAILED system certificate %q: no password for the GUI-exported ZIP", name)
+					continue
+				}
 			}
 
 			// Build the create payload

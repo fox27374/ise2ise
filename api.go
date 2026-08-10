@@ -293,6 +293,17 @@ type exportReq struct {
 	Certs       []string `json:"certs"`
 	Passphrase  string   `json:"passphrase"`
 	SystemCerts []string `json:"systemCerts"`
+
+	// One entry per attached GUI-exported ZIP: the name it should carry on the
+	// target and the roles the operator ticked, since the file itself says
+	// nothing about either.
+	SystemCertZips []systemCertZipSpec `json:"systemCertZips"`
+}
+
+type systemCertZipSpec struct {
+	Filename string   `json:"filename"`
+	Name     string   `json:"name"`
+	Roles    []string `json:"roles"`
 }
 
 // UploadedZip carries metadata about a system certificate uploaded as a ZIP from the 3.2 GUI.
@@ -442,6 +453,19 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 				"pem":         pemData,
 				"keyBlob":     keyBlobData,
 			}
+			// The file says nothing about what the certificate should be called
+			// or what it is for; the operator does, in the request beside it.
+			for _, spec := range in.SystemCertZips {
+				if spec.Filename != fileHeader.Filename {
+					continue
+				}
+				if spec.Name != "" {
+					zipInfo["name"] = spec.Name
+				}
+				for _, role := range spec.Roles {
+					zipInfo[role] = true
+				}
+			}
 			systemCertZips = append(systemCertZips, zipInfo)
 		}
 	} else {
@@ -531,6 +555,13 @@ type importInput struct {
 	client     *Client
 	bundle     *Bundle
 	passphrase string
+
+	// System certificates only: which target nodes to write to, whether the
+	// admin role may be taken, and the password for any certificate that came
+	// from a GUI-exported ZIP. None of these are stored anywhere.
+	nodes       []string
+	adminRole   bool
+	zipPassword string
 }
 
 func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
@@ -562,8 +593,23 @@ func readImport(w http.ResponseWriter, r *http.Request) (*importInput, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &importInput{client: c, bundle: b, passphrase: pass}, nil
+	in2 := &importInput{
+		client: c, bundle: b, passphrase: pass,
+		adminRole:   yes(r.FormValue("adminRole")),
+		zipPassword: r.FormValue("zipPassword"),
+	}
+	// The node picker posts a JSON array of hostnames; absent means the
+	// pre-flight default, which is every eligible node.
+	if raw := r.FormValue("selectedNodes"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &in2.nodes); err != nil {
+			return nil, fmt.Errorf("could not read the target node selection: %w", err)
+		}
+	}
+	return in2, nil
 }
+
+// yes accepts either spelling the UI has used for a checkbox.
+func yes(v string) bool { return v == "yes" || v == "true" }
 
 func handlePreflight(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -583,7 +629,7 @@ func handlePreflight(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "The ERS API is required for an import and is not usable: "+firstNote(probe))
 		return
 	}
-	rep, err := Preflight(in.client, in.bundle)
+	rep, err := Preflight(in.client, in.bundle, in.nodes)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -616,7 +662,7 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 
 	s := newStream(w)
 	s.log("Re-checking the target before writing…")
-	rep, err := Preflight(in.client, in.bundle)
+	rep, err := Preflight(in.client, in.bundle, in.nodes)
 	if err != nil {
 		s.fail("%v", err)
 		return
@@ -631,18 +677,16 @@ func handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract selectedTargetNodes and adminRole from the form
+	// The pre-flight above already resolved the operator's node selection, so
+	// apply follows the report rather than re-reading the form.
 	selectedTargetNodes := map[string]bool{}
 	for _, tn := range rep.TargetNodes {
-		// Check if the form has this target node selected
-		// Form field name is "targetNodes:<hostname>"
-		if r.FormValue("targetNodes:"+tn.Hostname) == "true" {
+		if tn.Selected {
 			selectedTargetNodes[tn.Hostname] = true
 		}
 	}
-	adminRole := r.FormValue("adminRole") == "true"
 
-	res, err := ApplyImport(in.client, rep, in.passphrase, selectedTargetNodes, adminRole, s.log)
+	res, err := ApplyImport(in.client, rep, in.passphrase, in.zipPassword, selectedTargetNodes, in.adminRole, s.log)
 	if err != nil {
 		s.fail("%v", err)
 		s.send(map[string]any{"type": "done", "result": res, "preflight": rep})
