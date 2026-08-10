@@ -1139,3 +1139,50 @@ func TestExportRecordsIssuerAndAdminRole(t *testing.T) {
 		t.Error("the source's admin role did not travel, so the import's admin checkbox can never take effect")
 	}
 }
+
+// ISE's SystemCert schema marks seven booleans required and refuses the whole
+// import with "<field>, must not be null" when one is missing. A real 3.4 target
+// rejected the write for a missing allowPortalTagTransferForSameSubject, on both
+// nodes, after the trusted CA had already been created.
+func TestSystemCertImportSendsEveryRequiredFlag(t *testing.T) {
+	cert := genCertWithSANs(t, "ise.ntslab.loc", []string{"ise.ntslab.loc", "ise01.ntslab.loc"})
+	b := sysCertBundle(t, cert, "wildcard.ntslab.loc", nil)
+
+	tgt := twoNodeTarget(t)
+	c := tgt.client()
+	c.nodeDialer = func(host string) *Client { return tgt.client() }
+
+	rep, err := Preflight(c, b, []string{"ISE-178"})
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, err := ApplyImport(c, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	if len(tgt.systemCertImports) == 0 {
+		t.Fatal("nothing was imported")
+	}
+	payload := tgt.systemCertImports[len(tgt.systemCertImports)-1]
+
+	required := []string{
+		"allowExtendedValidity", "allowOutOfDateCert",
+		"allowPortalTagTransferForSameSubject", "allowReplacementOfCertificates",
+		"allowReplacementOfPortalGroupTag", "allowRoleTransferForSameSubject",
+		"allowSHA1Certificates",
+	}
+	for _, f := range required {
+		if _, ok := payload[f]; !ok {
+			t.Errorf("%s is missing; ISE refuses the whole import when it is null", f)
+		}
+	}
+	// The three that would take something away from a certificate the node may
+	// be serving right now.
+	for _, f := range []string{"allowReplacementOfCertificates", "allowReplacementOfPortalGroupTag", "allowRoleTransferForSameSubject", "allowPortalTagTransferForSameSubject"} {
+		if v, _ := payload[f].(bool); v {
+			t.Errorf("%s = true; import never overwrites", f)
+		}
+	}
+}

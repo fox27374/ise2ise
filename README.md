@@ -250,10 +250,12 @@ What to expect:
   password you set in the GUI, so you are asked for it once on export and once on
   import; certificates taken through the API are not affected.
 
-This family's API shapes were read off a real ISE 3.4 deployment before it was
-built, including the export ZIP's layout, but **no certificate has yet been
-imported onto a real node** — the role mapping, the portal tag behaviour and the
-restart path are proven against the specification and the fake deployment only.
+This path has been run between two real ISE 3.4 deployments: a multi-SAN
+certificate exported with its private key, its issuing CA carried in the same
+bundle, both created on a two-node target with EAP and RADIUS DTLS on each node,
+the portal role dropped because the tag was held there, and a re-run creating
+nothing. What has still never been exercised is taking the **admin** role, the
+3.2 GUI-ZIP path, and a node restarting mid-import.
 
 ### Policy elements
 
