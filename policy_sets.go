@@ -328,13 +328,33 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 			it.Action = actionCreate
 		}
 
-		// Check all references in the set and its rules
+		// Check all references in the set and its rules.
 		if it.Action != actionBlocked && !isDefault {
 			reason := checkPolicySetReferences(item, serviceNamesByName, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName)
 			if reason != "" {
 				it.Action = actionBlocked
 				it.Reason = reason
 				r.Notes = append(r.Notes, fmt.Sprintf("Policy set %q: %s", name, reason))
+			}
+		}
+		if isDefault {
+			// Default cannot be blocked as a unit — it exists on the target and
+			// the whole point is merging rules into it — so its rules are
+			// checked one by one and the unresolvable ones are left out. Without
+			// this they were never checked at all and failed at write time: a
+			// real target refused fifteen of them, one per missing certificate
+			// authentication profile or join point.
+			for _, kind := range []string{"authentication", "authorization"} {
+				keep := make([]map[string]any, 0, len(ruleList(it.obj[kind])))
+				for _, rule := range ruleList(it.obj[kind]) {
+					if reason := checkRuleReferences(rule, kind, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName); reason != "" {
+						inner, _ := rule["rule"].(map[string]any)
+						r.Notes = append(r.Notes, fmt.Sprintf("Default policy set: the rule %q was not imported because %s", str(inner, "name"), reason))
+						continue
+					}
+					keep = append(keep, rule)
+				}
+				it.obj[kind] = keep
 			}
 		}
 
@@ -808,6 +828,38 @@ func freeSetName(name string, existing map[string]map[string]any) string {
 		}
 		if mine(target) {
 			return "" // already imported under this name
+		}
+	}
+	return ""
+}
+
+// checkRuleReferences resolves one rule's references and says what is missing.
+// It is the per-rule half of checkPolicySetReferences, used where a whole set
+// cannot be refused: the Default set exists on every deployment, so a rule of
+// its own that cannot resolve is left out instead.
+func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authProfiles, willExistAuthProfiles, conditions map[string]string) string {
+	if kind == "authentication" {
+		if src := str(rule, "identitySourceName"); src != "" && idStores[src] == "" {
+			return fmt.Sprintf("the target has no identity source %q", src)
+		}
+	} else {
+		if profiles, ok := rule["profile"].([]any); ok {
+			for _, p := range profiles {
+				name, _ := p.(string)
+				if name != "" && authProfiles[name] == "" && willExistAuthProfiles[name] == "" {
+					return fmt.Sprintf("the target has no authorization profile %q and this bundle does not create one", name)
+				}
+			}
+		}
+		if sg := str(rule, "securityGroup"); sg != "" && sgts[sg] == "" {
+			return fmt.Sprintf("the target has no security group %q (TrustSec is not migrated yet)", sg)
+		}
+	}
+	if inner, ok := rule["rule"].(map[string]any); ok {
+		if cond, _ := inner["condition"].(map[string]any); cond != nil {
+			if reason := checkConditionReferences(cond, conditions); reason != "" {
+				return reason
+			}
 		}
 	}
 	return ""
