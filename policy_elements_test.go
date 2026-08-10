@@ -615,3 +615,105 @@ func TestTagDescription(t *testing.T) {
 		t.Errorf("the marker was truncated away: %q", long[len(long)-40:])
 	}
 }
+
+// An advanced attribute can read a dictionary on either side. Checking only the
+// left let a profile through whose right-hand side named an AD join point's
+// dictionary, and a real 3.4 target answered the create with HTTP 500 and an
+// empty body. Bisecting the payload showed the same profile creates fine with
+// that one attribute removed.
+func TestAuthProfileChecksBothSidesOfAnAdvancedAttribute(t *testing.T) {
+	lhsOnly := map[string]any{
+		"leftHandSideDictionaryAttribue": map[string]any{
+			"AdvancedAttributeValueType": "AdvancedDictionaryAttribute",
+			"dictionaryName":             "Cisco", "attributeName": "cisco-av-pair",
+		},
+		"rightHandSideAttribueValue": map[string]any{
+			"AdvancedAttributeValueType": "AttributeValue",
+			"value":                      "termination-action-modifier=1",
+		},
+	}
+	rhsDict := map[string]any{
+		"leftHandSideDictionaryAttribue": map[string]any{
+			"AdvancedAttributeValueType": "AdvancedDictionaryAttribute",
+			"dictionaryName":             "Cisco", "attributeName": "cisco-av-pair",
+		},
+		"rightHandSideAttribueValue": map[string]any{
+			"AdvancedAttributeValueType": "AdvancedDictionaryAttribute",
+			"dictionaryName":             "ntslab.loc", "attributeName": "msDS-cloudExtensionAttribute9",
+		},
+	}
+
+	dicts := map[string]bool{"Cisco": true}
+	ok := map[string]any{"name": "AssignVLAN102", "advancedAttributes": []map[string]any{lhsOnly}}
+	if reason := checkAuthProfileRefs(ok, map[string]bool{}, map[string]bool{}, dicts, nil); reason != "" {
+		t.Errorf("a literal right-hand side must not be treated as a dictionary: %q", reason)
+	}
+
+	bad := map[string]any{"name": "AssignVLAN102", "advancedAttributes": []map[string]any{lhsOnly, rhsDict}}
+	reason := checkAuthProfileRefs(bad, map[string]bool{}, map[string]bool{}, dicts, nil)
+	if reason == "" {
+		t.Fatal("a right-hand side dictionary the target lacks must block the profile")
+	}
+	if !strings.Contains(reason, "ntslab.loc") {
+		t.Errorf("the reason must name the dictionary, got %q", reason)
+	}
+
+	// Present on the target: nothing to report.
+	if reason := checkAuthProfileRefs(bad, map[string]bool{}, map[string]bool{}, map[string]bool{"Cisco": true, "ntslab.loc": true}, nil); reason != "" {
+		t.Errorf("dictionary exists on the target, got %q", reason)
+	}
+}
+
+// A dictionary can be present on the target while the attribute inside it is
+// not: a custom endpoint attribute lives in the stock EndPoints dictionary. The
+// lab's iPSK profile referenced one, and the target answered HTTP 500 with an
+// empty body — the source's EndPoints had 23 attributes, the target's 12.
+func TestAuthProfileChecksTheAttributeInsideTheDictionary(t *testing.T) {
+	profile := map[string]any{
+		"name": "iPSK",
+		"advancedAttributes": []map[string]any{{
+			"leftHandSideDictionaryAttribue": map[string]any{
+				"AdvancedAttributeValueType": "AdvancedDictionaryAttribute",
+				"dictionaryName":             "Cisco", "attributeName": "cisco-av-pair",
+			},
+			"rightHandSideAttribueValue": map[string]any{
+				"AdvancedAttributeValueType": "AdvancedDictionaryAttribute",
+				"dictionaryName":             "EndPoints", "attributeName": "iPSK",
+			},
+		}},
+	}
+	dicts := map[string]bool{"Cisco": true, "EndPoints": true}
+
+	// The target's EndPoints has the stock attributes and not the custom one.
+	stock := func(dict string) map[string]bool {
+		if dict == "EndPoints" {
+			return map[string]bool{"MACAddress": true, "EndPointPolicy": true}
+		}
+		return map[string]bool{"cisco-av-pair": true}
+	}
+	reason := checkAuthProfileRefs(profile, map[string]bool{}, map[string]bool{}, dicts, stock)
+	if reason == "" {
+		t.Fatal("a custom attribute the target lacks must block the profile")
+	}
+	if !strings.Contains(reason, "iPSK") || !strings.Contains(reason, "EndPoints") {
+		t.Errorf("the reason must name the attribute and its dictionary, got %q", reason)
+	}
+
+	// Once the target has it, nothing to report.
+	withIt := func(dict string) map[string]bool {
+		m := stock(dict)
+		if dict == "EndPoints" {
+			m["iPSK"] = true
+		}
+		return m
+	}
+	if reason := checkAuthProfileRefs(profile, map[string]bool{}, map[string]bool{}, dicts, withIt); reason != "" {
+		t.Errorf("attribute exists on the target, got %q", reason)
+	}
+
+	// A dictionary whose attributes could not be read must not block: unknown is
+	// not the same as absent.
+	if reason := checkAuthProfileRefs(profile, map[string]bool{}, map[string]bool{}, dicts, func(string) map[string]bool { return nil }); reason != "" {
+		t.Errorf("unreadable attribute list must not block, got %q", reason)
+	}
+}

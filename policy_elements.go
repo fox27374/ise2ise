@@ -198,6 +198,26 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 	}
 
 	// Dictionaries
+	// Attributes inside a dictionary, read once per dictionary and only for the
+	// ones a profile actually names.
+	attrCache := map[string]map[string]bool{}
+	dictAttrs := func(dict string) map[string]bool {
+		if known, ok := attrCache[dict]; ok {
+			return known
+		}
+		attrs, err := c.openAPIList(pathDictionaries + "/" + dict + "/attribute")
+		if err != nil {
+			attrCache[dict] = nil // unknown is not the same as absent; do not block on it
+			return nil
+		}
+		known := map[string]bool{}
+		for _, a := range attrs {
+			known[str(a, "name")] = true
+		}
+		attrCache[dict] = known
+		return known
+	}
+
 	dictionaryByName := map[string]bool{}
 	dicts, _ := c.openAPIList(pathDictionaries)
 	for _, d := range dicts {
@@ -332,7 +352,7 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 				it.Reason = fmt.Sprintf("already exists on the target and DIFFERS from the source in %s; not changed — edit it on the target if the source's version is the one you want", strings.Join(fields, ", "))
 			}
 		case kind == "authorizationProfile":
-			if reason := checkAuthProfileRefs(item, willExist["dacl"], daclIDByName, dictionaryByName); reason != "" {
+			if reason := checkAuthProfileRefs(item, willExist["dacl"], daclIDByName, dictionaryByName, dictAttrs); reason != "" {
 				it.Action, it.Reason = actionBlocked, reason
 			} else {
 				it.Action = actionCreate
@@ -464,7 +484,7 @@ func driftFields(mine, theirs map[string]any) []string {
 }
 
 // checkAuthProfileRefs checks if an authorization profile's references are resolvable
-func checkAuthProfileRefs(obj map[string]any, willExistDacl, existingDacl, existingDict map[string]bool) string {
+func checkAuthProfileRefs(obj map[string]any, willExistDacl, existingDacl, existingDict map[string]bool, attrsIn func(string) map[string]bool) string {
 	// Check dACL reference
 	if daclName := str(obj, "daclName"); daclName != "" {
 		if !existingDacl[daclName] && !willExistDacl[daclName] {
@@ -472,15 +492,39 @@ func checkAuthProfileRefs(obj map[string]any, willExistDacl, existingDacl, exist
 		}
 	}
 
-	// Check advancedAttributes for dictionary references
-	if advAttrs, ok := obj["advancedAttributes"].([]any); ok {
-		for _, attr := range advAttrs {
-			if attrMap, ok := attr.(map[string]any); ok {
-				// Check left-hand side
-				if lhs, ok := attrMap["leftHandSideDictionaryAttribue"].(map[string]any); ok {
-					if dictName := str(lhs, "dictionaryName"); dictName != "" && !existingDict[dictName] {
-						return fmt.Sprintf("dictionary %q does not exist on the target", dictName)
-					}
+	// Check advancedAttributes for dictionary references, on both sides.
+	//
+	// The right-hand side can itself be a dictionary attribute rather than a
+	// literal — an AD join point's dictionary, typically — and checking only the
+	// left let such a profile through. A real 3.4 target answered the create
+	// with HTTP 500 and an empty body, which is unusually unhelpful even for
+	// this resource: the same profile with that one attribute removed creates
+	// fine. Verified by bisecting the payload on 2026-08-10.
+	for _, attr := range ruleList(obj["advancedAttributes"]) {
+		for _, side := range []string{"leftHandSideDictionaryAttribue", "rightHandSideAttribueValue"} {
+			s, ok := attr[side].(map[string]any)
+			if !ok {
+				continue
+			}
+			// A literal value carries no dictionary and needs no check.
+			if str(s, "AdvancedAttributeValueType") != "AdvancedDictionaryAttribute" {
+				continue
+			}
+			dictName := str(s, "dictionaryName")
+			if dictName == "" {
+				continue
+			}
+			if !existingDict[dictName] {
+				return fmt.Sprintf("dictionary %q does not exist on the target", dictName)
+			}
+			// The dictionary can be present while the attribute inside it is
+			// not: a custom endpoint attribute lives in the stock EndPoints
+			// dictionary, and referencing one the target has never had earns the
+			// same empty-bodied HTTP 500. Verified on 3.4, where the source's
+			// EndPoints held 23 attributes and the target's 12.
+			if attrName := str(s, "attributeName"); attrName != "" && attrsIn != nil {
+				if known := attrsIn(dictName); known != nil && !known[attrName] {
+					return fmt.Sprintf("the dictionary %q on the target has no attribute %q; it is a custom attribute and has to be created there first", dictName, attrName)
 				}
 			}
 		}
