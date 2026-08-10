@@ -696,3 +696,20 @@ func (c *Client) iseVersion() (string, error) {
 	}
 	return "", nil
 }
+
+// openAPIListOnce reads a collection in a single request, for the endpoints that
+// ignore paging. The dictionary attribute lists do: asked for page 2 they answer
+// page 1 again, so openAPIList's "a full page means there may be another" rule
+// walks all the way to its thousand-page guard and the request appears to hang.
+func (c *Client) openAPIListOnce(path string) ([]map[string]any, error) {
+	u := c.apiBase + path
+	b, err := c.do(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	items, err := decodeList(b)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", u, err)
+	}
+	return items, nil
+}

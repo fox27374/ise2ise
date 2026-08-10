@@ -205,7 +205,7 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 		if known, ok := attrCache[dict]; ok {
 			return known
 		}
-		attrs, err := c.openAPIList(pathDictionaries + "/" + dict + "/attribute")
+		attrs, err := c.openAPIListOnce(pathDictionaries + "/" + dict + "/attribute")
 		if err != nil {
 			attrCache[dict] = nil // unknown is not the same as absent; do not block on it
 			return nil
