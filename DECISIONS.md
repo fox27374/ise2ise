@@ -560,10 +560,15 @@ checkbox — no per-object pickers. Unlike certificates, nothing here is dangero
 or meaningless to carry, the volumes are small, and what the target already has
 is skipped.
 
-**ERS cannot list authorization profiles on 3.4.** `GET
-/ers/config/authorizationprofile` answers **HTTP 500**, "Failed to convert to ERS
-object, attribute: cisco-av-pair, Error: could not extract ResultSet". The
-collection read is unusable, so stubs come from OpenAPI
+**ERS may refuse to list authorization profiles at all.** `GET
+/ers/config/authorizationprofile` answers **HTTP 500** on the `172.24.89.22`
+source, "Failed to convert to ERS object, attribute: cisco-av-pair, Error: could
+not extract ResultSet". A second 3.4 deployment (`ise.ntslab.loc`, checked
+2026-08-10) answers 200 for the same call, so this is **data-dependent**: one
+profile ISE cannot serialise takes the whole collection read down with it, and
+which profiles those are differs per box. The tool therefore never calls the
+collection at all — a route that works on one deployment and 500s on the next is
+not a route. Stubs come from OpenAPI
 `/api/v1/policy/network-access/authorization-profiles` — which returns name and
 id and nothing else — and the detail comes per id from ERS.
 
@@ -629,6 +634,30 @@ authorization profile's fields across all 26 readable ones are `accessType`,
 `id` and `link`, which is the pattern the endpoint slice already runs on, but no
 policy element has been posted to a real deployment. Proving it any earlier would
 mean writing throwaway objects onto a real box outside the pre-flight gate.
+
+### What the tool created is marked in the description
+
+Asked for on 2026-08-10: a way to see at a glance which objects on the target
+came from a migration. ISE offers no help here. Policy **sets** and rules carry
+`state: enabled | disabled | monitor` and could be imported disabled, but not one
+of the five element families has any such field — an authorization profile or a
+dACL either exists or does not.
+
+So a created object gets `[ise2ise YYYY-MM-DD]` appended to its **description**,
+the only field all five families share and one the ISE list views show without
+opening the object. It is added at import, not at export, because it describes
+what happened to the target rather than anything about the source.
+
+Two consequences worth stating. The marker is **excluded from the drift
+comparison**, or every object the tool created would report as differing from its
+own source on the next run, which would ruin the report exactly where it is
+useful. And marking is **idempotent** — an already-marked description is left
+alone, so an object recreated after a manual deletion does not collect a marker
+per run.
+
+Deliberately not done: marking endpoint groups, endpoints or certificates. The
+request was about policy, a certificate's description is a field ISE itself is
+fussy about, and a marker nobody asked for on every family is noise.
 
 ---
 

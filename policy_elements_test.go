@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestExportPolicyElements verifies that policy elements are exported correctly.
@@ -524,5 +525,89 @@ func TestPolicyElementsReRunCreatesNothing(t *testing.T) {
 	}
 	if second.Created != 0 || second.Failed != 0 {
 		t.Fatalf("a re-run must write nothing, got %+v (preflight said %d create)", second, rep2.Create)
+	}
+}
+
+// Policy elements carry no enabled/disabled state — ISE has one on policy sets
+// and on nothing here — so what the tool created is marked in the description,
+// which is the one field all five families share.
+func TestImportMarksWhatItCreated(t *testing.T) {
+	src := newFakeISE(t)
+	src.addDACL("dacl1", "CORP_QUARANTINE", "permit ip any any")
+	src.addNetworkDeviceGroup("ndg1", "Device Type#Switches", "")
+	src.mu.Lock()
+	src.dacls[0]["description"] = "Quarantine ACL"
+	src.mu.Unlock()
+
+	b := NewBundle(&Probe{Host: "src"})
+	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	tgt := newFakeISE(t)
+	ct := tgt.client()
+	rep, err := Preflight(ct, b, nil)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, quiet); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	for _, d := range tgt.dacls {
+		if str(d, "name") != "CORP_QUARANTINE" {
+			continue
+		}
+		desc := str(d, "description")
+		if !strings.Contains(desc, importMarkerPrefix) {
+			t.Fatalf("description = %q, want the import marker", desc)
+		}
+		if !strings.HasPrefix(desc, "Quarantine ACL") {
+			t.Errorf("the source's own description was lost: %q", desc)
+		}
+		return
+	}
+	t.Fatal("the dACL never reached the target")
+}
+
+// The marker must not read as drift on the next run, or every object the tool
+// created would report as differing from its own source.
+func TestImportMarkerIsNotDrift(t *testing.T) {
+	mine := map[string]any{"name": "X", "description": "Quarantine ACL", "dacl": "deny ip any any"}
+	theirs := map[string]any{"name": "X", "description": "Quarantine ACL [ise2ise 2026-08-10]", "dacl": "deny ip any any"}
+	if got := driftFields(mine, theirs); len(got) != 0 {
+		t.Errorf("driftFields = %v, want none: the marker is this tool's own", got)
+	}
+
+	theirs["dacl"] = "permit ip any any"
+	if got := driftFields(mine, theirs); len(got) != 1 || got[0] != "dacl" {
+		t.Errorf("driftFields = %v, want exactly [dacl]: real drift must still be caught", got)
+	}
+}
+
+func TestTagDescription(t *testing.T) {
+	marker := importMarker(time.Now())
+
+	if got := tagDescription(""); got != marker {
+		t.Errorf("empty description = %q, want just the marker", got)
+	}
+	if got := tagDescription("Guest ACL"); got != "Guest ACL "+marker {
+		t.Errorf("got %q", got)
+	}
+	// Marking twice must not stack: an object recreated after a manual delete
+	// would otherwise collect a marker per run.
+	once := tagDescription("Guest ACL")
+	if twice := tagDescription(once); twice != once {
+		t.Errorf("second tag changed it: %q -> %q", once, twice)
+	}
+	// An over-long description loses its tail, not the marker.
+	long := tagDescription(strings.Repeat("x", 400))
+	if len(long) > maxDescription {
+		t.Errorf("length %d exceeds ISE's limit", len(long))
+	}
+	if !strings.HasSuffix(long, marker) {
+		t.Errorf("the marker was truncated away: %q", long[len(long)-40:])
 	}
 }
