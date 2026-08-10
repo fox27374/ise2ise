@@ -601,15 +601,14 @@ func ListSystemCerts(c *Client) ([]SystemCertInfo, error) {
 					continue
 				}
 
-				// Parse certificate to extract subject, SANs, key size
+				// The export answers a ZIP holding one .pem, not bare PEM — the
+				// same shape the with-key export uses. Sniffing covers all three
+				// forms, and reading this wrong is invisible: the row simply
+				// loses its SANs and reads as single-name, which is how a
+				// multi-SAN certificate ends up unticked.
 				var parsedCert *x509.Certificate
-				if bytes.HasPrefix(body, []byte("-----BEGIN")) {
-					block, _ := pem.Decode(body)
-					if block != nil && block.Type == "CERTIFICATE" {
-						if c, _ := x509.ParseCertificate(block.Bytes); c != nil {
-							parsedCert = c
-						}
-					}
+				if found, _ := extractCertificates(body, ""); len(found) > 0 {
+					parsedCert = found[0]
 				}
 
 				// Build the info object
