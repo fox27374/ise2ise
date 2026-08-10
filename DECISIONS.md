@@ -838,10 +838,13 @@ Ordered by dependency, not by size.
    contents cannot exercise — a static *profile* assignment, an expired
    certificate, a comma in a description, OpenAPI switched off. Everything
    structural is now proven on hardware.
-5. **System certificates** — operator-selected, the 3.3 export-with-private-key
-   API and the 3.2 GUI-ZIP fallback, admin role off. Interviewed and its API
-   surface read off the source box on 2026-08-10, before any code; see the
-   section above. In build.
+5. ~~System certificates~~ — built on 2026-08-10, with its API surface read off
+   the source box before any code was written; see the section above.
+   **Awaiting hardware**: no certificate has been imported onto a real node, and
+   the lab holds no wildcard or multi-SAN certificate to try it with, so the role
+   mapping, the portal tag behaviour, the derived export password and the
+   restart-mid-import path are proven against the specification and the fake
+   deployment only.
 6. **Policy elements** — network device groups, condition library, dACLs,
    authorization profiles, identity source sequences. Introduces the factory
    allowlist update mechanism.
