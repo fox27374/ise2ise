@@ -288,3 +288,73 @@ func TestExportCarriesAllADFields(t *testing.T) {
 		t.Errorf("top-level link not stripped")
 	}
 }
+
+// A join point this run creates has to count as an identity source for the
+// families checked after it, or a first migration cannot carry a join point and
+// the sequences and rules that name it in one pass. Its dictionary and its
+// groups must not count: those appear only once someone joins the domain.
+func TestJoinPointCreatedThisRunCountsAsAnIdentitySource(t *testing.T) {
+	src := newFakeISE(t)
+	src.addADJoinPoint("ad-1", "ntslab.loc", "ntslab.loc", nil)
+	src.addIdStoreSequence("iss-1", "Corp_Sequence", "")
+	src.mu.Lock()
+	for _, s := range src.idStoreSequences {
+		if str(s, "name") == "Corp_Sequence" {
+			s["idSeqItem"] = []any{map[string]any{"idstore": "ntslab.loc", "order": 1}}
+		}
+	}
+	src.mu.Unlock()
+
+	b := NewBundle(&Probe{Host: "src"})
+	if err := ExportADJoinPoints(src.client(), b, []string{familyADJoinPoints}, quiet); err != nil {
+		t.Fatalf("export join points: %v", err)
+	}
+	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
+		t.Fatalf("export elements: %v", err)
+	}
+
+	// A bare target: no join point, no sequence.
+	tgt := newFakeISE(t)
+	rep, err := Preflight(tgt.client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	for _, it := range rep.Items {
+		if it.Family != familyPolicyElements || it.Name != "Corp_Sequence" {
+			continue
+		}
+		if it.Action == actionBlocked {
+			t.Fatalf("the sequence was blocked for a join point this same run creates: %q", it.Reason)
+		}
+		return
+	}
+	t.Fatal("the sequence never appeared in the report")
+}
+
+// Without the join point in the bundle the same sequence must still block: the
+// rule counts what will exist, not what is merely named.
+func TestSequenceStillBlocksWithoutTheJoinPoint(t *testing.T) {
+	src := newFakeISE(t)
+	src.addIdStoreSequence("iss-1", "Corp_Sequence", "")
+	src.mu.Lock()
+	for _, s := range src.idStoreSequences {
+		if str(s, "name") == "Corp_Sequence" {
+			s["idSeqItem"] = []any{map[string]any{"idstore": "ntslab.loc", "order": 1}}
+		}
+	}
+	src.mu.Unlock()
+
+	b := NewBundle(&Probe{Host: "src"})
+	if err := ExportPolicyElements(src.client(), b, []string{familyPolicyElements}, quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	rep, err := Preflight(newFakeISE(t).client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	for _, it := range rep.Items {
+		if it.Name == "Corp_Sequence" && it.Action != actionBlocked {
+			t.Fatalf("action = %q, want blocked: nothing supplies the join point", it.Action)
+		}
+	}
+}

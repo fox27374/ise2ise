@@ -231,6 +231,11 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 	for _, store := range idStores {
 		idStoreByName[str(store, "name")] = "exists"
 	}
+	// An AD join point this run creates is an identity source a rule can name,
+	// even before anyone joins the domain.
+	for name := range joinPointsAfterThisRun(c, r) {
+		idStoreByName[name] = "exists"
+	}
 
 	// Authorization profiles from OpenAPI (name + id only)
 	authProfileByName := map[string]string{} // name -> id

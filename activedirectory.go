@@ -314,3 +314,27 @@ func applyADJoinPoints(c *Client, r *PreflightReport, res *ImportResult, log fun
 
 	return nil
 }
+
+// joinPointsAfterThisRun names the AD join points the target will have once this
+// import finishes: the ones it already has, plus the ones pre-flight decided to
+// create. preflightADJoinPoints runs before the policy families, so its verdicts
+// are already in the report by the time they ask.
+//
+// Only the join point itself counts. Its dictionary and its groups appear when
+// the domain is joined, which is a manual step between two runs, so anything
+// needing those still blocks on the first pass.
+func joinPointsAfterThisRun(c *Client, r *PreflightReport) map[string]bool {
+	names := map[string]bool{}
+	stubs, _ := c.ersList(pathActiveDirectory)
+	for _, s := range stubs {
+		names[s.Name] = true
+	}
+	for _, it := range r.Items {
+		if it.Family == familyADJoinPoints && it.Action == actionCreate {
+			if name := str(it.obj, "name"); name != "" {
+				names[name] = true
+			}
+		}
+	}
+	return names
+}
