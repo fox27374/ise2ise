@@ -155,6 +155,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | System certificates | The ones you select, with their private keys, onto the target nodes you select. See below. |
 | Policy elements | Network device groups, dACLs, authorization profiles, identity source sequences and conditions, all of them. See below. |
 | Policy sets and rules | The sets with their authentication and authorization rules. They arrive **disabled**. See below. |
+| Active Directory join points | The join point and its whole configuration. **You join the domain**; the tool loads the groups on the next run. See below. |
 
 ### Trusted certificates
 
@@ -337,6 +338,44 @@ the import step carries the source's own state instead, for a live cutover.
 Per-set exceptions, global exceptions and MFA rules are not carried; a bundle
 whose source had them gets a note per set.
 
+### Active Directory join points
+
+This is the one family that needs you in the middle of it, and it takes two
+import runs with a manual step between them:
+
+1. **First import** creates the join point on the target with its whole
+   configuration, **not joined**. The report says so.
+2. **You join the domain** in `Administration → Identity Management → External
+   Identity Sources → Active Directory`, with your own domain credentials.
+3. **Second import** loads the join point's AD groups, and everything that was
+   blocked on the AD dictionary or those groups now goes through.
+
+The domain join is deliberately not automated. ISE does expose an API for it, but
+joining creates a computer object in Active Directory and fails per node in ways
+ISE reports afterwards — that is a domain administrator's action, and keeping it
+manual means **no AD credentials ever reach this tool**. There is no code path
+that can call it.
+
+- **The whole configuration travels**: domain, description, the allowed-domain
+  list, the AD scope, the AD attributes and every advanced setting — machine
+  authentication, aging time, the rewrite rules, the not-in-AD and unreachable
+  domain behaviours, failed-authentication protection. Nothing is trimmed to make
+  a create succeed; if ISE refuses it, the report carries its words.
+- **All the join point's groups travel**, with their SIDs. That list is already
+  an administrator's selection — ISE holds only the groups someone added from the
+  directory — and both deployments joining the same domain means the SIDs match
+  and policy references resolve.
+- **A domain already joined under a different name blocks**, naming both. Adding
+  a second join point for the same domain is a configuration change, not a
+  migration, so the tool leaves the decision to you.
+- **A join point created in the run counts as an identity source** immediately,
+  so identity source sequences and rules that name it can land in the same pass.
+  Its dictionary and its groups do not — those exist only after the join, which
+  is why the second run matters.
+
+Ticking policy sets ticks this family too, since rules name the join point as
+their identity source.
+
 ## Running
 
 Prebuilt binaries are attached to each release —
@@ -417,7 +456,6 @@ Everything below is a later slice. None of it exists in the binary today, not
 even as a stub:
 
 - Full TrustSec: SGTs, SGACLs, egress matrix
-- AD join point configuration and `addGroups`
 - Network device CSV → API import
 
 The probe, both endpoint families and the whole trusted certificate path have
