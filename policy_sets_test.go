@@ -462,3 +462,51 @@ func TestAuthorizationRuleKeepsProfileNames(t *testing.T) {
 		t.Fatal("no imported authorization rule carried a profile")
 	}
 }
+
+// A rule's condition reads a dictionary attribute, and the target may have
+// neither the dictionary nor the attribute. ISE refuses such a rule with
+// "Condition attributes are illegal for requested scope: [ EntraIDDevice :
+// ExternalGroups ]" — six Default rules failed exactly that way on a real target
+// after everything else they needed had been created.
+func TestRuleConditionChecksItsDictionary(t *testing.T) {
+	condOn := func(dict, attr string) map[string]any {
+		return map[string]any{
+			"conditionType": "ConditionAttributes", "isNegate": false,
+			"dictionaryName": dict, "attributeName": attr,
+			"operator": "equals", "attributeValue": "x",
+		}
+	}
+	rule := map[string]any{
+		"profile": []any{"CLIENTS-88"},
+		"rule":    map[string]any{"name": "EntraID_User", "condition": condOn("EntraIDDevice", "ExternalGroups")},
+	}
+	profiles := map[string]string{"CLIENTS-88": "id-1"}
+	none := map[string]string{}
+
+	// Dictionary absent.
+	reason := checkRuleReferences(rule, "authorization", none, none, profiles, none, none,
+		map[string]bool{"Radius": true}, func(string) map[string]bool { return nil })
+	if !strings.Contains(reason, "EntraIDDevice") {
+		t.Errorf("a missing dictionary must be named, got %q", reason)
+	}
+
+	// Dictionary present, attribute absent.
+	dicts := map[string]bool{"EntraIDDevice": true}
+	attrs := func(string) map[string]bool { return map[string]bool{"SomethingElse": true} }
+	reason = checkRuleReferences(rule, "authorization", none, none, profiles, none, none, dicts, attrs)
+	if !strings.Contains(reason, "ExternalGroups") {
+		t.Errorf("a missing attribute must be named, got %q", reason)
+	}
+
+	// Both present: nothing to say.
+	ok := func(string) map[string]bool { return map[string]bool{"ExternalGroups": true} }
+	if reason := checkRuleReferences(rule, "authorization", none, none, profiles, none, none, dicts, ok); reason != "" {
+		t.Errorf("both present, got %q", reason)
+	}
+
+	// An unreadable attribute list must not block: unknown is not absent.
+	if reason := checkRuleReferences(rule, "authorization", none, none, profiles, none, none, dicts,
+		func(string) map[string]bool { return nil }); reason != "" {
+		t.Errorf("unreadable attribute list blocked the rule: %q", reason)
+	}
+}
