@@ -678,3 +678,26 @@ func applyPolicyElements(c *Client, r *PreflightReport, res *ImportResult, log f
 
 	return nil
 }
+
+// dictionaryAttrLookup answers which attributes a dictionary on this deployment
+// has, reading each dictionary once and only when something asks. The attribute
+// endpoint ignores paging, so it is read with a single request.
+func dictionaryAttrLookup(c *Client) func(string) map[string]bool {
+	cache := map[string]map[string]bool{}
+	return func(dict string) map[string]bool {
+		if known, ok := cache[dict]; ok {
+			return known
+		}
+		attrs, err := c.openAPIListOnce(pathDictionaries + "/" + dict + "/attribute")
+		if err != nil {
+			cache[dict] = nil // unknown is not absent; never block on it
+			return nil
+		}
+		known := map[string]bool{}
+		for _, a := range attrs {
+			known[str(a, "name")] = true
+		}
+		cache[dict] = known
+		return known
+	}
+}

@@ -291,6 +291,15 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 		conditionByName[name] = "will-be-created"
 	}
 
+	// Dictionaries and their attributes, for the conditions in rules. A rule
+	// reading an attribute the target does not have is refused by ISE with
+	// "Condition attributes are illegal for requested scope".
+	dictByName := map[string]bool{}
+	for _, d := range func() []map[string]any { l, _ := c.openAPIList(pathDictionaries); return l }() {
+		dictByName[str(d, "name")] = true
+	}
+	dictAttrs := dictionaryAttrLookup(c)
+
 	// Target's existing policy sets by name
 	targetSets, _ := c.openAPIList(pathPolicySets)
 	targetSetsByName := map[string]map[string]any{}
@@ -335,7 +344,7 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 
 		// Check all references in the set and its rules.
 		if it.Action != actionBlocked && !isDefault {
-			reason := checkPolicySetReferences(item, serviceNamesByName, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName)
+			reason := checkPolicySetReferences(item, serviceNamesByName, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName, dictByName, dictAttrs)
 			if reason != "" {
 				it.Action = actionBlocked
 				it.Reason = reason
@@ -352,7 +361,7 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 			for _, kind := range []string{"authentication", "authorization"} {
 				keep := make([]map[string]any, 0, len(ruleList(it.obj[kind])))
 				for _, rule := range ruleList(it.obj[kind]) {
-					if reason := checkRuleReferences(rule, kind, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName); reason != "" {
+					if reason := checkRuleReferences(rule, kind, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName, dictByName, dictAttrs); reason != "" {
 						inner, _ := rule["rule"].(map[string]any)
 						r.Notes = append(r.Notes, fmt.Sprintf("Default policy set: the rule %q was not imported because %s", str(inner, "name"), reason))
 						continue
@@ -375,7 +384,7 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 }
 
 // checkPolicySetReferences checks if all references in a policy set are resolvable
-func checkPolicySetReferences(set map[string]any, services, sgts, idStores, authProfiles, willExistAuthProfiles, conditions map[string]string) string {
+func checkPolicySetReferences(set map[string]any, services, sgts, idStores, authProfiles, willExistAuthProfiles, conditions map[string]string, dicts map[string]bool, attrsIn func(string) map[string]bool) string {
 	// Check service name
 	if serviceName := str(set, "serviceName"); serviceName != "" && services[serviceName] == "" {
 		return fmt.Sprintf("service %q does not exist on the target", serviceName)
@@ -383,7 +392,7 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 
 	// Check conditions recursively
 	if cond, ok := set["condition"].(map[string]any); ok && cond != nil {
-		if reason := checkConditionReferences(cond, conditions); reason != "" {
+		if reason := checkConditionReferences(cond, conditions, dicts, attrsIn); reason != "" {
 			return reason
 		}
 	}
@@ -400,7 +409,7 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 				// Check rule condition
 				if ruleObj, ok := arMap["rule"].(map[string]any); ok {
 					if ruleCond, _ := ruleObj["condition"].(map[string]any); ruleCond != nil {
-						if reason := checkConditionReferences(ruleCond, conditions); reason != "" {
+						if reason := checkConditionReferences(ruleCond, conditions, dicts, attrsIn); reason != "" {
 							return reason
 						}
 					}
@@ -432,7 +441,7 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 				// Check rule condition
 				if ruleObj, ok := azrMap["rule"].(map[string]any); ok {
 					if ruleCond, _ := ruleObj["condition"].(map[string]any); ruleCond != nil {
-						if reason := checkConditionReferences(ruleCond, conditions); reason != "" {
+						if reason := checkConditionReferences(ruleCond, conditions, dicts, attrsIn); reason != "" {
 							return reason
 						}
 					}
@@ -445,29 +454,40 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 }
 
 // checkConditionReferences recursively checks if all condition references are resolvable
-func checkConditionReferences(cond map[string]any, conditionByName map[string]string) string {
+func checkConditionReferences(cond map[string]any, conditionByName map[string]string, dicts map[string]bool, attrsIn func(string) map[string]bool) string {
 	if cond == nil {
 		return ""
 	}
 
-	condType := str(cond, "conditionType")
-
-	// Check ConditionReference
-	if condType == "ConditionReference" {
+	switch str(cond, "conditionType") {
+	case "ConditionReference":
 		name := str(cond, "name")
 		if name != "" && conditionByName[name] == "" {
 			return fmt.Sprintf("library condition %q does not exist on the target", name)
 		}
+	case "ConditionAttributes", "LibraryConditionAttributes":
+		// A condition reads a dictionary attribute, and the target may have
+		// neither. ISE refuses the rule with "Condition attributes are illegal
+		// for requested scope: [ EntraIDDevice : ExternalGroups ]" — verified on
+		// 3.4, where six Default rules failed that way after everything else
+		// they needed had been created.
+		dict := str(cond, "dictionaryName")
+		if dict == "" {
+			break
+		}
+		if dicts != nil && !dicts[dict] {
+			return fmt.Sprintf("a condition reads the dictionary %q, which the target does not have", dict)
+		}
+		if attr := str(cond, "attributeName"); attr != "" && attrsIn != nil {
+			if known := attrsIn(dict); known != nil && !known[attr] {
+				return fmt.Sprintf("a condition reads %q from the dictionary %q, and the target's copy has no such attribute", attr, dict)
+			}
+		}
 	}
 
-	// Recursively check children
-	if children, ok := cond["children"].([]any); ok {
-		for _, child := range children {
-			if childMap, ok := child.(map[string]any); ok {
-				if reason := checkConditionReferences(childMap, conditionByName); reason != "" {
-					return reason
-				}
-			}
+	for _, child := range ruleList(cond["children"]) {
+		if reason := checkConditionReferences(child, conditionByName, dicts, attrsIn); reason != "" {
+			return reason
 		}
 	}
 
@@ -842,7 +862,7 @@ func freeSetName(name string, existing map[string]map[string]any) string {
 // It is the per-rule half of checkPolicySetReferences, used where a whole set
 // cannot be refused: the Default set exists on every deployment, so a rule of
 // its own that cannot resolve is left out instead.
-func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authProfiles, willExistAuthProfiles, conditions map[string]string) string {
+func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authProfiles, willExistAuthProfiles, conditions map[string]string, dicts map[string]bool, attrsIn func(string) map[string]bool) string {
 	if kind == "authentication" {
 		if src := str(rule, "identitySourceName"); src != "" && idStores[src] == "" {
 			return fmt.Sprintf("the target has no identity source %q", src)
@@ -862,7 +882,7 @@ func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authP
 	}
 	if inner, ok := rule["rule"].(map[string]any); ok {
 		if cond, _ := inner["condition"].(map[string]any); cond != nil {
-			if reason := checkConditionReferences(cond, conditions); reason != "" {
+			if reason := checkConditionReferences(cond, conditions, dicts, attrsIn); reason != "" {
 				return reason
 			}
 		}
