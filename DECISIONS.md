@@ -1048,20 +1048,49 @@ Ordered by dependency, not by size.
    a node restarting mid-import.
 6. ~~Policy elements~~ — network device groups, dACLs, authorization profiles,
    identity source sequences, conditions. Built on 2026-08-10 with the read
-   shapes taken off the source box first; see the section above. **Awaiting
-   hardware**: no policy element has been created on a real target, so every
-   POST body is still the read shape minus `id` and `link` rather than a proven
-   payload. The
+   shapes taken off the source box first; see the section above. **Proven
+   against real hardware on 2026-08-10**, alongside the policy sets: device
+   groups, dACLs, profiles, sequences and conditions created on the 178/179
+   target, with three defects only the write could show — device group ancestors,
+   both sides of an advanced attribute, and the attribute inside a dictionary.
+   The
    factory allowlist update mechanism is **not** part of it — factory objects are
    skipped with their content drift reported, and the update mechanism waits for
    the policy set slice, where `Default` makes it necessary.
 7. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
-8. **Policy sets and rules** — interviewed on 2026-08-10 with the read shapes
-   taken off `ise.ntslab.loc` first; see the section above. In build. The
-   "two-pass UUID remap" this entry used to promise turned out not to be needed:
-   rules reference by name, and the one reference that carries a UUID carries the
-   name beside it. Imported sets arrive **disabled**, which is what makes
-   building it before TrustSec acceptable — a set referencing an SGT the target
-   lacks is blocked, not half-written.
+8. ~~Policy sets and rules~~ — built on 2026-08-10 and **proven against real
+   hardware the same day**: five sets created on the 178/179 target with their
+   rules, disabled; the `Default` set's rules merged beside the target's own,
+   skipping the fourteen it already had; four sets blocked whole for references
+   nothing can supply; a re-run creating nothing. The "two-pass UUID remap" this
+   entry used to promise turned out not to be needed: rules reference by name,
+   and the one reference carrying a UUID carries the name beside it.
+   Building it before TrustSec was made safe by importing sets **disabled** — a
+   set referencing an SGT the target lacks is blocked, not half-written.
 9. **AD join point** config export, creation, and `addGroups`.
+   Promoted in practice by the 2026-08-10 run: the join point's dictionary and
+   the identity stores that depend on it blocked two authorization profiles,
+   three policy sets and an identity source sequence between them. Nothing else
+   on this list unblocks as much.
 10. **Network device CSV → API import.**
+
+### What the first policy migration could not carry
+
+Everything blocked in the 2026-08-10 run against 178/179, in the order it would
+unblock the most work. None of these is on the roadmap above; all of them were
+found by running it rather than by reading Cisco's documentation.
+
+| Missing on the target | Blocked | Where it belongs |
+|---|---|---|
+| AD join point `ntslab.loc`, and the dictionary it brings | 2 profiles, 2 sets, 1 sequence | Roadmap 9 |
+| Security group `Production` | 1 set | Roadmap 7 (TrustSec) |
+| EntraID identity store | 1 sequence, and the set using it | No slice yet — external identity sources |
+| Custom endpoint attribute `EndPoints:iPSK` | 1 profile, 1 set | No slice yet |
+| Vendor dictionary `PaloAltoNetworks` | 2 profiles | No slice yet |
+| Certificate authentication profile `EntraID_Cert_Profile` | rules in `Default` | No slice yet |
+
+The last four are small objects with their own ERS or OpenAPI resources, and each
+one costs more in blocked policy than it would cost to build. A "supporting
+objects" slice covering certificate authentication profiles, custom endpoint
+attributes and vendor dictionaries is now better value than TrustSec, which
+blocked exactly one set.
