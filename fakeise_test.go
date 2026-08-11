@@ -237,6 +237,22 @@ func (f *fakeISE) serveERS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Handle Active Directory addGroups endpoint: PUT /ers/config/activedirectory/{id}/addGroups
+	if strings.HasSuffix(path, "/addGroups") && r.Method == http.MethodPut {
+		if coll != "activedirectory" {
+			iseError(w, http.StatusNotFound, "Resource not found: "+path)
+			return
+		}
+		// addGroups can fail when the domain is not joined
+		// (this would be verified on real ISE but we keep it simple in the fake)
+		var body map[string]map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		// For testing, we can simulate failure if a flag is set
+		// For now, accept it silently
+		writeJSONRaw(w, map[string]any{rootActiveDirectory: body[rootActiveDirectory]})
+		return
+	}
+
 	objs, root, ok := f.collection(coll)
 	if !ok {
 		iseError(w, http.StatusNotFound, "Resource not found: "+path)
@@ -821,7 +837,7 @@ func (f *fakeISE) collection(coll string) ([]map[string]any, string, bool) {
 	case "idstoresequence":
 		return f.idStoreSequences, rootIdStoreSequence, true
 	case "activedirectory":
-		return f.adJoinPoints, "ActiveDirectory", true
+		return f.adJoinPoints, rootActiveDirectory, true
 	case "certificateprofile":
 		return f.certProfiles, "CertificateProfile", true
 	}
@@ -1031,4 +1047,41 @@ func (f *fakeISE) addNamedList(which, name, id string) {
 	case "store":
 		f.identityStores = append(f.identityStores, obj)
 	}
+}
+
+func (f *fakeISE) addADJoinPoint(id, name, domain string, groups []map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj := map[string]any{
+		"id":                      id,
+		"name":                    name,
+		"domain":                  domain,
+		"description":             "",
+		"enableDomainAllowedList": true,
+		"adScopesNames":           "Default_Scope",
+		"adAttributes": map[string]any{
+			"attributes": []any{},
+		},
+		"advancedSettings": map[string]any{
+			"enablePassChange":              true,
+			"enableMachineAuth":             true,
+			"enableMachineAccess":           true,
+			"agingTime":                     5,
+			"enableDialinPermissionCheck":   false,
+			"enableCallbackForDialinClient": false,
+			"plaintextAuth":                 false,
+			"enableFailedAuthProtection":    false,
+			"authProtectionType":            "WIRELESS",
+			"failedAuthThreshold":           5,
+			"enableAuthorizationFlow":       false,
+			"identityNotInAdBehaviour":      "SEARCH_JOINED_FOREST",
+			"unreachableDomainsBehaviour":   "PROCEED",
+			"enableRewrites":                false,
+			"rewriteRules":                  []any{},
+		},
+		"adgroups": map[string]any{
+			"groups": groups,
+		},
+	}
+	f.adJoinPoints = append(f.adJoinPoints, obj)
 }

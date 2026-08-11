@@ -181,8 +181,10 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <span class="hint">Node identity certificates with private keys. Operator selects which nodes to import on.</span></label>
         <label><input type="checkbox" id="famPolicyElements"> Policy elements
           <span class="hint">Network device groups, dACLs, authorization profiles, identity source sequences, and conditions.</span></label>
+        <label><input type="checkbox" id="famADJoinPoints"> Active Directory join points
+          <span class="hint">Join point configuration. The tool creates the join point; the operator joins the domain in the ISE GUI.</span></label>
         <label><input type="checkbox" id="famPolicySets"> Policy sets and rules
-          <span class="hint">Network access policy sets with their authentication and authorization rules. Selecting this also includes policy elements.</span></label>
+          <span class="hint">Network access policy sets with their authentication and authorization rules. Selecting this also includes policy elements and Active Directory join points.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Migrate these endpoint identity groups
@@ -616,10 +618,16 @@ $("famSysCerts").addEventListener("change", () => {
 $("famPolicyElements").addEventListener("change", () => {
   // Policy elements have no picker, they're all-or-nothing
 });
+$("famADJoinPoints").addEventListener("change", () => {
+  // Active Directory join points have no picker, they're all-or-nothing
+});
 $("famPolicySets").addEventListener("change", () => {
-  // Ticking policy sets forces policy elements to be ticked
+  // Ticking policy sets forces policy elements and AD join points to be ticked
   if ($("famPolicySets").checked && !$("famPolicyElements").checked) {
     $("famPolicyElements").checked = true;
+  }
+  if ($("famPolicySets").checked && !$("famADJoinPoints").checked) {
+    $("famADJoinPoints").checked = true;
   }
 });
 
@@ -632,6 +640,7 @@ $("expGo").addEventListener("click", async () => {
   if ($("famCerts").checked) families.push("trustedCertificates");
   if ($("famSysCerts").checked) families.push("systemCertificates");
   if ($("famPolicyElements").checked) families.push("policyElements");
+  if ($("famADJoinPoints").checked) families.push("adJoinPoints");
   if ($("famPolicySets").checked) families.push("policySets");
   if (!families.length) return showErr($("expError"), "Select at least one object family.");
   const phrase = $("expPhrase").value;

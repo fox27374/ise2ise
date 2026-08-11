@@ -496,9 +496,14 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ticking policy sets forces policy elements into the same export
-	if slices.Contains(in.Families, familyPolicySets) && !slices.Contains(in.Families, familyPolicyElements) {
-		in.Families = append(in.Families, familyPolicyElements)
+	// Ticking policy sets forces policy elements and AD join points into the same export
+	if slices.Contains(in.Families, familyPolicySets) {
+		if !slices.Contains(in.Families, familyPolicyElements) {
+			in.Families = append(in.Families, familyPolicyElements)
+		}
+		if !slices.Contains(in.Families, familyADJoinPoints) {
+			in.Families = append(in.Families, familyADJoinPoints)
+		}
 	}
 
 	s := newStream(w)
@@ -521,6 +526,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ExportSystemCerts(c, b, in.Families, in.SystemCerts, in.Passphrase, systemCertZips, zipPassword, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
+	if err := ExportADJoinPoints(c, b, in.Families, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}
