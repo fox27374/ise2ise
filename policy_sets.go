@@ -327,7 +327,15 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 			// description tells them apart: ours is skipped, so a re-run writes
 			// nothing, and a stranger's is left alone and imported beside.
 			if mine(target) {
+				// A set this tool imported earlier, which may be missing rules
+				// that failed at the time — a rule naming a profile that could
+				// not be created yet, typically. Skipping it whole leaves the
+				// set looking migrated while authorising differently from the
+				// source, so its rules are reconciled the way Default's are.
+				// A set the operator made carries no marker and is never touched.
 				it.Action, it.Reason = actionSkip, "already imported by this tool"
+				it.obj["mergeIntoID"] = str(target, "id")
+				it.obj["mergeName"] = name
 			} else {
 				importedName := freeSetName(name, targetSetsByName)
 				if importedName == "" {
@@ -351,6 +359,52 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 				r.Notes = append(r.Notes, fmt.Sprintf("Policy set %q: %s", name, reason))
 			}
 		}
+		// A set this tool imported earlier may be missing rules that failed at
+		// the time. Report each one, so a skip does not read as "done" when the
+		// set on the target authorises differently from the source.
+		if it.Action == actionSkip && str(it.obj, "mergeIntoID") != "" {
+			have := map[string]bool{}
+			for _, kind := range []string{"authentication", "authorization"} {
+				for _, rule := range ruleList(func() any {
+					l, _ := c.openAPIList(pathPolicySets + "/" + str(it.obj, "mergeIntoID") + "/" + kind)
+					return l
+				}()) {
+					if inner, ok := rule["rule"].(map[string]any); ok {
+						have[kind+"|"+str(inner, "name")] = true
+					}
+				}
+			}
+			var missing []string
+			for _, kind := range []string{"authentication", "authorization"} {
+				for _, rule := range ruleList(it.obj[kind]) {
+					inner, _ := rule["rule"].(map[string]any)
+					if inner == nil || truthy(inner, "default") {
+						continue
+					}
+					if have[kind+"|"+str(inner, "name")] {
+						continue
+					}
+					// The same per-rule check Default's merge gets: a rule that
+					// cannot resolve is named and left out rather than posted
+					// and refused.
+					if reason := checkRuleReferences(rule, kind, sgtByName, idStoreByName, authProfileByName, willExistAuthProfiles, conditionByName, dictByName, dictAttrs); reason != "" {
+						r.Notes = append(r.Notes, fmt.Sprintf("Policy set %q: the rule %q is still missing because %s", name, str(inner, "name"), reason))
+						continue
+					}
+					missing = append(missing, str(inner, "name"))
+				}
+			}
+			if len(missing) > 0 {
+				r.add(PreflightItem{
+					Family: familyPolicySets,
+					Name:   fmt.Sprintf("%s — %d missing %s", name, len(missing), plural(len(missing), "rule")),
+					Action: actionCreate,
+					Reason: fmt.Sprintf("this set was imported by an earlier run and does not have %s; they will be added", strings.Join(quoteAll(missing), ", ")),
+					obj:    it.obj,
+				})
+			}
+		}
+
 		if isDefault {
 			// Default cannot be blocked as a unit — it exists on the target and
 			// the whole point is merging rules into it — so its rules are
@@ -535,7 +589,13 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 		// it exists on every deployment — but its rules still have to be merged
 		// into the target's own. Treating skip as nothing to do left the
 		// source's Default rules, which are the bulk of most policies, behind.
+		// Two kinds of skip still have work to do: the Default set, whose rules
+		// are merged into the target's own, and a set this tool imported on an
+		// earlier run, which may be missing rules that failed back then.
 		mergeDefault := it.Action == actionSkip && truthy(it.obj, "default")
+		// The "N missing rules" item pre-flight added for a set this tool
+		// imported earlier. The set's own item stays an ordinary skip.
+		mergeMine := it.Action == actionCreate && str(it.obj, "mergeIntoID") != ""
 		if it.Action != actionCreate && !mergeDefault {
 			if it.Action == actionSkip {
 				res.Skipped++
@@ -557,8 +617,19 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 
 		isDefault := truthy(setObj, "default")
 		var targetSetID string
+		if mergeMine {
+			// Reconciling a set this tool created: post the missing rules to it
+			// rather than creating anything.
+			targetSetID = str(setObj, "mergeIntoID")
+			targetName = str(setObj, "mergeName")
+			log("Checking the rules of %q, imported by an earlier run…", targetName)
+		}
 
-		if isDefault {
+		switch {
+		case mergeMine:
+			// Nothing to create: the set is already there and only its missing
+			// rules are posted below.
+		case isDefault:
 			// Merge into Default set: use its id from the target
 			targetSetID = str(setObj, "targetDefaultID")
 			if targetSetID == "" {
@@ -568,7 +639,7 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 				continue
 			}
 			log("Merging rules into target's Default set…")
-		} else {
+		default:
 			// Create a new set
 			delete(setObj, "targetName")
 			delete(setObj, "targetDefaultID")
@@ -646,7 +717,7 @@ func applyPolicySets(c *Client, r *PreflightReport, res *ImportResult, keepState
 		// own. They are matched by name and left alone; the tool adds beside
 		// them, never over them.
 		existing := map[string]bool{}
-		if mergeDefault {
+		if mergeDefault || mergeMine {
 			for _, kind := range []string{"authentication", "authorization"} {
 				have, err := c.openAPIList(pathPolicySets + "/" + targetSetID + "/" + kind)
 				if err != nil {
@@ -888,4 +959,11 @@ func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authP
 		}
 	}
 	return ""
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
 }

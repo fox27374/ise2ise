@@ -510,3 +510,79 @@ func TestRuleConditionChecksItsDictionary(t *testing.T) {
 		t.Errorf("unreadable attribute list blocked the rule: %q", reason)
 	}
 }
+
+// A set this tool created on an earlier run can be missing rules that failed at
+// the time — a rule naming a profile that could not be created yet. Skipping the
+// set whole leaves it looking migrated while authorising differently from the
+// source. Found on a real target, where four sets were quietly missing fourteen
+// rules between them.
+func TestRulesMissingFromAnEarlierRunAreAdded(t *testing.T) {
+	b := exportSets(t, srcWithPolicySets(t))
+	tgt := tgtForPolicySets(t)
+	ct := tgt.client()
+
+	// First run creates the set and its rules.
+	rep, err := Preflight(ct, b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, err := ApplyImport(ct, rep, "test-passphrase-1234567890", "", nil, false, false, quiet); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// Something removes a rule from the set — the same state a rule that failed
+	// on the first run would leave behind.
+	tgt.mu.Lock()
+	var setID string
+	for _, s := range tgt.policySets {
+		if str(s, "name") == "KOF - EntraID" {
+			setID = str(s, "id")
+		}
+	}
+	if setID == "" {
+		tgt.mu.Unlock()
+		t.Fatal("the set was never created")
+	}
+	tgt.policySetRules[setID+"|authorization"] = nil
+	tgt.mu.Unlock()
+
+	rep2, err := Preflight(ct, b, nil, false)
+	if err != nil {
+		t.Fatalf("second preflight: %v", err)
+	}
+	var reported bool
+	for _, it := range rep2.Items {
+		if strings.Contains(it.Name, "missing rule") {
+			reported = true
+			if it.Action != actionCreate {
+				t.Errorf("action = %q, want create", it.Action)
+			}
+		}
+	}
+	if !reported {
+		t.Fatalf("the missing rule was not reported: %+v", rep2.Items)
+	}
+
+	res, err := ApplyImport(ct, rep2, "test-passphrase-1234567890", "", nil, false, false, quiet)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if res.Created == 0 {
+		t.Fatalf("the missing rule was not added: %+v", res)
+	}
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	if len(tgt.policySetRules[setID+"|authorization"]) == 0 {
+		t.Error("the set is still missing its rule")
+	}
+	// The set itself must not have been created a second time.
+	var count int
+	for _, s := range tgt.policySets {
+		if str(s, "name") == "KOF - EntraID" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("the set exists %d times; reconciling must not create another", count)
+	}
+}
