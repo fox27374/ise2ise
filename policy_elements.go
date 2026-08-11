@@ -224,12 +224,13 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 		dictionaryByName[str(d, "name")] = true
 	}
 
-	// AD join points
-	adJoinPointByName := map[string]bool{}
-	adStubs, _ := c.ersList(pathActiveDirectory)
-	for _, stub := range adStubs {
-		adJoinPointByName[stub.Name] = true
-	}
+	// AD join points, the target's own plus any this run will create. An
+	// unjoined join point still exists as an identity source, so a sequence
+	// naming it resolves — which is what lets a first migration carry the join
+	// point and the sequences that depend on it in one pass. Its dictionary and
+	// its groups are deliberately not counted: those appear only once someone
+	// joins the domain.
+	adJoinPointByName := joinPointsAfterThisRun(c, r)
 
 	// Identity source sequences. The built-in store names are always present on
 	// any deployment; everything else has to be read.

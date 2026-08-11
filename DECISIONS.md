@@ -765,6 +765,65 @@ through a migration tool to save a 60-second GUI action is a bad trade.
 If a future migration crosses to a *different* domain, every AD group condition
 is dead on arrival — different SIDs — and the tool can only report them.
 
+### Read off the box on 2026-08-11, and re-confirmed
+
+Slice 9. The source holds one join point, `ntslab.loc`; the 178/179 target holds
+**none**, which is why an AD dictionary, an identity store, two authorization
+profiles, three policy sets and an identity source sequence were all blocked in
+the first policy migration.
+
+**ISE can join the domain over the API** — `PUT
+/ers/config/activedirectory/{id}/joinAllNodes` exists alongside `addGroups`. The
+decision above was put again with that on the table and **stands**: joining
+creates a computer object in Active Directory and fails per node in ways ISE
+reports asynchronously. That is a domain administrator's action, and keeping it
+out means no AD credentials ever reach this tool.
+
+**The whole configuration travels.** `ERSActiveDirectory` carries `name`,
+`domain`, `description`, `enableDomainAllowedList`, `adScopesNames`,
+`adAttributes` and `advancedSettings`; only `id` and `link` are dropped. The
+advanced block holds real operational decisions — machine authentication, aging
+time, four rewrite rules, `identityNotInAdBehaviour`, failed-authentication
+protection — and a join point that authenticates differently from the source is
+exactly what this tool exists to prevent. Nothing is trimmed to make a create
+succeed; a refusal is reported with ISE's words.
+
+The AD attributes earn their place twice: the source's two are
+`msDS-cloudExtensionAttribute9` and `badPwdCount`, and the first is what the
+`AssignVLAN102` authorization profile reads on the right-hand side of an advanced
+attribute. Carrying the join point is what unblocks that profile.
+
+**All groups travel, with their SIDs.** The source's ten are already an
+administrator's selection — ISE holds only groups someone added from the
+directory — so filtering to what migrated policy references would drop groups
+used by portals, by device admin policy, or by a rule written next week.
+
+**Two phases, across runs, driven by the target.** No join point on the target
+means create it and report that it must be joined. A join point present means
+attempt `addGroups` and report what ISE answers. Nothing probes for a join state,
+because the object exposes none: `ERSActiveDirectory` has no field saying whether
+the domain is joined. A third run writes nothing.
+
+**A domain already joined under another name blocks.** Same name is an ordinary
+skip. A different name for the same domain is reported blocked, naming both, and
+never creates a second join point — migrated rules name the *source's* join point
+as their identity source, so the operator has to decide whether to rename it or
+repoint the rules.
+
+**A join point created in the same run counts as an identity source** for the
+sequences, profiles and policy sets checked after it, the `willExist` rule the
+other families already use: an unjoined join point still exists as an identity
+store. Its **dictionary and its groups do not count**, because those appear only
+once the domain is joined — so a profile reading `ntslab.loc` still blocks until
+the second run.
+
+Selection is its own checkbox, and ticking policy sets ticks and locks it
+alongside policy elements.
+
+**Unproven until the lab run**: the create payload, whether ISE accepts
+`advancedSettings` and `adAttributes` on a create, what `addGroups` wants as a
+body, and what it answers for a join point whose domain is not joined.
+
 ---
 
 ## Explicitly out of scope
@@ -1067,7 +1126,9 @@ Ordered by dependency, not by size.
    and the one reference carrying a UUID carries the name beside it.
    Building it before TrustSec was made safe by importing sets **disabled** — a
    set referencing an SGT the target lacks is blocked, not half-written.
-9. **AD join point** config export, creation, and `addGroups`.
+9. **AD join point** config export, creation, and `addGroups`. Interviewed on
+   2026-08-11 with the shapes read off the source first; see the section above.
+   In build.
    Promoted in practice by the 2026-08-10 run: the join point's dictionary and
    the identity stores that depend on it blocked two authorization profiles,
    three policy sets and an identity source sequence between them. Nothing else

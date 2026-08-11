@@ -22,6 +22,7 @@ const (
 	familySystemCerts    = "systemCertificates"
 	familyPolicyElements = "policyElements"
 	familyPolicySets     = "policySets"
+	familyADJoinPoints   = "adJoinPoints"
 )
 
 // ISE paths and their ERS root keys.
@@ -50,6 +51,7 @@ const (
 	pathNetworkConditions   = "/api/v1/policy/network-access/network-condition"
 	pathDictionaries        = "/api/v1/policy/network-access/dictionaries"
 	pathActiveDirectory     = "/ers/config/activedirectory"
+	rootActiveDirectory     = "ERSActiveDirectory"
 	pathCertificateProfile  = "/ers/config/certificateprofile"
 
 	// Policy sets paths
@@ -615,6 +617,7 @@ func Preflight(c *Client, b *Bundle, selectedNodes []string, keepState bool) (*P
 
 	preflightTrustedCerts(c, b, r)
 	preflightSystemCerts(c, b, r, selectedNodes)
+	preflightADJoinPoints(c, b, r)
 	preflightPolicyElements(c, b, r)
 	preflightPolicySets(c, b, r, keepState)
 
@@ -1512,6 +1515,11 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 				log("Endpoints: %d/%d processed.", done, endpoints)
 			}
 		}
+	}
+
+	// Active Directory join points
+	if err := applyADJoinPoints(c, r, res, log); err != nil {
+		return res, err
 	}
 
 	// Policy elements
