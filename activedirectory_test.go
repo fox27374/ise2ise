@@ -358,3 +358,95 @@ func TestSequenceStillBlocksWithoutTheJoinPoint(t *testing.T) {
 		}
 	}
 }
+
+// A join point has to exist before anyone can join a domain, so on a real
+// migration the target's was made by hand and the tool skips it — and the
+// source's AD attributes never arrive. ISE offers no way to add one to an
+// existing join point (a PUT answers 405, and there is no attribute operation),
+// so the only honest thing is to name them. Verified against the lab, where the
+// target's ntslab.loc dictionary carried 2 stock attributes and neither of the
+// source's, leaving an authorization profile refused with an empty HTTP 500.
+func TestExistingJoinPointReportsMissingAttributes(t *testing.T) {
+	src := newFakeISE(t)
+	src.addADJoinPoint("ad-1", "ntslab.loc", "ntslab.loc", nil)
+	src.mu.Lock()
+	for _, jp := range src.adJoinPoints {
+		if str(jp, "name") == "ntslab.loc" {
+			jp["adAttributes"] = map[string]any{"attributes": []any{
+				map[string]any{"name": "msDS-cloudExtensionAttribute9", "type": "STRING"},
+				map[string]any{"name": "badPwdCount", "type": "STRING"},
+			}}
+			jp["advancedSettings"] = map[string]any{"enableMachineAuth": true, "agingTime": 5}
+		}
+	}
+	src.mu.Unlock()
+
+	b := NewBundle(&Probe{Host: "src"})
+	if err := ExportADJoinPoints(src.client(), b, []string{familyADJoinPoints}, quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	// The target has the join point, made by hand: no attributes, and one
+	// advanced setting that differs.
+	tgt := newFakeISE(t)
+	tgt.addADJoinPoint("tgt-1", "ntslab.loc", "ntslab.loc", nil)
+	tgt.mu.Lock()
+	for _, jp := range tgt.adJoinPoints {
+		jp["advancedSettings"] = map[string]any{"enableMachineAuth": false, "agingTime": 5}
+	}
+	tgt.mu.Unlock()
+
+	rep, err := Preflight(tgt.client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+
+	var attrItem *PreflightItem
+	for i, it := range rep.Items {
+		if it.Family == familyADJoinPoints && strings.Contains(it.Name, "AD attributes") {
+			attrItem = &rep.Items[i]
+		}
+	}
+	if attrItem == nil {
+		t.Fatalf("the missing attributes were never reported: %+v", rep.Items)
+	}
+	if attrItem.Action != actionBlocked {
+		t.Errorf("action = %q, want blocked: nothing can add them", attrItem.Action)
+	}
+	for _, want := range []string{"msDS-cloudExtensionAttribute9", "badPwdCount", "405"} {
+		if !strings.Contains(attrItem.Reason, want) {
+			t.Errorf("the reason should mention %q, got %q", want, attrItem.Reason)
+		}
+	}
+
+	var drift bool
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "enableMachineAuth") && strings.Contains(n, "not changed") {
+			drift = true
+		}
+	}
+	if !drift {
+		t.Errorf("advanced settings drift was not reported: %v", rep.Notes)
+	}
+
+	// A target whose join point already carries them says nothing.
+	tgt2 := newFakeISE(t)
+	tgt2.addADJoinPoint("tgt-2", "ntslab.loc", "ntslab.loc", nil)
+	tgt2.mu.Lock()
+	for _, jp := range tgt2.adJoinPoints {
+		jp["adAttributes"] = map[string]any{"attributes": []any{
+			map[string]any{"name": "msDS-cloudExtensionAttribute9", "type": "STRING"},
+			map[string]any{"name": "badPwdCount", "type": "STRING"},
+		}}
+	}
+	tgt2.mu.Unlock()
+	rep2, err := Preflight(tgt2.client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("second preflight: %v", err)
+	}
+	for _, it := range rep2.Items {
+		if strings.Contains(it.Name, "AD attributes") {
+			t.Errorf("attributes already present were still reported: %q", it.Reason)
+		}
+	}
+}

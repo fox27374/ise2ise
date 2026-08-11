@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sort"
 	"strings"
 )
 
@@ -161,6 +162,7 @@ func preflightADJoinPoints(c *Client, b *Bundle, r *PreflightReport) {
 			}
 
 			r.add(groupsItem)
+			reportJoinPointDrift(bundleItem, targetJP, r)
 			continue
 		}
 
@@ -337,4 +339,71 @@ func joinPointsAfterThisRun(c *Client, r *PreflightReport) map[string]bool {
 		}
 	}
 	return names
+}
+
+// reportJoinPointDrift names what the source's join point carries and the
+// target's does not. It never writes.
+//
+// A join point has to exist before anyone can join a domain, so on a real
+// migration the target's was made by hand and the tool skips it — which means
+// the source's AD attributes and advanced settings never arrive. That is worth
+// saying out loud, because an AD attribute is not decoration: an authorization
+// profile reading msDS-cloudExtensionAttribute9 is refused by ISE with an empty
+// HTTP 500 when the target's join point does not expose it.
+//
+// Adding them is not something this tool can do. ISE answers a PUT on the join
+// point with 405, offers no attribute operation beside addGroups, and the only
+// route that would work — delete and recreate — would leave the domain. So the
+// report names them and the operator adds them in the GUI, where they are set at
+// join time anyway.
+func reportJoinPointDrift(bundle, target map[string]any, r *PreflightReport) {
+	name := str(bundle, "name")
+
+	have := map[string]bool{}
+	for _, a := range attrList(target) {
+		have[str(a, "name")] = true
+	}
+	var missing []string
+	for _, a := range attrList(bundle) {
+		if n := str(a, "name"); n != "" && !have[n] {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		r.add(PreflightItem{
+			Family: familyADJoinPoints,
+			Name:   fmt.Sprintf("%s — %d AD attributes", name, len(missing)),
+			Action: actionBlocked,
+			Reason: fmt.Sprintf("the target's join point does not expose %s, and ISE has no API to add an attribute to a join point that already exists (a PUT answers 405). Add them in the ISE GUI under this join point's Attributes tab, then re-run — an authorization profile that reads one is refused until you do.",
+				strings.Join(quoteAll(missing), ", ")),
+		})
+	}
+
+	// Advanced settings are behavioural. They are reported, never changed: the
+	// target's join point is already authenticating users.
+	bAdv, _ := bundle["advancedSettings"].(map[string]any)
+	tAdv, _ := target["advancedSettings"].(map[string]any)
+	if fields := driftFields(bAdv, tAdv); len(fields) > 0 {
+		r.Notes = append(r.Notes, fmt.Sprintf(
+			"AD join point %q: the target's advanced settings differ from the source in %s. They were not changed — compare them in the GUI if the source's behaviour is the one you want.",
+			name, strings.Join(fields, ", ")))
+	}
+}
+
+// attrList reads a join point's AD attributes whichever way they arrived.
+func attrList(jp map[string]any) []map[string]any {
+	block, _ := jp["adAttributes"].(map[string]any)
+	if block == nil {
+		return nil
+	}
+	return ruleList(block["attributes"])
+}
+
+func quoteAll(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = fmt.Sprintf("%q", s)
+	}
+	return out
 }
