@@ -820,9 +820,35 @@ the second run.
 Selection is its own checkbox, and ticking policy sets ticks and locks it
 alongside policy elements.
 
-**Unproven until the lab run**: the create payload, whether ISE accepts
-`advancedSettings` and `adAttributes` on a create, what `addGroups` wants as a
-body, and what it answers for a join point whose domain is not joined.
+### What the 2026-08-11 run proved, and what it broke
+
+`addGroups` works and needed no guessing: the ten groups, with their SIDs, landed
+on the target's join point on the first attempt, and a re-run reports them as
+already loaded.
+
+The design flaw the operator spotted is real and it inverts the slice's main
+path. **A join point must exist before anyone can join a domain**, so on any real
+migration the target's join point has already been created by hand by the time
+this tool runs. The create path — the one carrying `adAttributes` and
+`advancedSettings` — is therefore nearly dead, and skip-by-name means the
+source's configuration never arrives.
+
+That is not cosmetic. The target's `ntslab.loc` dictionary existed and carried
+only its two stock attributes, `ExternalGroups` and `IdentityAccessRestricted`;
+the source's join point adds `msDS-cloudExtensionAttribute9`, which is what the
+`AssignVLAN102` authorization profile reads — the profile ISE refuses with an
+empty HTTP 500.
+
+**Nothing can fix that over the API.** A `PUT` on the join point answers **405**,
+there is no attribute operation beside `addGroups`, and the only route that would
+work — delete and recreate with the attributes — would leave the domain. So the
+missing attributes are reported as a blocked item naming each one and saying to
+add them in the GUI, where they are set at join time anyway, and the advanced
+settings are reported as a note and never changed. The target's join point is
+already authenticating users; this tool does not get to decide how.
+
+Proven against the lab: skip, groups already loaded, two attributes named,
+`enableMachineAccess` reported as drift.
 
 ---
 

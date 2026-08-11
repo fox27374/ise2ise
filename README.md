@@ -372,6 +372,15 @@ that can call it.
   so identity source sequences and rules that name it can land in the same pass.
   Its dictionary and its groups do not — those exist only after the join, which
   is why the second run matters.
+- **If you created the join point yourself, its AD attributes are reported, not
+  copied.** You have to create a join point before you can join a domain, so in
+  practice yours already exists and the tool skips it. ISE offers no way to add
+  an attribute to an existing join point — a `PUT` answers 405 and there is no
+  attribute operation — so the report names each attribute the source has and
+  yours does not, for you to add under the join point's **Attributes** tab. This
+  matters: an authorization profile that reads one is refused by ISE with an
+  empty HTTP 500 until the attribute is there. Advanced settings that differ are
+  reported the same way and never changed.
 
 Ticking policy sets ticks this family too, since rules name the join point as
 their identity source.
