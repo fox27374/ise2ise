@@ -128,6 +128,20 @@ func preflightIdentitySources(c *Client, b *Bundle, r *PreflightReport) {
 		name := str(item, "name")
 		it := PreflightItem{Family: familyIdentitySources, Name: name, obj: maps.Clone(item)}
 
+		// ERS refuses a name with anything but letters, digits and underscore:
+		// "name field may contain only alphanumeric and _ characters". The GUI
+		// is more permissive, so a source can hold a name ERS will not accept.
+		if kind == "restIDStore" && !ersSafeName(name) {
+			it.Action, it.Reason = actionBlocked,
+				"ERS refuses this name on create — a REST identity store name may contain only letters, digits and underscores. Rename it on the source, or create it by hand on the target."
+			r.add(it)
+			continue
+		}
+
+		if kind == "restIDStore" {
+			noteRestStoreGaps(item, r)
+		}
+
 		// Determine if target has this object
 		exists := false
 		if kind == "restIDStore" {
@@ -207,6 +221,15 @@ func applyIdentitySources(c *Client, r *PreflightReport, res *ImportResult, log 
 			if kind == "restIDStore" {
 				path = pathRestIDStore
 				root = rootRestIDStore
+				// ERS refuses a REST ID store create carrying either of these,
+				// and refuses a PUT adding them afterwards — both answer
+				// "Resource Initialization Failed due to JSON invalidity"
+				// naming the block. They are GUI-only. Verified on 3.4 by
+				// bisecting the payload: attributes plus user attributes is
+				// accepted (201), either of these two turns it into a 400, and
+				// user attributes are required rather than optional.
+				delete(obj, "ersRestIDStoreDeviceAttributes")
+				delete(obj, "ersRestIDStoreAdvanceSettings")
 			} else if kind == "certificateProfile" {
 				path = pathCertificateProfile
 				root = rootCertificateProfile
@@ -393,4 +416,40 @@ func mapsEqual(a, b any) bool {
 	aStr := fmt.Sprintf("%v", a)
 	bStr := fmt.Sprintf("%v", b)
 	return aStr == bStr
+}
+
+// ersSafeName reports whether ERS will accept a REST identity store name.
+// Verified on 3.4: "name field may contain only alphanumeric and _ characters".
+func ersSafeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// noteRestStoreGaps names the parts of a REST identity store that cannot travel.
+// ERS accepts neither on a create nor on a PUT afterwards, so the operator sets
+// them in the GUI or the store behaves differently from the source's.
+func noteRestStoreGaps(item map[string]any, r *PreflightReport) {
+	name := str(item, "name")
+	var missing []string
+	if _, ok := item["ersRestIDStoreDeviceAttributes"]; ok {
+		missing = append(missing, "its device attributes")
+	}
+	if _, ok := item["ersRestIDStoreAdvanceSettings"]; ok {
+		missing = append(missing, "its advanced settings")
+	}
+	if len(missing) == 0 {
+		return
+	}
+	r.Notes = append(r.Notes, fmt.Sprintf(
+		"REST identity store %q: %s cannot be carried — ERS refuses both on a create and on an update, so set them in the ISE GUI after the import.",
+		name, strings.Join(missing, " and ")))
 }

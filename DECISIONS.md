@@ -890,9 +890,40 @@ that already holds private keys — the operator judged the trade not worth it.
 Selection is its own family, exportable alone, ticked and locked when policy sets
 are selected, beside policy elements and AD join points.
 
-**Unproven until the run**: whether ERS accepts the store back on create — the
-`predefined` marker and the nested attribute blocks especially — and whether ISE
-validates the Entra credentials at create time or only on use.
+### What the 2026-08-12 run proved
+
+The store crosses: `rootUrl`, `usernameSuffix`, the `predefined` marker, all
+three headers and the user attributes arrived, and the secret hashes identically
+on both sides. ISE does not validate the Entra credentials at create time. The
+export audit passed against real data — the secret appears in no log line, no
+note, and is not readable in the encrypted bundle.
+
+Four things the run corrected, none of which a fake could have shown:
+
+**The certificate profile's root key is `CertificateProfile`**, not
+`ERSCertificateProfile` as this file first guessed. Every test passed with the
+wrong value because the fake was built from the same constant.
+
+**`ersRestIDStoreDeviceAttributes` and `ersRestIDStoreAdvanceSettings` cannot
+travel at all.** ERS refuses both on a create and on a PUT afterwards, each time
+with "Resource Initialization Failed due to JSON invalidity" naming the block.
+Bisecting the payload settled it: attributes plus user attributes is accepted
+(201); adding either of those two makes it a 400. They are dropped from the
+create and named in a note.
+
+**User attributes are required, not optional** — without them the create fails
+with `Resource Initialization Failed(10)`.
+
+**ERS validates the name**: "name field may contain only alphanumeric and _
+characters". The GUI is more permissive, so a source can hold a store name ERS
+will refuse; that is a blocked item with the reason rather than a failed write.
+
+The consequence of the second finding is worth stating plainly, because it costs
+the operator a manual step: the `EntraIDDevice` dictionary exists on a deployment
+only once the store has device attributes, so a target that got its store from
+this tool does not have that dictionary, and every rule reading it stays blocked
+until someone adds the device attribute in the GUI. Same shape as an AD join
+point's attributes.
 
 ---
 

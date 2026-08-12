@@ -236,6 +236,12 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 	for name := range joinPointsAfterThisRun(c, r) {
 		idStoreByName[name] = "exists"
 	}
+	// So is a REST identity store or certificate authentication profile this run
+	// creates: a rule can name one as its identity source directly, not only
+	// through a sequence.
+	for name := range identitySourcesAfterThisRun(c, r) {
+		idStoreByName[name] = "exists"
+	}
 
 	// Authorization profiles from OpenAPI (name + id only)
 	authProfileByName := map[string]string{} // name -> id

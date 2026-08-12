@@ -54,9 +54,11 @@ const (
 	pathActiveDirectory     = "/ers/config/activedirectory"
 	rootActiveDirectory     = "ERSActiveDirectory"
 	pathCertificateProfile  = "/ers/config/certificateprofile"
-	rootCertificateProfile  = "ERSCertificateProfile"
-	pathRestIDStore         = "/ers/config/restidstore"
-	rootRestIDStore         = "ERSRestIDStore"
+	// Not "ERSCertificateProfile": ISE answers this one with a bare
+	// "CertificateProfile" root, unlike its neighbours. Verified on 3.4.
+	rootCertificateProfile = "CertificateProfile"
+	pathRestIDStore        = "/ers/config/restidstore"
+	rootRestIDStore        = "ERSRestIDStore"
 
 	// Policy sets paths
 	pathPolicySets            = "/api/v1/policy/network-access/policy-set"
