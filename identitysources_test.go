@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -89,21 +90,17 @@ func TestExportIdentitySources(t *testing.T) {
 	if !ok {
 		t.Fatal("missing attributes")
 	}
+	// The client id and tenant id are kept — the report needs them to tell the
+	// operator what to build — and the client secret is dropped before the
+	// bundle is written, because the tool never creates one of these stores.
 	headers := extractHeaders(attrs)
-	if len(headers) != 3 {
-		t.Errorf("expected 3 headers, got %d", len(headers))
+	if len(headers) != 2 {
+		t.Errorf("expected 2 headers after the secret is dropped, got %d", len(headers))
 	}
-
-	// Check bundle notes for secret warning
-	found := false
-	for _, note := range b.Notes {
-		if strings.Contains(note, "EntraID") && strings.Contains(note, "secret") {
-			found = true
-			break
+	for _, h := range headers {
+		if str(h, "key") == "clientSecret" {
+			t.Error("the client secret reached the bundle")
 		}
-	}
-	if !found {
-		t.Error("expected bundle note warning about secret")
 	}
 
 	// Verify secret value is NOT in notes
@@ -122,13 +119,16 @@ func TestPreflightIdentitySources(t *testing.T) {
 	fake := newFakeISE(t)
 	client := fake.client()
 
-	// Add target REST store with a different secret
+	// The target's store keeps its own secret, which the bundle never carries.
+	// The drift that matters is in the settings either side can see.
 	targetRest := map[string]any{
 		"id":   "target-rest-1",
 		"name": "EntraID",
 		"ersRestIDStoreAttributes": map[string]any{
+			"rootUrl": "http://10.0.0.9:9601/azure",
 			"headers": []any{
 				map[string]any{"key": "clientSecret", "value": "differentsecret"},
+				map[string]any{"key": "clientID", "value": "49261ca1"},
 			},
 		},
 	}
@@ -147,8 +147,9 @@ func TestPreflightIdentitySources(t *testing.T) {
 			"name": "EntraID",
 			"kind": "restIDStore",
 			"ersRestIDStoreAttributes": map[string]any{
+				"rootUrl": "http://169.254.6.2:9601/azure",
 				"headers": []any{
-					map[string]any{"key": "clientSecret", "value": "sourcesecret"},
+					map[string]any{"key": "clientID", "value": "49261ca1"},
 				},
 			},
 		},
@@ -181,8 +182,8 @@ func TestPreflightIdentitySources(t *testing.T) {
 	if entraItem.Action != actionSkip {
 		t.Errorf("expected EntraID to be skipped, got action %s", entraItem.Action)
 	}
-	if !strings.Contains(entraItem.Reason, "clientSecret") {
-		t.Errorf("expected drift reason to mention clientSecret, got: %s", entraItem.Reason)
+	if !strings.Contains(entraItem.Reason, "connection settings") {
+		t.Errorf("expected drift reason to mention the connection settings, got: %s", entraItem.Reason)
 	}
 	// Verify the secret value is NOT in the reason
 	if strings.Contains(entraItem.Reason, "sourcesecret") || strings.Contains(entraItem.Reason, "differentsecret") {
@@ -420,39 +421,36 @@ func TestDuplicateHandling(t *testing.T) {
 	}
 }
 
+// Two stores differing only in their client secret are not drift: the bundle
+// never carries one, so comparing it would report every store as differing in
+// the single field this tool has decided not to migrate. A difference either
+// side can actually see is drift, and no value ever reaches the field list.
 func TestHeaderComparison(t *testing.T) {
-	// Test that header comparison redacts values
-	mine := map[string]any{
-		"ersRestIDStoreAttributes": map[string]any{
-			"headers": []any{
-				map[string]any{"key": "clientSecret", "value": "secret1"},
-			},
-		},
-	}
-
-	theirs := map[string]any{
-		"ersRestIDStoreAttributes": map[string]any{
-			"headers": []any{
-				map[string]any{"key": "clientSecret", "value": "secret2"},
-			},
-		},
-	}
-
-	fields := driftFieldsIdentitySource(mine, theirs, "restIDStore")
-	found := false
-	for _, f := range fields {
-		if f == "clientSecret" {
-			found = true
+	withHeaders := func(root string, h ...map[string]any) map[string]any {
+		hs := make([]any, len(h))
+		for i, x := range h {
+			hs[i] = x
 		}
+		return map[string]any{"ersRestIDStoreAttributes": map[string]any{"rootUrl": root, "headers": hs}}
 	}
-	if !found {
-		t.Error("expected clientSecret in drift fields")
+	secret := func(v string) map[string]any { return map[string]any{"key": "clientSecret", "value": v} }
+	client := func(v string) map[string]any { return map[string]any{"key": "clientID", "value": v} }
+
+	same := driftFieldsIdentitySource(
+		withHeaders("http://a/azure", client("id-1")),
+		withHeaders("http://a/azure", client("id-1"), secret("secret2")), "restIDStore")
+	if len(same) != 0 {
+		t.Errorf("a secret the bundle never carries must not read as drift, got %v", same)
 	}
 
-	// Verify neither secret value is in the fields list
-	fieldsStr := fmt.Sprintf("%v", fields)
-	if strings.Contains(fieldsStr, "secret1") || strings.Contains(fieldsStr, "secret2") {
-		t.Error("secret values found in drift fields")
+	differs := driftFieldsIdentitySource(
+		withHeaders("http://a/azure", client("id-1")),
+		withHeaders("http://b/azure", client("id-2"), secret("secret2")), "restIDStore")
+	if len(differs) == 0 {
+		t.Error("a different rootUrl and client id must be reported")
+	}
+	if s := fmt.Sprintf("%v", differs); strings.Contains(s, "secret2") || strings.Contains(s, "id-2") {
+		t.Errorf("a value reached the field list: %v", differs)
 	}
 }
 
@@ -523,4 +521,89 @@ func TestAllFamiliesForSecrets(t *testing.T) {
 			t.Errorf("secret found in import result error: %s", err)
 		}
 	}
+}
+
+// ISE cannot create a usable REST identity store over its API. The device
+// attributes and device query settings cannot be written — not on a create, not
+// on an update, under any property spelling — and a store without them cannot be
+// saved in the GUI either, because the tabs that would supply them are not
+// shown. Verified on a real 3.4 target by creating one and then failing to
+// complete it every available way. So the tool reports it instead, and the
+// application secret never enters the bundle.
+func TestRestStoreIsReportedNeverCreated(t *testing.T) {
+	src := newFakeISE(t)
+	src.mu.Lock()
+	src.restIDStores = append(src.restIDStores, map[string]any{
+		"id": "rest-1", "name": "EntraID", "description": "",
+		"ersRestIDStoreAttributes": map[string]any{
+			"rootUrl": "http://169.254.6.2:9601/azure", "usernameSuffix": "@ad.nts.show",
+			"predefined": "Microsoft Entra ID",
+			"headers": []any{
+				map[string]any{"key": "clientID", "value": "49261ca1"},
+				map[string]any{"key": "clientSecret", "value": "supersecret-value-nobody-should-see"},
+				map[string]any{"key": "tenantID", "value": "8a7ef744"},
+			},
+		},
+		"ersRestIDStoreUserAttributes": map[string]any{"attributes": []any{
+			map[string]any{"name": "userPrincipalName", "type": "STRING"}}},
+	})
+	src.mu.Unlock()
+
+	b := NewBundle(&Probe{Host: "src"})
+	if err := ExportIdentitySources(src.client(), b, []string{familyIdentitySources}, quiet); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	// The secret is nowhere in the bundle.
+	blob, err := json.Marshal(b.Objects)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(blob), "supersecret-value-nobody-should-see") {
+		t.Fatal("the client secret reached the bundle")
+	}
+	for _, n := range b.Notes {
+		if strings.Contains(n, "supersecret-value-nobody-should-see") {
+			t.Fatal("the client secret reached a bundle note")
+		}
+	}
+
+	tgt := newFakeISE(t)
+	rep, err := Preflight(tgt.client(), b, nil, false)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+
+	var seen bool
+	for _, it := range rep.Items {
+		if it.Family != familyIdentitySources || it.Name != "EntraID" {
+			continue
+		}
+		seen = true
+		if it.Action != actionBlocked {
+			t.Fatalf("action = %q, want blocked: creating one leaves an object nobody can save", it.Action)
+		}
+		for _, want := range []string{"cannot be created", "by hand", "client secret"} {
+			if !strings.Contains(it.Reason, want) {
+				t.Errorf("the reason should mention %q, got %q", want, it.Reason)
+			}
+		}
+		if strings.Contains(it.Reason, "supersecret-value-nobody-should-see") {
+			t.Error("the reason leaked the secret")
+		}
+	}
+	if !seen {
+		t.Fatal("the store was never reported")
+	}
+
+	res, err := ApplyImport(tgt.client(), rep, "test-passphrase-1234567890", "", nil, false, false, quiet)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	if len(tgt.restIDStores) != 0 {
+		t.Errorf("a REST identity store was written to the target: %+v", tgt.restIDStores)
+	}
+	_ = res
 }

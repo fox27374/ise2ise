@@ -155,7 +155,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | System certificates | The ones you select, with their private keys, onto the target nodes you select. See below. |
 | Policy elements | Network device groups, dACLs, authorization profiles, identity source sequences and conditions, all of them. See below. |
 | Policy sets and rules | The sets with their authentication and authorization rules. They arrive **disabled**. See below. |
-| Identity sources | REST identity stores (Microsoft Entra ID) and certificate authentication profiles. **Carries application secrets.** See below. |
+| Identity sources | Certificate authentication profiles are created; REST identity stores are reported for you to build by hand. See below. |
 | Active Directory join points | The join point and its whole configuration. **You join the domain**; the tool loads the groups on the next run. See below. |
 
 ### Trusted certificates
@@ -388,28 +388,21 @@ their identity source.
 
 ### Identity sources
 
-REST identity stores and certificate authentication profiles — the objects an
-authentication rule names as its identity source. Ticking policy sets ticks this
-family too.
+Certificate authentication profiles are migrated normally. **REST identity stores
+are not created** — they are reported, with everything you need to build one.
 
-**This family puts a credential in the bundle.** A REST identity store holds the
-application secret ISE uses to reach Entra ID, and ISE returns it in plaintext
-over its own API, unlike a RADIUS shared secret. It travels inside the bundle's
-AES-256-GCM, and the export step warns you before the run. The secret never
-appears in a log line, a report, a note or the UI — a drift report will say the
-secret differs, never what it is. Treat the bundle file accordingly.
+That is not a shortcut. ISE will accept a REST identity store over its API and
+produce something unusable: the device attributes and device query settings
+cannot be written by any API, and a store missing them does not even show those
+tabs in the GUI, so it cannot be completed or saved there either. The only
+remaining action on such a store is to delete it. The report therefore names the
+provider, `rootUrl`, username suffix, client id and tenant id, and you create it
+under `Administration → Identity Management → External Identity Sources → REST
+(ROPC)`.
 
-Two things ISE will not let the tool carry, both of which you set in the GUI
-afterwards:
-
-- **A REST store's device attributes and advanced settings.** ERS refuses them on
-  create and on update alike, so they are named in a note. This one has a
-  knock-on effect worth knowing: the `EntraIDDevice` dictionary only exists on a
-  deployment once the store has device attributes, so rules reading it stay
-  blocked until you add them under the store in the GUI.
-- **A store whose name contains anything but letters, digits and underscores**,
-  which ISE's own GUI allows and its API refuses. That is reported as blocked
-  with the reason rather than attempted.
+Because nothing is written, **the application secret is not carried** in the
+bundle at all — take it from your own records when you build the store. The
+client id and tenant id do travel; neither is a credential on its own.
 
 ## Running
 

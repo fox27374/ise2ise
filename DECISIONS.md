@@ -875,17 +875,33 @@ ERS masks as `******`, an Entra application secret comes back readable over
 `/ers/config/restidstore`. That was found by reading it, and it is the reason
 this family needed a decision rather than an implementation.
 
-**The secret travels**, inside the bundle's existing AES-256-GCM. The bundle
-already carries certificate private keys, so the file's handling rules do not
-change — but what is in it does, so the operator is told twice: the export step
-warns before the run, and the bundle carries a note naming the store. The secret
-itself never reaches a log line, a pre-flight reason, a drift report or the UI. A
-drift report may say `clientSecret` differs; it never says what it is.
+**The secret does not travel, and a REST identity store is never created.** That
+reverses the first decision, on evidence from the box.
 
-Rejected: carrying everything except the secret and having the operator retype it
-at import, the shape the GUI-ZIP certificate password uses. It would keep one
-credential out of the file at the cost of a field and a failure mode, on a file
-that already holds private keys — the operator judged the trade not worth it.
+ISE can create one of these over ERS, and the result is unusable. The device
+attributes and the device query settings cannot be written — not on a create, not
+on a PUT afterwards, under any property spelling tried — and a store missing them
+cannot be completed in the GUI either: its **Device Attributes and Device Query
+tabs are not shown**, so the settings ISE requires can never be supplied, and the
+store cannot even be saved. The only thing left to do with it is delete it.
+Confirmed on 3.4 by creating the store, exhausting the API, and watching the GUI
+refuse.
+
+So the tool reports the store instead, with what the operator needs to build it:
+provider, `rootUrl`, username suffix, client id and tenant id. And with nothing
+to write, carrying the application secret would put a credential in a file for no
+purpose — so it is dropped at export. The bundle holds no Entra secret at all,
+and the warnings that decision required disappear with it.
+
+What that costs: the fiddly part of an Entra integration still has to be typed in
+by hand once per migration. What it buys: nothing unusable is ever written to the
+target, and the tool stops holding a credential it cannot use.
+
+**Certificate authentication profiles are unaffected** and are created normally;
+that half works.
+
+The client id and the tenant id are still carried, because the report needs them
+and neither is a credential on its own.
 
 Selection is its own family, exportable alone, ticked and locked when policy sets
 are selected, beside policy elements and AD join points.

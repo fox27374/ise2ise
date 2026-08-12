@@ -32,19 +32,12 @@ func ExportIdentitySources(c *Client, b *Bundle, families []string, log func(str
 
 	for _, store := range restStores {
 		store["kind"] = "restIDStore"
+		// The application secret does not travel. The tool cannot create a REST
+		// identity store at all — see below — so carrying the secret would put a
+		// credential in a file to no purpose. Everything else is kept, because
+		// the report uses it to tell the operator what to build by hand.
+		dropClientSecret(store)
 		out = append(out, stripLocal(store))
-
-		// Warn if this store carries a clientSecret
-		attrs, _ := store["ersRestIDStoreAttributes"].(map[string]any)
-		if headers := extractHeaders(attrs); len(headers) > 0 {
-			for _, header := range headers {
-				if str(header, "key") == "clientSecret" && str(header, "value") != "" {
-					name := str(store, "name")
-					b.Note("REST identity store %q carries an application secret and travels in the bundle; the file is credential material.", name)
-					break
-				}
-			}
-		}
 	}
 
 	log("Captured %d REST ID stores.", len(restStores))
@@ -128,18 +121,15 @@ func preflightIdentitySources(c *Client, b *Bundle, r *PreflightReport) {
 		name := str(item, "name")
 		it := PreflightItem{Family: familyIdentitySources, Name: name, obj: maps.Clone(item)}
 
-		// ERS refuses a name with anything but letters, digits and underscore:
-		// "name field may contain only alphanumeric and _ characters". The GUI
-		// is more permissive, so a source can hold a name ERS will not accept.
-		if kind == "restIDStore" && !ersSafeName(name) {
-			it.Action, it.Reason = actionBlocked,
-				"ERS refuses this name on create — a REST identity store name may contain only letters, digits and underscores. Rename it on the source, or create it by hand on the target."
+		// A REST identity store is never created. ISE cannot make a usable one
+		// over its API: the device attributes and device query settings cannot
+		// be written, and a store without them cannot be saved in the GUI
+		// either, because the tabs that would supply them are not shown. It is
+		// reported with what the operator needs to build it by hand.
+		if kind == "restIDStore" && !targetRestStores[name] {
+			it.Action, it.Reason = actionBlocked, restStoreManualSteps(item)
 			r.add(it)
 			continue
-		}
-
-		if kind == "restIDStore" {
-			noteRestStoreGaps(item, r)
 		}
 
 		// Determine if target has this object
@@ -297,7 +287,12 @@ func driftFieldsIdentitySource(mine, theirs map[string]any, kind string) []strin
 	if theirs == nil {
 		return nil
 	}
-	ignore := map[string]bool{"id": true, "link": true, "kind": true}
+	ignore := map[string]bool{
+		// Neither can be written by any API, so the bundle carrying a copy the
+		// target lacks is expected, not drift.
+		"ersRestIDStoreDeviceAttributes": true,
+		"ersRestIDStoreAdvanceSettings":  true,
+		"id":                             true, "link": true, "kind": true}
 	seen := map[string]bool{}
 	var fields []string
 
@@ -310,7 +305,10 @@ func driftFieldsIdentitySource(mine, theirs map[string]any, kind string) []strin
 
 			a, b := mine[k], theirs[k]
 
-			// For REST ID stores, check attributes without comparing secret values
+			// A REST identity store's attributes are compared without the client
+			// secret on either side: the bundle deliberately does not carry one,
+			// so comparing it would report every store as differing in the one
+			// field the tool has decided not to migrate.
 			if kind == "restIDStore" && k == "ersRestIDStoreAttributes" {
 				aAttrs, aOk := a.(map[string]any)
 				bAttrs, bOk := b.(map[string]any)
@@ -320,11 +318,11 @@ func driftFieldsIdentitySource(mine, theirs map[string]any, kind string) []strin
 					}
 					continue
 				}
-
-				// Check if attributes differ, with special handling for headers
-				differs := attributesDiffer(aAttrs, bAttrs)
-				if differs {
-					fields = append(fields, "clientSecret")
+				aCopy, bCopy := maps.Clone(aAttrs), maps.Clone(bAttrs)
+				dropClientSecret(map[string]any{"ersRestIDStoreAttributes": aCopy})
+				dropClientSecret(map[string]any{"ersRestIDStoreAttributes": bCopy})
+				if attributesDiffer(aCopy, bCopy) {
+					fields = append(fields, "connection settings")
 				}
 				continue
 			}
@@ -339,52 +337,37 @@ func driftFieldsIdentitySource(mine, theirs map[string]any, kind string) []strin
 }
 
 // attributesDiffer checks if two attribute blocks differ, treating header values as secrets
+// attributesDiffer compares two REST identity store attribute blocks.
+//
+// The client secret has already been removed from both sides by the caller, so
+// what is left — rootUrl, the username suffix, the provider, the client and
+// tenant ids — is ordinary configuration and is compared as such. An earlier
+// version returned true whenever any header existed, on the grounds that a
+// secret cannot be compared; that reported every store as drifting in the one
+// field this tool has decided not to migrate.
 func attributesDiffer(a, b map[string]any) bool {
-	// Check structural properties
-	aHeaders := extractHeaders(a)
-	bHeaders := extractHeaders(b)
-
-	// Different number of headers means they differ
-	if len(aHeaders) != len(bHeaders) {
+	headerMap := func(m map[string]any) map[string]any {
+		out := map[string]any{}
+		for _, h := range extractHeaders(m) {
+			out[str(h, "key")] = str(h, "value")
+		}
+		return out
+	}
+	if !mapsEqual(headerMap(a), headerMap(b)) {
 		return true
 	}
-
-	// Compare all keys in both maps except for specific handling of headers
-	seen := make(map[string]bool)
-	for k := range a {
-		seen[k] = true
-		if k == "headers" {
-			// For headers, only compare keys, not values (values are secrets)
-			aKeys := make(map[string]bool)
-			for _, h := range aHeaders {
-				aKeys[str(h, "key")] = true
+	seen := map[string]bool{}
+	for _, m := range []map[string]any{a, b} {
+		for k := range m {
+			if k == "headers" || seen[k] {
+				continue
 			}
-			bKeys := make(map[string]bool)
-			for _, h := range bHeaders {
-				bKeys[str(h, "key")] = true
-			}
-			if !mapsEqual(aKeys, bKeys) {
-				return true
-			}
-			// Keys match but values might differ - be conservative and report as differing
-			// since we can't check the values (they're secrets)
-			if len(aHeaders) > 0 {
-				return true // Headers might have changed values, report as different
-			}
-		} else if !mapsEqual(a[k], b[k]) {
-			return true
-		}
-	}
-
-	// Check keys only in b
-	for k := range b {
-		if !seen[k] && k != "headers" {
+			seen[k] = true
 			if !mapsEqual(a[k], b[k]) {
 				return true
 			}
 		}
 	}
-
 	return false
 }
 
@@ -418,38 +401,45 @@ func mapsEqual(a, b any) bool {
 	return aStr == bStr
 }
 
-// ersSafeName reports whether ERS will accept a REST identity store name.
-// Verified on 3.4: "name field may contain only alphanumeric and _ characters".
-func ersSafeName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// noteRestStoreGaps names the parts of a REST identity store that cannot travel.
-// ERS accepts neither on a create nor on a PUT afterwards, so the operator sets
-// them in the GUI or the store behaves differently from the source's.
-func noteRestStoreGaps(item map[string]any, r *PreflightReport) {
-	name := str(item, "name")
-	var missing []string
-	if _, ok := item["ersRestIDStoreDeviceAttributes"]; ok {
-		missing = append(missing, "its device attributes")
-	}
-	if _, ok := item["ersRestIDStoreAdvanceSettings"]; ok {
-		missing = append(missing, "its advanced settings")
-	}
-	if len(missing) == 0 {
+// dropClientSecret removes the application secret from a REST identity store,
+// in place, before it reaches the bundle. Every other header is kept: the client
+// and tenant ids are what the operator needs to rebuild the store by hand, and
+// neither is a credential on its own.
+func dropClientSecret(store map[string]any) {
+	attrs, _ := store["ersRestIDStoreAttributes"].(map[string]any)
+	if attrs == nil {
 		return
 	}
-	r.Notes = append(r.Notes, fmt.Sprintf(
-		"REST identity store %q: %s cannot be carried — ERS refuses both on a create and on an update, so set them in the ISE GUI after the import.",
-		name, strings.Join(missing, " and ")))
+	kept := []any{}
+	for _, h := range ruleList(attrs["headers"]) {
+		if str(h, "key") == "clientSecret" {
+			continue
+		}
+		kept = append(kept, h)
+	}
+	attrs["headers"] = kept
+}
+
+// restStoreManualSteps is what the report tells the operator to build by hand.
+// ISE cannot create one of these over its API: the device attributes and device
+// query settings cannot be written, and a store missing them cannot be saved in
+// the GUI either — its Device Attributes and Device Query tabs are not shown, so
+// the required settings can never be supplied. Verified on 3.4 by creating one,
+// failing to complete it every way the API allows, and watching the GUI refuse
+// to save it.
+func restStoreManualSteps(item map[string]any) string {
+	attrs, _ := item["ersRestIDStoreAttributes"].(map[string]any)
+	var b strings.Builder
+	b.WriteString("a REST identity store cannot be created over ISE's API: its device attributes and device query settings cannot be written, and a store without them cannot be saved in the GUI either. Create it by hand under Administration > Identity Management > External Identity Sources > REST (ROPC)")
+	if attrs != nil {
+		fmt.Fprintf(&b, " — provider %q, rootUrl %q, username suffix %q",
+			str(attrs, "predefined"), str(attrs, "rootUrl"), str(attrs, "usernameSuffix"))
+		for _, h := range ruleList(attrs["headers"]) {
+			if k := str(h, "key"); k == "clientID" || k == "tenantID" {
+				fmt.Fprintf(&b, ", %s %q", k, str(h, "value"))
+			}
+		}
+	}
+	b.WriteString(". The client secret is deliberately not carried in the bundle; take it from your own records.")
+	return b.String()
 }
