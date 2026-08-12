@@ -16,13 +16,14 @@ import (
 // Object families carried by a bundle. One string per family, used as the
 // bundle key, the UI checkbox value and the pre-flight report's grouping.
 const (
-	familyEndpointGroups = "endpointGroups"
-	familyEndpoints      = "endpoints"
-	familyTrustedCerts   = "trustedCertificates"
-	familySystemCerts    = "systemCertificates"
-	familyPolicyElements = "policyElements"
-	familyPolicySets     = "policySets"
-	familyADJoinPoints   = "adJoinPoints"
+	familyEndpointGroups  = "endpointGroups"
+	familyEndpoints       = "endpoints"
+	familyTrustedCerts    = "trustedCertificates"
+	familySystemCerts     = "systemCertificates"
+	familyPolicyElements  = "policyElements"
+	familyPolicySets      = "policySets"
+	familyADJoinPoints    = "adJoinPoints"
+	familyIdentitySources = "identitySources"
 )
 
 // ISE paths and their ERS root keys.
@@ -53,6 +54,9 @@ const (
 	pathActiveDirectory     = "/ers/config/activedirectory"
 	rootActiveDirectory     = "ERSActiveDirectory"
 	pathCertificateProfile  = "/ers/config/certificateprofile"
+	rootCertificateProfile  = "ERSCertificateProfile"
+	pathRestIDStore         = "/ers/config/restidstore"
+	rootRestIDStore         = "ERSRestIDStore"
 
 	// Policy sets paths
 	pathPolicySets            = "/api/v1/policy/network-access/policy-set"
@@ -618,6 +622,7 @@ func Preflight(c *Client, b *Bundle, selectedNodes []string, keepState bool) (*P
 	preflightTrustedCerts(c, b, r)
 	preflightSystemCerts(c, b, r, selectedNodes)
 	preflightADJoinPoints(c, b, r)
+	preflightIdentitySources(c, b, r)
 	preflightPolicyElements(c, b, r)
 	preflightPolicySets(c, b, r, keepState)
 
@@ -1519,6 +1524,11 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 
 	// Active Directory join points
 	if err := applyADJoinPoints(c, r, res, log); err != nil {
+		return res, err
+	}
+
+	// Identity sources
+	if err := applyIdentitySources(c, r, res, log); err != nil {
 		return res, err
 	}
 

@@ -496,13 +496,17 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ticking policy sets forces policy elements and AD join points into the same export
+	// Ticking policy sets forces policy elements, AD join points, and identity sources
+	// into the same export
 	if slices.Contains(in.Families, familyPolicySets) {
 		if !slices.Contains(in.Families, familyPolicyElements) {
 			in.Families = append(in.Families, familyPolicyElements)
 		}
 		if !slices.Contains(in.Families, familyADJoinPoints) {
 			in.Families = append(in.Families, familyADJoinPoints)
+		}
+		if !slices.Contains(in.Families, familyIdentitySources) {
+			in.Families = append(in.Families, familyIdentitySources)
 		}
 	}
 
@@ -530,6 +534,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ExportADJoinPoints(c, b, in.Families, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
+	if err := ExportIdentitySources(c, b, in.Families, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}

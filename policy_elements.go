@@ -268,11 +268,26 @@ func preflightPolicyElements(c *Client, b *Bundle, r *PreflightReport) {
 		}
 	}
 
-	// Certificate profiles
+	// Certificate profiles and REST ID stores: get the target's copies plus any
+	// created in this run so a sequence naming them resolves.
 	certProfileByName := map[string]bool{}
 	certStubs, _ := c.ersList(pathCertificateProfile)
 	for _, stub := range certStubs {
 		certProfileByName[stub.Name] = true
+	}
+
+	// Add identity sources created in this run
+	idSourcesThisRun := identitySourcesAfterThisRun(c, r)
+	for name := range idSourcesThisRun {
+		idSourceByName[name] = true
+		// If it's a cert profile created this run, also add to certProfileByName
+		// Note: we need to check if it's a cert profile by looking at the items
+		for _, it := range r.Items {
+			if it.Family == familyIdentitySources && it.Action == actionCreate &&
+				str(it.obj, "name") == name && str(it.obj, "kind") == "certificateProfile" {
+				certProfileByName[name] = true
+			}
+		}
 	}
 
 	// willExist tracks what will exist after this import (bundles created in same run)

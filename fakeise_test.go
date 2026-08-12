@@ -56,6 +56,7 @@ type fakeISE struct {
 	dictionaries           []map[string]any
 	adJoinPoints           []map[string]any
 	certProfiles           []map[string]any
+	restIDStores           []map[string]any
 
 	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
@@ -839,7 +840,9 @@ func (f *fakeISE) collection(coll string) ([]map[string]any, string, bool) {
 	case "activedirectory":
 		return f.adJoinPoints, rootActiveDirectory, true
 	case "certificateprofile":
-		return f.certProfiles, "CertificateProfile", true
+		return f.certProfiles, rootCertificateProfile, true
+	case "restidstore":
+		return f.restIDStores, rootRestIDStore, true
 	}
 	return nil, "", false
 }
@@ -864,6 +867,8 @@ func (f *fakeISE) append(coll string, o map[string]any) {
 		f.adJoinPoints = append(f.adJoinPoints, o)
 	case "certificateprofile":
 		f.certProfiles = append(f.certProfiles, o)
+	case "restidstore":
+		f.restIDStores = append(f.restIDStores, o)
 	}
 }
 
