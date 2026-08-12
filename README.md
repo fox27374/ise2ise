@@ -157,6 +157,7 @@ profile that does not exist on the target blocks that endpoint at pre-flight.
 | Policy sets and rules | The sets with their authentication and authorization rules. They arrive **disabled**. See below. |
 | Identity sources | Certificate authentication profiles are created; REST identity stores are reported for you to build by hand. See below. |
 | Active Directory join points | The join point and its whole configuration. **You join the domain**; the tool loads the groups on the next run. See below. |
+| TrustSec | Security groups, SGACLs and the egress matrix cells. Tag values are never renumbered; the default cell is never written. See below. |
 
 ### Trusted certificates
 
@@ -403,6 +404,39 @@ under `Administration → Identity Management → External Identity Sources → 
 Because nothing is written, **the application secret is not carried** in the
 bundle at all — take it from your own records when you build the store. The
 client id and tenant id do travel; neither is a credential on its own.
+
+### TrustSec
+
+Security groups, the SGACLs the matrix names, and the egress matrix cells, in
+that order — an SGT exists before the cell that points at it. Ticking policy sets
+ticks this family too, because authorization rules name security groups.
+
+What ISE stores as a UUID here — a cell's source group, its destination group and
+each of its SGACLs — travels as a name and is resolved against the target's own
+UUIDs on import, so a cell created in the same run resolves the groups created
+minutes earlier.
+
+Four things are worth knowing before you run it:
+
+- **A tag value is never renumbered.** If the target has already given value 16
+  to a different security group, the one in your bundle is left out and the
+  report names the holder. The tag is what a switch puts on the wire; a group
+  that arrived under a different number would mean something else than it did on
+  the source.
+- **A cell is written whole or not at all.** One SGACL missing on the target and
+  the whole cell stays out, with the missing name in the report. A cell short of
+  one of its rules permits or denies traffic nobody asked it to.
+- **The default `ANY-ANY` cell is never written.** It decides every pair with no
+  cell of its own, it exists on every deployment, and one PUT to it can black-hole
+  a network. Both sides are described in the report and you change it yourself.
+- **Nothing is pushed to your switches.** The objects are created in ISE; deploy
+  the matrix from the target's own TrustSec pages afterwards.
+
+One refusal you may meet: a cell that carries a catch-all rule (`PERMIT_IP` or
+`DENY_IP`) *and* an SGACL is rejected unless **Multiple SGACLs per cell** is
+enabled in the target's TrustSec global settings. No API on 3.4 reports that
+setting, so the tool warns in the pre-flight, still attempts the cell, and quotes
+ISE's refusal if it comes.
 
 ## Running
 

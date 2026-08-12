@@ -220,6 +220,10 @@ func preflightPolicySets(c *Client, b *Bundle, r *PreflightReport, keepState boo
 	for _, sgt := range sgts {
 		sgtByName[str(sgt, "name")] = "exists"
 	}
+	// An SGT created in this run is also usable by policy sets
+	for name := range sgtNamesAfterThisRun(c, r) {
+		sgtByName[name] = "exists"
+	}
 
 	// Identity stores
 	idStoreByName := map[string]string{}
@@ -495,7 +499,7 @@ func checkPolicySetReferences(set map[string]any, services, sgts, idStores, auth
 
 				// Check security group
 				if sg := str(azrMap, "securityGroup"); sg != "" && sgts[sg] == "" {
-					return fmt.Sprintf("security group %q does not exist on the target (TrustSec is not yet migrated)", sg)
+					return fmt.Sprintf("security group %q does not exist on the target and will not be created", sg)
 				}
 
 				// Check rule condition
@@ -954,7 +958,7 @@ func checkRuleReferences(rule map[string]any, kind string, sgts, idStores, authP
 			}
 		}
 		if sg := str(rule, "securityGroup"); sg != "" && sgts[sg] == "" {
-			return fmt.Sprintf("the target has no security group %q (TrustSec is not migrated yet)", sg)
+			return fmt.Sprintf("the target has no security group %q and it will not be created", sg)
 		}
 	}
 	if inner, ok := rule["rule"].(map[string]any); ok {

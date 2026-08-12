@@ -185,8 +185,10 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           <span class="hint">Join point configuration. The tool creates the join point; the operator joins the domain in the ISE GUI.</span></label>
         <label><input type="checkbox" id="famIdentitySources"> Identity sources
           <span class="hint">REST ID stores and certificate authentication profiles. REST ID stores carry application secrets and are encrypted in the bundle.</span></label>
+        <label><input type="checkbox" id="famTrustSec"> TrustSec
+          <span class="hint">Security groups, security group access control lists, and the egress matrix. The imported configuration is not pushed to network devices by this tool.</span></label>
         <label><input type="checkbox" id="famPolicySets"> Policy sets and rules
-          <span class="hint">Network access policy sets with their authentication and authorization rules. Selecting this also includes policy elements, identity sources, and Active Directory join points.</span></label>
+          <span class="hint">Network access policy sets with their authentication and authorization rules. Selecting this also includes policy elements, identity sources, Active Directory join points, and TrustSec.</span></label>
       </div>
       <div id="expGroupsWrap" style="margin-top:1rem">
         <label>Migrate these endpoint identity groups
@@ -631,8 +633,16 @@ $("famIdentitySources").addEventListener("change", () => {
     $("famIdentitySources").disabled = false;
   }
 });
+$("famTrustSec").addEventListener("change", () => {
+  // TrustSec has no picker, it's all-or-nothing, and ticking policy sets ticks this too
+  if ($("famPolicySets").checked && !$("famTrustSec").checked) {
+    $("famTrustSec").disabled = true;
+  } else if (!$("famPolicySets").checked) {
+    $("famTrustSec").disabled = false;
+  }
+});
 $("famPolicySets").addEventListener("change", () => {
-  // Ticking policy sets forces policy elements, AD join points, and identity sources to be ticked
+  // Ticking policy sets forces policy elements, AD join points, identity sources, and TrustSec to be ticked
   if ($("famPolicySets").checked && !$("famPolicyElements").checked) {
     $("famPolicyElements").checked = true;
   }
@@ -644,6 +654,12 @@ $("famPolicySets").addEventListener("change", () => {
     $("famIdentitySources").disabled = true;
   } else if (!$("famPolicySets").checked) {
     $("famIdentitySources").disabled = false;
+  }
+  if ($("famPolicySets").checked && !$("famTrustSec").checked) {
+    $("famTrustSec").checked = true;
+    $("famTrustSec").disabled = true;
+  } else if (!$("famPolicySets").checked) {
+    $("famTrustSec").disabled = false;
   }
 });
 
@@ -658,6 +674,7 @@ $("expGo").addEventListener("click", async () => {
   if ($("famPolicyElements").checked) families.push("policyElements");
   if ($("famADJoinPoints").checked) families.push("adJoinPoints");
   if ($("famIdentitySources").checked) families.push("identitySources");
+  if ($("famTrustSec").checked) families.push("trustSec");
   if ($("famPolicySets").checked) families.push("policySets");
   if (!families.length) return showErr($("expError"), "Select at least one object family.");
   const phrase = $("expPhrase").value;

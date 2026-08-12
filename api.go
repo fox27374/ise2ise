@@ -508,6 +508,9 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		if !slices.Contains(in.Families, familyIdentitySources) {
 			in.Families = append(in.Families, familyIdentitySources)
 		}
+		if !slices.Contains(in.Families, familyTrustSec) {
+			in.Families = append(in.Families, familyTrustSec)
+		}
 	}
 
 	s := newStream(w)
@@ -538,6 +541,10 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ExportIdentitySources(c, b, in.Families, s.log); err != nil {
+		s.fail("%v", err)
+		return
+	}
+	if err := ExportTrustSec(c, b, in.Families, s.log); err != nil {
 		s.fail("%v", err)
 		return
 	}

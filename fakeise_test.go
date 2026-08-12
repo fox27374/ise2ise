@@ -58,6 +58,16 @@ type fakeISE struct {
 	certProfiles           []map[string]any
 	restIDStores           []map[string]any
 
+	// TrustSec
+	sgts        []map[string]any
+	sgacls      []map[string]any
+	egressCells []map[string]any
+
+	// Ids ISE serves on a GET but leaves out of its own collection listing.
+	// Real 3.4 does this with the ANY security group, which the default egress
+	// cell points at.
+	hiddenFromList map[string]bool
+
 	policyForbidden bool // the policy API answers 403, as a locked-down box does
 
 	// Policy sets
@@ -262,7 +272,14 @@ func (f *fakeISE) serveERS(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && id == "":
 		f.pagesServed[coll]++
-		f.writeSearchResult(w, r, objs)
+		listed := make([]map[string]any, 0, len(objs))
+		for _, o := range objs {
+			if idStr, _ := o["id"].(string); f.hiddenFromList[idStr] {
+				continue
+			}
+			listed = append(listed, o)
+		}
+		f.writeSearchResult(w, r, listed)
 	case r.Method == http.MethodGet:
 		for _, o := range objs {
 			if o["id"] == id {
@@ -843,6 +860,12 @@ func (f *fakeISE) collection(coll string) ([]map[string]any, string, bool) {
 		return f.certProfiles, rootCertificateProfile, true
 	case "restidstore":
 		return f.restIDStores, rootRestIDStore, true
+	case "sgt":
+		return f.sgts, rootSGT, true
+	case "sgacl":
+		return f.sgacls, rootSGACL, true
+	case "egressmatrixcell":
+		return f.egressCells, rootEgressCell, true
 	}
 	return nil, "", false
 }
@@ -869,6 +892,12 @@ func (f *fakeISE) append(coll string, o map[string]any) {
 		f.certProfiles = append(f.certProfiles, o)
 	case "restidstore":
 		f.restIDStores = append(f.restIDStores, o)
+	case "sgt":
+		f.sgts = append(f.sgts, o)
+	case "sgacl":
+		f.sgacls = append(f.sgacls, o)
+	case "egressmatrixcell":
+		f.egressCells = append(f.egressCells, o)
 	}
 }
 

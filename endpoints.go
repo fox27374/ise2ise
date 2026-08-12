@@ -24,6 +24,7 @@ const (
 	familyPolicySets      = "policySets"
 	familyADJoinPoints    = "adJoinPoints"
 	familyIdentitySources = "identitySources"
+	familyTrustSec        = "trustSec"
 )
 
 // ISE paths and their ERS root keys.
@@ -59,6 +60,14 @@ const (
 	rootCertificateProfile = "CertificateProfile"
 	pathRestIDStore        = "/ers/config/restidstore"
 	rootRestIDStore        = "ERSRestIDStore"
+
+	// TrustSec paths
+	pathSGT        = "/ers/config/sgt"
+	rootSGT        = "Sgt"
+	pathSGACL      = "/ers/config/sgacl"
+	rootSGACL      = "Sgacl"
+	pathEgressCell = "/ers/config/egressmatrixcell"
+	rootEgressCell = "EgressMatrixCell"
 
 	// Policy sets paths
 	pathPolicySets            = "/api/v1/policy/network-access/policy-set"
@@ -625,6 +634,7 @@ func Preflight(c *Client, b *Bundle, selectedNodes []string, keepState bool) (*P
 	preflightSystemCerts(c, b, r, selectedNodes)
 	preflightADJoinPoints(c, b, r)
 	preflightIdentitySources(c, b, r)
+	preflightTrustSec(c, b, r)
 	preflightPolicyElements(c, b, r)
 	preflightPolicySets(c, b, r, keepState)
 
@@ -1531,6 +1541,11 @@ func ApplyImport(c *Client, r *PreflightReport, passphrase, zipPassword string, 
 
 	// Identity sources
 	if err := applyIdentitySources(c, r, res, log); err != nil {
+		return res, err
+	}
+
+	// TrustSec
+	if err := applyTrustSec(c, r, res, log); err != nil {
 		return res, err
 	}
 
