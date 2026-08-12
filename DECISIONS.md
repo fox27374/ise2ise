@@ -978,6 +978,118 @@ point's attributes.
 
 ---
 
+## TrustSec: security groups, SGACLs and the egress matrix
+
+Slice 7, decided and built on 2026-08-12, with every read shape taken off the
+source deployment before any code was written. Three ERS resources, one bundle
+family, `kind` per object:
+
+| Kind | Resource | ERS root key | On the lab (source / target) |
+|---|---|---|---|
+| `sgt` | `/ers/config/sgt` | `Sgt` | 30 / 18 |
+| `sgacl` | `/ers/config/sgacl` | `Sgacl` | 9 / 4 |
+| `egressCell` | `/ers/config/egressmatrixcell` | `EgressMatrixCell` | 3 / 3 |
+
+Every cross-reference ISE stores here is a UUID — a cell's `sourceSgtId`, its
+`destinationSgtId` and each entry of `sgacls` — so all three become names on
+export and are resolved against the target's own UUIDs on import. `generationId`
+(ISE's change counter) and `matrixId` (the local egress matrix) are stripped
+beside `id` and `link`.
+
+### What the box showed before any code was written
+
+**The `ANY` security group is not in what `/ers/config/sgt` lists.** Thirty stubs
+come back and `ANY` is not among them, but every default egress cell points at it
+and a GET on its id returns it. So resolving a cell's group cannot rely on the
+list: an id the list cannot satisfy is fetched directly, and one that still
+resolves to nothing is carried as the id and reported, so the cell blocks on
+import rather than being written against a reference that means nothing.
+
+**Factory objects share identical UUIDs across independent deployments** —
+factory SGTs, `Permit IP`/`Deny IP`, the `ANY-ANY` cell, even `matrixId`. That is
+not exploited. Everything still resolves by name, per the project rule, because
+nothing guarantees it for the objects an operator made.
+
+### The decisions
+
+**A tag value is never renumbered.** If a bundle SGT's `value` is held on the
+target by a different name, the SGT is skipped and the holder is named. Real on
+the lab: source `TestSGT`=16 and `TEst1235`=17 against target `VLAN_175`=16 and
+`VLAN170`=17. The tag is what a switch puts on the wire and what every SXP peer
+carries; a group created under a substituted number would silently mean something
+else than it did on the source. Remapping was considered and rejected for that.
+
+**A name already on the target is skipped and its content drift reported.** Same
+convention as the policy element slice. No factory-allowlist update mechanism was
+built: nothing in this family decides what happens to unmatched traffic, so the
+argument that forced one for the `Default` policy set does not apply here.
+
+**The `ANY-ANY` default cell is never written.** It is the TrustSec catch-all —
+its `defaultRule` and SGACL list decide every pair with no cell of its own — and
+it exists on every deployment. Unlike the `Default` policy set, where rules are
+merged beside the target's own, there is no merge here: it is one global switch,
+and writing it can black-hole every enforced flow on the target. Both sides are
+described in the report and the operator changes it in the GUI.
+
+**A cell is blocked whole.** A missing SGACL, a missing group, or a group blocked
+by a tag collision takes the entire cell with it. A cell written with the rest of
+its list permits or denies traffic the source never meant it to.
+
+**Import order is SGTs, then SGACLs, then cells**, in pre-flight and in apply
+alike, so an object is always decided before whatever points at it. The family is
+sorted by kind rank rather than alphabetically for the same reason — sorted by
+name, `egressCell` sorts first and every cell would be judged before the groups
+it names existed.
+
+TrustSec runs before the policy families, and an SGT this run creates counts as
+one a policy set may name. The two "TrustSec is not yet migrated" messages in
+`policy_sets.go` are gone with it.
+
+### What the 2026-08-12 run proved
+
+Exported from `ise01.ntslab.loc`, applied to the 178/179 target: **18 objects
+created** — 12 security groups, 5 SGACLs and the `Production-Production` cell —
+both tag collisions blocked with the holder named, the default cell reported and
+untouched, and a re-run creating **nothing**. The created cell carries the
+target's own UUIDs for `Production` and `IpYesICMPno`, resolved from names.
+
+Two things only the hardware could show:
+
+**A cell holding a catch-all rule and an SGACL at once is refused.** The source's
+`Auditors-Auditors` cell carries `defaultRule: DENY_IP` alongside the `Deny IP`
+SGACL, and the target answered:
+
+> Validation Error - Illegal values: [Only one Catch All Rule SGACL can exsits
+> [None,Permit IP,Deny IP! , can not change cell to multiple sgacls as it set to
+> disable in trust sec global settings !]
+
+That is the **Multiple SGACLs per cell** global setting being off on the target.
+No API on 3.4 reports it — `/api/v1/trustsec/settings`, `/ers/config/trustsecconfiguration`
+and four other spellings all answer 404 — so it cannot be probed and must not be
+guessed from a version. The pre-flight warns when a cell carries both, the create
+is still attempted because the setting may well be on, and ISE's own words are
+reported when it is not.
+
+**A property one build answers with and another omits is not drift.** The source
+returns `validateAclContent: false` on every SGACL; the target, a patch behind,
+returns no such property at all. Reported as-is, that produced "differs in
+validateAclContent" on all four factory SGACLs — noise pointing at a patch level,
+not at anything an operator changed. Drift now ignores a field that is absent on
+one side and empty on the other; a field the other side actually sets is still
+reported. Same lesson as the REST identity store finding, in a quieter form: two
+deployments at the same version differ by patch, and the difference surfaces as
+API shape.
+
+### Deliberately not in this slice
+
+IP-to-SGT static mappings (`/ers/config/sgmapping`, 17 on the source),
+`sgmappinggroup`, and the SGT/VN-VLAN container (`/ers/config/sgtvnvlan`). They
+are switch plumbing rather than policy, and nothing in the blocked-policy table
+needed them. TrustSec **deploy to network devices** is out of scope entirely: the
+objects are created in ISE and the operator pushes the matrix.
+
+---
+
 ## Explicitly out of scope
 
 Confirmed manual: ISE internal CA · posture (conditions, requirements, policies)
@@ -1268,7 +1380,13 @@ Ordered by dependency, not by size.
    factory allowlist update mechanism is **not** part of it — factory objects are
    skipped with their content drift reported, and the update mechanism waits for
    the policy set slice, where `Default` makes it necessary.
-7. **TrustSec** — SGTs, then SGACLs, then the egress matrix (needs both).
+7. ~~TrustSec~~ — SGTs, then SGACLs, then the egress matrix. Interviewed and
+   built on 2026-08-12 with the read shapes taken off the source first, and
+   **proven against real hardware the same day**: 18 objects created on the
+   178/179 target, both tag collisions blocked, the default cell reported and
+   never written, a re-run creating nothing. Two defects only the write could
+   show — a cell carrying a catch-all rule beside an SGACL, and a patch-level
+   property difference reported as content drift. See the section above.
 8. ~~Policy sets and rules~~ — built on 2026-08-10 and **proven against real
    hardware the same day**: five sets created on the 178/179 target with their
    rules, disabled; the `Default` set's rules merged beside the target's own,
@@ -1302,7 +1420,7 @@ found by running it rather than by reading Cisco's documentation.
 | Missing on the target | Blocked | Where it belongs |
 |---|---|---|
 | AD join point `ntslab.loc`, and the dictionary it brings | 2 profiles, 2 sets, 1 sequence | Roadmap 9 |
-| Security group `Production` | 1 set | Roadmap 7 (TrustSec) |
+| Security group `Production` | 1 set | ~~Roadmap 7~~ — carried since 2026-08-12 |
 | EntraID identity store | 1 sequence, and the set using it | No slice yet — external identity sources |
 | Custom endpoint attribute `EndPoints:iPSK` | 1 profile, 1 set | No slice yet |
 | Vendor dictionary `PaloAltoNetworks` | 2 profiles | No slice yet |
