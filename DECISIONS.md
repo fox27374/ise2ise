@@ -900,6 +900,41 @@ target, and the tool stops holding a credential it cannot use.
 **Certificate authentication profiles are unaffected** and are created normally;
 that half works.
 
+### The measurement was taken against mismatched patch levels
+
+Recorded 2026-08-12, after the conclusion above had already been drawn.
+
+The source runs 3.4.0.608 with patches **3, 5 and 6**; the target runs the same
+build with patch **3 only**. That difference explains every symptom this section
+attributes to ISE 3.4 in general:
+
+- The target's GUI shows no Device Attributes and no Device Query tab on a REST
+  identity store — **including one created by hand in the GUI**, which is what
+  ruled out "the API made a broken object" as the cause.
+- The target's ERS answers "please if properties names are correct" for
+  `ersRestIDStoreDeviceAttributes` and `ersRestIDStoreAdvanceSettings`, which is
+  what that message means when a build has never heard of a property.
+- The store could not be saved in the GUI because that version has nowhere to put
+  the settings it was asking for.
+
+So the reversal above — report REST identity stores, never create them, do not
+carry the secret — was decided on evidence from a patch-mismatched pair, not from
+a property of the release. It stands as the current behaviour because it is safe
+on both, but it is **not** settled.
+
+**To resolve, once the target is patched to 5 and 6**: re-test whether ERS
+accepts `ersRestIDStoreDeviceAttributes` and `ersRestIDStoreAdvanceSettings` on a
+create. If it does, the original decision is the right one — create the store,
+carry the secret — with the version-independent guard this tool uses everywhere
+else: send what the source has, and report what the target's API refuses, rather
+than deciding anything from a version number.
+
+The general lesson is worth keeping regardless: **two deployments at the same
+version can still differ by patch**, and a capability probe has to be a probe. The
+project rule against branching on version numbers already says this; what it did
+not say is that "the API refuses it" can mean "this build has not learned it yet"
+rather than "ISE cannot do it".
+
 The client id and the tenant id are still carried, because the report needs them
 and neither is a credential on its own.
 
@@ -1251,7 +1286,9 @@ Ordered by dependency, not by size.
    three policy sets and an identity source sequence between them. Nothing else
    on this list unblocks as much.
 10. **Identity sources** — REST ID stores and certificate authentication
-    profiles. Decided 2026-08-12; see the section above. In build. Promoted ahead
+    profiles. **Open**: re-test the REST store create once the target carries
+    patches 5 and 6; the current report-only behaviour was measured against a
+    patch-mismatched pair. See the section above. Decided 2026-08-12; see the section above. In build. Promoted ahead
     of TrustSec because it unblocks six objects to TrustSec's two, and because
     the first policy migration stalled on it.
 11. **Network device CSV → API import.**
