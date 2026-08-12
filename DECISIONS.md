@@ -852,6 +852,81 @@ Proven against the lab: skip, groups already loaded, two attributes named,
 
 ---
 
+## Identity sources: REST ID stores and certificate profiles
+
+Slice 10, decided 2026-08-12 after the policy migration stalled on them. Two ERS
+resources, both identity sources that policy names by name:
+
+| Resource | ERS root key | On the lab |
+|---|---|---|
+| `/ers/config/restidstore` | `ERSRestIDStore` | source has `EntraID`; target has none |
+| `/ers/config/certificateprofile` | `ERSCertificateProfile` | source has `EntraID_Cert_Profile`; target has only the factory `Preloaded_Certificate_Profile` |
+
+Between them they blocked `EntraID_Sequence`, the `KOF - EntraID` policy set, the
+`INTUNE` Default rule and the three `EntraID_*` Default rules that read the
+`EntraIDDevice` dictionary — the largest remaining block after TrustSec.
+
+The REST ID store carries `rootUrl`, `usernameSuffix`, a `predefined` marker
+(`"Microsoft Entra ID"`), user and device attribute lists, an advanced settings
+block, and headers holding `clientID`, `tenantID` and **`clientSecret`**.
+
+**ISE returns that secret in plaintext.** Unlike a RADIUS shared secret, which
+ERS masks as `******`, an Entra application secret comes back readable over
+`/ers/config/restidstore`. That was found by reading it, and it is the reason
+this family needed a decision rather than an implementation.
+
+**The secret travels**, inside the bundle's existing AES-256-GCM. The bundle
+already carries certificate private keys, so the file's handling rules do not
+change — but what is in it does, so the operator is told twice: the export step
+warns before the run, and the bundle carries a note naming the store. The secret
+itself never reaches a log line, a pre-flight reason, a drift report or the UI. A
+drift report may say `clientSecret` differs; it never says what it is.
+
+Rejected: carrying everything except the secret and having the operator retype it
+at import, the shape the GUI-ZIP certificate password uses. It would keep one
+credential out of the file at the cost of a field and a failure mode, on a file
+that already holds private keys — the operator judged the trade not worth it.
+
+Selection is its own family, exportable alone, ticked and locked when policy sets
+are selected, beside policy elements and AD join points.
+
+### What the 2026-08-12 run proved
+
+The store crosses: `rootUrl`, `usernameSuffix`, the `predefined` marker, all
+three headers and the user attributes arrived, and the secret hashes identically
+on both sides. ISE does not validate the Entra credentials at create time. The
+export audit passed against real data — the secret appears in no log line, no
+note, and is not readable in the encrypted bundle.
+
+Four things the run corrected, none of which a fake could have shown:
+
+**The certificate profile's root key is `CertificateProfile`**, not
+`ERSCertificateProfile` as this file first guessed. Every test passed with the
+wrong value because the fake was built from the same constant.
+
+**`ersRestIDStoreDeviceAttributes` and `ersRestIDStoreAdvanceSettings` cannot
+travel at all.** ERS refuses both on a create and on a PUT afterwards, each time
+with "Resource Initialization Failed due to JSON invalidity" naming the block.
+Bisecting the payload settled it: attributes plus user attributes is accepted
+(201); adding either of those two makes it a 400. They are dropped from the
+create and named in a note.
+
+**User attributes are required, not optional** — without them the create fails
+with `Resource Initialization Failed(10)`.
+
+**ERS validates the name**: "name field may contain only alphanumeric and _
+characters". The GUI is more permissive, so a source can hold a store name ERS
+will refuse; that is a blocked item with the reason rather than a failed write.
+
+The consequence of the second finding is worth stating plainly, because it costs
+the operator a manual step: the `EntraIDDevice` dictionary exists on a deployment
+only once the store has device attributes, so a target that got its store from
+this tool does not have that dictionary, and every rule reading it stays blocked
+until someone adds the device attribute in the GUI. Same shape as an AD join
+point's attributes.
+
+---
+
 ## Explicitly out of scope
 
 Confirmed manual: ISE internal CA · posture (conditions, requirements, policies)
@@ -1159,7 +1234,11 @@ Ordered by dependency, not by size.
    the identity stores that depend on it blocked two authorization profiles,
    three policy sets and an identity source sequence between them. Nothing else
    on this list unblocks as much.
-10. **Network device CSV → API import.**
+10. **Identity sources** — REST ID stores and certificate authentication
+    profiles. Decided 2026-08-12; see the section above. In build. Promoted ahead
+    of TrustSec because it unblocks six objects to TrustSec's two, and because
+    the first policy migration stalled on it.
+11. **Network device CSV → API import.**
 
 ### What the first policy migration could not carry
 
